@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1100">
+<title>Skywave — live DSC monitor</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <div class="brand">SKYWAVE <span class="sub">· live DSC, sixteen-wide</span></div>
+  <div class="status" id="status">idle</div>
+</header>
+
+<section class="controls">
+  <label>Channels
+    <div class="chips" id="bands">
+      <label><input type="checkbox" value="2187.5"  checked><span>MF</span><em>2187.5</em></label>
+      <label><input type="checkbox" value="4207.5"  checked><span>HF4</span><em>4207.5</em></label>
+      <label><input type="checkbox" value="6312.0"  checked><span>HF6</span><em>6312.0</em></label>
+      <label><input type="checkbox" value="8414.5"  checked><span>HF8</span><em>8414.5</em></label>
+      <label><input type="checkbox" value="12577.0" checked><span>HF12</span><em>12577.0</em></label>
+      <label><input type="checkbox" value="16804.5" checked><span>HF16</span><em>16804.5</em></label>
+    </div>
+  </label>
+  <button id="listen" class="primary">▶ Listen · 16 RX</button>
+  <label class="vol">
+    <span id="mute" class="mute">🔊</span>
+    <input id="gain" type="range" min="0" max="100" value="60">
+  </label>
+</section>
+
+<section class="rack" id="rack">
+  <!-- 16 slots injected here by app.js -->
+</section>
+
+<section class="radio">
+  <canvas id="waterfall" width="1024" height="120"></canvas>
+  <div class="axis"><span>0</span><span>1 kHz</span><span>2 kHz</span><span>3 kHz</span></div>
+  <div class="smeter" title="audio level (selected receiver)">
+    <div class="smeter-needle" id="needle"></div>
+    <div class="smeter-scale"><span>S0</span><span>5</span><span>9</span><span>+20</span></div>
+  </div>
+</section>
+
+<section class="log">
+  <div class="log-head">
+    <span>time</span><span>caller</span><span>flow</span><span>payload</span><span>heard by</span>
+  </div>
+  <div id="calls"></div>
+  <div id="empty" class="empty">waiting for traffic · a quiet MF watch normally sees 0–3 calls / hour</div>
+</section>
+
+<footer>
+  <a href="#" id="gfw-link">set GFW API key</a>
+  <span class="sep">·</span>
+  <span id="bytecount">0 B</span>
+  <span class="sep">·</span>
+  <span id="rxcount">0 / 0 live</span>
+  <span class="sep">·</span>
+  <span>monospace in, monospace out</span>
+</footer>
+
+<dialog id="gfw-dialog">
+  <form method="dialog">
+    <h3>Global Fishing Watch API key</h3>
+    <p>Optional. With a key, decoded MMSIs are resolved to ship names + flags.
+       Get one free at <code>globalfishingwatch.org/our-apis/tokens</code>.
+       Stored in your browser only.</p>
+    <input id="gfw-input" type="password" autocomplete="off" spellcheck="false">
+    <menu>
+      <button value="cancel">cancel</button>
+      <button id="gfw-save" value="save" class="primary">save</button>
+    </menu>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>
