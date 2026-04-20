@@ -427,10 +427,12 @@ function renderVessel(mmsi, info) {
     nameEl.textContent = info.name || `MMSI ${mmsi}`;
     if (info.type) nameEl.title = info.type;
   }
+  // Detail-block chips complement the name-already-in-the-row — GFW flag
+  // (3-letter), ML-inferred vessel type, callsign, IMO — but skip the
+  // name itself so we don't repeat it.
   for (const v of document.querySelectorAll(`.vessel[data-mmsi="${mmsi}"]`)) {
     const flag = info.flag || midIso(mmsi);
     const bits = [];
-    if (info.name) bits.push(`<strong>${escapeHtml(info.name)}</strong>`);
     if (flag) bits.push(`<span class="vchip">${escapeHtml(flag)}</span>`);
     if (info.type) bits.push(`<span class="vchip">${escapeHtml(info.type)}</span>`);
     if (info.callsign) bits.push(`<span class="vchip">${escapeHtml(info.callsign)}</span>`);
@@ -441,11 +443,16 @@ function renderVessel(mmsi, info) {
 
 Vessels.onUpdate((mmsi, info) => {
   renderVessel(mmsi, info);
-  if (!info || !info.lastPos) return;
-  // Push the new position into any already-open mini-map for this MMSI.
+  if (!info) return;
   for (const entry of callIndex.values()) {
-    if (entry.call.caller === mmsi && entry._mapInited) {
+    if (entry.call.caller !== mmsi || !entry._mapInited) continue;
+    if (info.lastPos) {
       setVesselOnMiniMap(entry, info);
+    } else if (info.vesselId) {
+      // Tracks fetch completed but returned no points — mark the map so
+      // the user can distinguish "still loading" from "ship silent".
+      const c = entry.row.querySelector(".mini-map");
+      if (c) c.classList.add("no-track");
     }
   }
 });

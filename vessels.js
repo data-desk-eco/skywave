@@ -88,11 +88,14 @@ export const Vessels = (() => {
         pending.add(mmsi);
         fetchTracks(cached.vesselId)
           .then((t) => {
-            if (!t || !t.lastPos) return;
-            cached.lastPos = t.lastPos;
-            cached.trail = t.trail;
-            cache.set(mmsi, cached);
-            scheduleSave();
+            if (t && t.lastPos) {
+              cached.lastPos = t.lastPos;
+              cached.trail = t.trail;
+              cache.set(mmsi, cached);
+              scheduleSave();
+            }
+            // fire either way so the UI can flip from "waiting" to the
+            // track or to "no-track" without a second open.
             notify(mmsi, cached);
           })
           .finally(() => pending.delete(mmsi));
@@ -115,8 +118,8 @@ export const Vessels = (() => {
             info.trail = t.trail;
             cache.set(mmsi, info);
             scheduleSave();
-            notify(mmsi, info);
           }
+          notify(mmsi, info);
         });
       })
       .catch(() => { cache.set(mmsi, null); scheduleSave(); })

@@ -219,6 +219,20 @@ header {
   border: 1px solid var(--line);
   position: relative;
 }
+/* "no recent AIS track" chip on mini-maps where GFW has identified
+ * the ship but has no track in the past 14 days. */
+.mini-map.no-track::after {
+  content: "no recent AIS track";
+  position: absolute; right: 6px; top: 6px;
+  font-size: 9px; color: var(--dim);
+  letter-spacing: 0.04em;
+  background: rgba(0, 0, 0, 0.65);
+  padding: 2px 5px;
+  border: 1px solid var(--line);
+  pointer-events: none;
+  z-index: 500;
+}
+
 /* Vessel info header in a call's detail panel (populated by GFW). */
 .vessel:empty { display: none; }
 .vessel {

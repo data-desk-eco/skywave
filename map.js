@@ -36,6 +36,7 @@ export function initMiniMap(entry) {
     for (const slot of entry.receiverSlots) addReceiverToMiniMap(entry, slot);
     const info = Vessels.get(entry.call.caller);
     if (info && info.lastPos) setVesselOnMiniMap(entry, info);
+    else if (info && info.vesselId) container.classList.add("no-track");
     fitMiniMap(entry);
     setTimeout(() => entry._map && entry._map.invalidateSize(), 120);
   });
@@ -60,6 +61,9 @@ export function setVesselOnMiniMap(entry, info) {
   if (!entry._mapInited || !info || !info.lastPos) return;
   const L = window.L;
   const { lat, lon } = info.lastPos;
+
+  const container = entry.row.querySelector(".mini-map");
+  if (container) container.classList.remove("no-track");
 
   if (info.trail && info.trail.length > 1) {
     if (entry._trail) entry._map.removeLayer(entry._trail);
