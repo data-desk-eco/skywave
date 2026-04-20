@@ -48,6 +48,7 @@ let audioCtx = null;
 let destinationGain = null;
 let nextStart = 0;
 let audioFollowKey = null;
+let audioUnlocked = false;
 let rackTimer = null;
 
 // -------------------------------------------------------------------
@@ -237,21 +238,37 @@ function reconsiderAudio() {
     best.setAudioFollow(true);
     audioFollowKey = best.key;
     if (audioCtx) nextStart = audioCtx.currentTime + AUDIO_LEAD_SEC;
-    playingEl.textContent = `${best.bandLabel} · ${best.label}`;
-    playingEl.classList.add("on");
   } else if (!best && audioFollowKey) {
     for (const c of slots.values()) if (c.audioFollow) c.setAudioFollow(false);
     audioFollowKey = null;
-    playingEl.textContent = "";
-    playingEl.classList.remove("on");
   }
+  updatePlayingLabel();
 }
 
 function stopFollowing(conn) {
   conn.audioFollow = false;
   if (audioFollowKey === conn.key) audioFollowKey = null;
-  playingEl.textContent = "";
-  playingEl.classList.remove("on");
+  updatePlayingLabel();
+}
+
+// The header indicator doubles as the audio-locked hint: on iOS the
+// AudioContext can be running but muted until the user taps, so don't
+// pretend a station is audible when it isn't.
+function updatePlayingLabel() {
+  const conn = audioFollowKey ? slots.get(audioFollowKey) : null;
+  if (!conn) {
+    playingEl.textContent = "";
+    playingEl.classList.remove("on");
+    return;
+  }
+  const label = `${conn.bandLabel} · ${conn.label}`;
+  if (audioCtx && audioCtx.state === "running" && audioUnlocked) {
+    playingEl.textContent = label;
+    playingEl.classList.add("on");
+  } else {
+    playingEl.textContent = `tap to enable audio · ${label}`;
+    playingEl.classList.remove("on");
+  }
 }
 
 // int16-BE base64 → Float32
@@ -289,6 +306,27 @@ function ensureAudio() {
   destinationGain.gain.value = 1;
   destinationGain.connect(audioCtx.destination);
   nextStart = audioCtx.currentTime + AUDIO_LEAD_SEC;
+  audioCtx.addEventListener("statechange", updatePlayingLabel);
+}
+
+function unlockAudio() {
+  ensureAudio();
+  if (audioCtx.state === "suspended") {
+    try { audioCtx.resume(); } catch (_) {}
+  }
+  // iOS WebKit (Safari + Chrome on iOS) leaves the AudioContext muted
+  // until something is actually scheduled inside a user-activation
+  // gesture — resume() alone isn't enough. Schedule one silent frame to
+  // flip the audio session into a state that allows later playback.
+  try {
+    const silent = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
+    const src = audioCtx.createBufferSource();
+    src.buffer = silent;
+    src.connect(audioCtx.destination);
+    src.start(0);
+    audioUnlocked = true;
+  } catch (_) {}
+  updatePlayingLabel();
 }
 
 // -------------------------------------------------------------------
@@ -521,12 +559,13 @@ if (regionEl) {
   });
 }
 
-function unlockAudio() {
-  ensureAudio();
-  if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
-}
-["pointerdown", "click", "keydown", "touchstart"].forEach((evt) =>
-  document.addEventListener(evt, unlockAudio, { once: true, passive: true })
+// Stay attached for the life of the page: iOS aggressively re-suspends
+// the AudioContext on tab backgrounding and after long silence, and the
+// next gesture has to be able to unlock it again. WebKit only counts
+// touchend/pointerup/click/keydown as user activations for audio — not
+// touchstart/pointerdown — so listen for the former.
+["pointerup", "click", "keydown", "touchend"].forEach((evt) =>
+  document.addEventListener(evt, unlockAudio, { passive: true })
 );
 
 start();
