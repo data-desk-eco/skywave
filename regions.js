@@ -17,8 +17,19 @@ export const bandLabelFor = (khz) =>
 // Regional scan presets. Each entry constrains the receiver candidate
 // pool to a bbox ([south, west, north, east]); the slot count is
 // whatever eligible receivers are available in that bbox, capped at
-// MAX_FANOUT. Smaller areas end up with fewer slots than Global.
-export const MAX_FANOUT = 96;
+// `maxFanout()`. Smaller areas end up with fewer slots than Global.
+//
+// When audio is tunnelling through the Cloudflare Worker gateway
+// (always the case on HTTPS origins, since ws:// is blocked) we scan
+// far fewer receivers — each live session keeps the Worker busy
+// relaying PCM frames, and 96 of those in parallel can exhaust the
+// free-tier CPU budget (audio hangs pending, user sees 0 / N). On
+// http:// origins we bypass the Worker and can safely scale up.
+export function maxFanout() {
+  const hasGateway = !!document.querySelector('meta[name="skywave-gateway"]');
+  const https = location.protocol === "https:";
+  return https && hasGateway ? 24 : 96;
+}
 export const REGION_STORAGE_KEY = "skywave.region";
 export const REGIONS = [
   { id: "global",    name: "Global",         bbox: null                  },

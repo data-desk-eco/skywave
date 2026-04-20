@@ -9,7 +9,7 @@ import { KiwiClient } from "./kiwi.js";
 import { Vessels } from "./vessels.js";
 import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap } from "./map.js";
 import {
-  BANDS, bandLabelFor, REGIONS, MAX_FANOUT, REGION_STORAGE_KEY,
+  BANDS, bandLabelFor, REGIONS, maxFanout, REGION_STORAGE_KEY,
   currentRegion, inRegion, coastDeg, parseGps, coversBand, midIso,
 } from "./regions.js";
 
@@ -223,6 +223,10 @@ class RxSlot {
         if (this.state !== "err") this.state = "dead";
         if (audioSlot === this) audioSlot = null;
         updateRxCount();
+        // Replace so one bad run of host failures doesn't leave the
+        // rack permanently under-filled. Rate-limited and capped to
+        // avoid a storm if the whole candidate pool is currently bad.
+        if (this.state === "err" || this.state === "dead") scheduleSlotReplacement(this);
       },
     });
     this.client.connect();
@@ -596,7 +600,7 @@ function stop() {
 function start() {
   const region = currentRegion();
   const bands = BANDS.map((b) => b.khz);
-  const picks = pickReceiversAcrossBands(bands, MAX_FANOUT, new Set(), region.bbox);
+  const picks = pickReceiversAcrossBands(bands, maxFanout(), new Set(), region.bbox);
   if (!picks.length) {
     rxCountEl.textContent = "no receivers in this region";
     return;
@@ -615,6 +619,38 @@ function start() {
 }
 
 function restart() { stop(); start(); }
+
+// Drop slots that failed, and pick a fresh replacement on the same band
+// from the current region's eligible pool. Debounced + rate-limited so
+// a simultaneous storm of failures (e.g. a candidate pool that's mostly
+// stale) doesn't flood the worker with retries.
+const replaceQueue = new Set();
+let replaceTimer = null;
+
+function scheduleSlotReplacement(slot) {
+  replaceQueue.add(slot);
+  if (replaceTimer) return;
+  replaceTimer = setTimeout(() => {
+    replaceTimer = null;
+    const batch = Array.from(replaceQueue).slice(0, 4);   // cap per tick
+    for (const s of batch) replaceQueue.delete(s);
+    const occupied = new Set(slots.filter((s) => !batch.includes(s)).map((s) => s.hostKey));
+    const bbox = currentRegion().bbox;
+    for (const s of batch) {
+      const idx = slots.indexOf(s);
+      if (idx >= 0) slots.splice(idx, 1);
+      if (slots.length >= maxFanout()) continue;
+      const cand = pickReceiversAcrossBands([s.bandKHz], 1, occupied, bbox);
+      if (!cand.length) continue;
+      const ns = new RxSlot(cand[0]);
+      slots.push(ns);
+      occupied.add(ns.hostKey);
+      ns.connect();
+    }
+    updateRxCount();
+    if (replaceQueue.size) replaceTimer = setTimeout(() => scheduleSlotReplacement(replaceQueue.values().next().value), 3000);
+  }, 2000);
+}
 
 // ---------------------------------------------------------------------------
 // CSV export

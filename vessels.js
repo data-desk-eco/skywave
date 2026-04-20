@@ -47,23 +47,78 @@ export const Vessels = (() => {
     }, 3000);
   }
 
-  // Pick the "best" identity fields out of a GFW search response. Prefer
-  // the formal registry record; fall back to the AIS-self-reported entry
-  // (which almost always has at least a flag and often a shipname). The
-  // shiptype comes from GFW's ML-inferred combinedSourcesInfo. We also
-  // keep the vesselId so we can follow up with a tracks lookup.
-  function extract(entry) {
-    if (!entry) return null;
-    const reg = entry.registryInfo && entry.registryInfo[0];
-    const self = entry.selfReportedInfo && entry.selfReportedInfo[0];
-    const combined = entry.combinedSourcesInfo && entry.combinedSourcesInfo[0];
+  // GFW often splits one MMSI into several `entries` when ownership or
+  // registry metadata changes over time, and even within a single entry
+  // the selfReportedInfo / registryInfo / combinedSourcesInfo arrays
+  // aren't sorted by recency — so entries[0] and entries[*][0] can
+  // easily point at a retired identity. We honour the
+  // `matchCriteria.latestVesselInfo` flag GFW sets on the current-
+  // identity match; failing that, we pick by the most recent
+  // transmissionDateTo.
+  function latestBy(arr, key) {
+    if (!arr || !arr.length) return null;
+    let best = arr[0], bestTs = Date.parse(best[key] || "") || 0;
+    for (let i = 1; i < arr.length; i++) {
+      const ts = Date.parse(arr[i][key] || "") || 0;
+      if (ts > bestTs) { best = arr[i]; bestTs = ts; }
+    }
+    return best;
+  }
+
+  function extract(entries) {
+    if (!entries || !entries.length) return null;
+
+    // 1. Pick the entry tagged as the current identity.
+    let entry = null, latestRef = null;
+    for (const e of entries) {
+      const mc = (e.matchCriteria || []).find((m) => m.latestVesselInfo);
+      if (mc) { entry = e; latestRef = mc.reference; break; }
+    }
+    // Fallback: the entry whose newest AIS segment has the latest TX.
+    if (!entry) {
+      let bestTs = 0;
+      for (const e of entries) {
+        const latest = latestBy(e.selfReportedInfo, "transmissionDateTo");
+        const ts = latest ? Date.parse(latest.transmissionDateTo || "") || 0 : 0;
+        if (ts > bestTs) { bestTs = ts; entry = e; latestRef = latest && latest.id; }
+      }
+    }
+    if (!entry) entry = entries[0];
+
+    // 2. Within the chosen entry, pick the specific records aligned
+    //    with `latestRef` — falling through to the latest by timestamp.
+    const selfs = entry.selfReportedInfo || [];
+    const self = (latestRef && selfs.find((s) => s.id === latestRef))
+      || latestBy(selfs, "transmissionDateTo")
+      || selfs[0];
+
+    const combineds = entry.combinedSourcesInfo || [];
+    const combined = (latestRef && combineds.find((c) => c.vesselId === latestRef))
+      || combineds[0];
+
+    const regs = entry.registryInfo || [];
+    const reg = latestBy(regs, "dateTo")
+      || latestBy(regs, "transmissionDateTo")
+      || regs[0];
+
+    // 3. Registry fields are typically cleaner than AIS-self-reported;
+    //    fall back either way.
     const name = (reg && reg.shipname) || (self && self.shipname) || null;
     const flag = (reg && reg.flag) || (self && self.flag) || null;
     const callsign = (reg && reg.callsign) || (self && self.callsign) || null;
     const imo = (reg && reg.imo) || (self && self.imo) || null;
-    const type = combined && combined.shiptypes && combined.shiptypes[0]
-      ? combined.shiptypes[0].name
-      : null;
+
+    // 4. Vessel type is attached with yearFrom/yearTo — pick the class
+    //    whose window covers the current year; else take the last.
+    let type = null;
+    if (combined && combined.shiptypes && combined.shiptypes.length) {
+      const now = new Date().getUTCFullYear();
+      const current = combined.shiptypes.find(
+        (s) => (s.yearTo || 9999) >= now && (s.yearFrom || 0) <= now,
+      );
+      type = (current || combined.shiptypes[combined.shiptypes.length - 1]).name || null;
+    }
+
     const vesselId = (combined && combined.vesselId) || (self && self.id) || null;
     if (!name && !flag && !type && !vesselId) return null;
     return { name, flag, type, callsign, imo, vesselId };
@@ -108,7 +163,7 @@ export const Vessels = (() => {
     fetch(`${GATEWAY}/gfw?query=${mmsi}`)
       .then((r) => r.ok ? r.json() : null)
       .then((data) => {
-        const info = extract(data && data.entries && data.entries[0]);
+        const info = extract(data && data.entries);
         cache.set(mmsi, info);
         scheduleSave();
         if (info) notify(mmsi, info);
