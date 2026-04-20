@@ -1,0 +1,7 @@
+name = "skywave-gateway"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+[observability]
+enabled = true

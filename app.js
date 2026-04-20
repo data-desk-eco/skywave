@@ -392,7 +392,7 @@ class KiwiClient {
 
   connect() {
     const ts = Math.floor(Date.now() / 1000);
-    const url = `ws://${this.host}:${this.port}/${ts}/SND`;
+    const url = wsFor(this.host, this.port, `/${ts}/SND`);
     this.onStatus(`connecting…`);
     this.ws = new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
@@ -513,6 +513,22 @@ const FANOUT = 16;
 const AUDIO_LEAD_SEC = 0.25;                 // how far ahead of currentTime we schedule
 const DEBUG = /(\?|&)debug=1\b/.test(location.search);  // ?debug=1 → console traces
 
+// Gateway — a Cloudflare Worker that serves the receiver list over HTTPS
+// and tunnels WSS→WS to KiwiSDRs. Needed when the page is served over
+// HTTPS (mixed-content rules block ws:// and http:// subresources).
+// On http:// origins (localhost, file://) we talk to KiwiSDRs directly.
+const GATEWAY = (() => {
+  const meta = document.querySelector('meta[name="skywave-gateway"]');
+  const url = meta && meta.content.trim();
+  if (!url) return null;
+  if (location.protocol !== "https:") return null;
+  return url.replace(/\/+$/, "");
+})();
+const wsFor = (host, port, path) =>
+  GATEWAY
+    ? GATEWAY.replace(/^https:/, "wss:") + `/kiwi/${host}/${port}${path}`
+    : `ws://${host}:${port}${path}`;
+
 // ITU-R M.493 DSC channels.
 const BANDS = [
   { khz:  2187.5, short: "MF"   },
@@ -595,15 +611,22 @@ function loadReceivers() {
   if (cached && Date.now() - cachedAt < 10 * 60 * 1000) {
     try { return Promise.resolve(JSON.parse(cached)); } catch (_) {}
   }
+  const cache = (list) => {
+    localStorage.setItem("skywave.rx", JSON.stringify(list));
+    localStorage.setItem("skywave.rxAt", String(Date.now()));
+    return list;
+  };
+  if (GATEWAY) {
+    return fetch(`${GATEWAY}/receivers`)
+      .then((r) => r.ok ? r.json() : Promise.reject(new Error(`gateway ${r.status}`)))
+      .then(cache);
+  }
+  // Direct load — only works from http:// origins. The endpoint returns a
+  // JS assignment (not JSON), so we inject a <script> to bypass CORS.
   return new Promise((resolve, reject) => {
     const s = document.createElement("script");
     s.src = "http://rx.linkfanel.net/kiwisdr_com.js?t=" + Date.now();
-    s.onload = () => {
-      const list = window.kiwisdr_com || [];
-      localStorage.setItem("skywave.rx", JSON.stringify(list));
-      localStorage.setItem("skywave.rxAt", String(Date.now()));
-      resolve(list);
-    };
+    s.onload = () => resolve(cache(window.kiwisdr_com || []));
     s.onerror = () => reject(new Error("failed to fetch receiver list"));
     document.head.appendChild(s);
   });
