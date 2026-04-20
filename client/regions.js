@@ -1,36 +1,12 @@
-// Static data: DSC channels, scan regions, coastal proximity anchors,
-// Maritime Identification Digit (MID) → ISO country lookup, and a few
-// tiny helpers used across modules.
-
-// ITU-R M.493 DSC channels.
-export const BANDS = [
-  { khz:  2187.5, short: "MF"   },
-  { khz:  4207.5, short: "HF4"  },
-  { khz:  6312.0, short: "HF6"  },
-  { khz:  8414.5, short: "HF8"  },
-  { khz: 12577.0, short: "HF12" },
-  { khz: 16804.5, short: "HF16" },
-];
-export const bandLabelFor = (khz) =>
-  (BANDS.find((b) => b.khz === khz) || {}).short || "?";
-
-// Regional scan presets. Each entry constrains the receiver candidate
-// pool to a bbox ([south, west, north, east]); the slot count is
-// whatever eligible receivers are available in that bbox, capped at
-// `maxFanout()`. Smaller areas end up with fewer slots than Global.
+// Client-side static data: the region dropdown, MMSI-to-ISO-country
+// lookup (for the little flag chip on each call), and a GPS-string
+// parser used by the per-card mini-map.
 //
-// When audio is tunnelling through the Cloudflare Worker gateway
-// (always the case on HTTPS origins, since ws:// is blocked) we scan
-// far fewer receivers — each live session keeps the Worker busy
-// relaying PCM frames, and 96 of those in parallel can exhaust the
-// free-tier CPU budget (audio hangs pending, user sees 0 / N). On
-// http:// origins we bypass the Worker and can safely scale up.
-export function maxFanout() {
-  const hasGateway = !!document.querySelector('meta[name="skywave-gateway"]');
-  const https = location.protocol === "https:";
-  return https && hasGateway ? 24 : 96;
-}
+// Band-coverage, coastal scoring, and rack selection moved server-side
+// in v2 — see `worker/src/regions.js`.
+
 export const REGION_STORAGE_KEY = "skywave.region";
+
 export const REGIONS = [
   { id: "global",    name: "Global",         bbox: null                  },
   { id: "nw-europe", name: "NW Europe",      bbox: [42, -12,  62,  15]   },
@@ -48,78 +24,15 @@ export function currentRegion() {
   return REGIONS.find((r) => r.id === saved) || REGIONS[0];
 }
 
-export function inRegion(gps, bbox) {
-  if (!bbox) return true;
-  const [s, w, n, e] = bbox;
-  const [lat, lon] = gps;
-  if (lat < s || lat > n) return false;
-  // Tolerate bboxes that cross the antimeridian.
-  return w <= e ? (lon >= w && lon <= e) : (lon >= w || lon <= e);
-}
-
-// Coastal anchors: (lat, lon) of major ports, coast-guard stations, and
-// busy chokepoints. A receiver's "coastal score" is inverse-distance to
-// the closest anchor — inland KiwiSDRs get deprioritised, sea-adjacent
-// ones float to the top.
-const COASTAL_ANCHORS = [
-  // NE Atlantic / North Sea / Baltic
-  [51.1,   1.3], [48.4,  -5.1], [50.4,  -4.1], [53.5,   9.9], [51.9,   4.5],
-  [60.4,   5.3], [64.1, -21.9], [57.7,  11.9], [59.3,  18.1], [60.2,  24.9],
-  [59.4,  24.8], [54.4,  18.7], [55.7,  12.6], [57.0,  -2.1], [62.0,  -7.0],
-  // Mediterranean / Black Sea
-  [36.1,  -5.3], [43.3,   5.4], [44.4,   8.9], [37.9,  23.7], [41.0,  29.0],
-  [35.9,  14.5], [31.2,  29.9], [32.8,  35.0], [44.5,  33.5],
-  // Iberia / W Africa / S Atlantic
-  [38.7,  -9.1], [37.7, -25.7], [33.6,  -7.6], [14.7, -17.4], [ 6.5,   3.4],
-  [-33.9,  18.4], [-29.9,  31.0], [-22.9, -43.2], [-34.6, -58.4], [-33.0, -71.6],
-  // NW Atlantic / Caribbean
-  [44.6, -63.6], [42.4, -71.1], [40.7, -74.0], [36.9, -76.3], [25.8, -80.2],
-  [29.9, -90.1], [29.7, -95.4], [25.1, -77.3], [18.5, -66.1], [ 9.4, -79.9],
-  // Pacific N America
-  [47.6, -122.3], [37.8, -122.4], [33.7, -118.2], [49.3, -123.1],
-  [21.3, -157.9], [61.2, -149.9],
-  // Red Sea / Gulf / Indian Ocean
-  [21.5,  39.2], [12.8,  45.0], [11.6,  43.1], [23.6,  58.6], [27.2,  56.3],
-  [29.4,  48.0], [19.1,  72.9], [ 6.9,  79.9], [13.1,  80.3],
-  // SE / E Asia
-  [ 1.3, 103.8], [-6.2, 106.8], [14.6, 121.0], [22.3, 114.2], [31.2, 121.5],
-  [35.2, 129.1], [35.7, 139.8], [43.1, 131.9], [13.7, 100.5],
-  // Oceania
-  [-33.9, 151.2], [-27.5, 153.0], [-31.9, 115.9], [-36.9, 174.8],
-  [-41.3, 174.8], [-18.1, 178.4], [-9.5, 147.2],
-];
-
-export function coastDeg(gps) {
-  if (!gps) return 999;
-  let min = Infinity;
-  for (const [la, lo] of COASTAL_ANCHORS) {
-    const dlat = gps[0] - la;
-    const dlon = ((gps[1] - lo + 540) % 360) - 180;
-    const d = Math.hypot(dlat, dlon);
-    if (d < min) min = d;
-  }
-  return min;
-}
-
 export function parseGps(s) {
   if (!s) return null;
-  const m = s.match(/\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)/);
+  const m = String(s).match(/\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)/);
   return m ? [parseFloat(m[1]), parseFloat(m[2])] : null;
 }
 
-export function coversBand(rx, khz) {
-  if (!rx.bands) return true;
-  const hz = khz * 1000;
-  for (const range of rx.bands.split(",")) {
-    const [lo, hi] = range.split("-").map(Number);
-    if (hz >= lo && hz <= hi) return true;
-  }
-  return false;
-}
-
-// Maritime Identification Digit → ISO 3166-1 alpha-2 country. Source:
-// ITU-R M.585 (2023). Missing entries fall through to no flag — the
-// MMSI still renders.
+// Maritime Identification Digit → ISO 3166-1 alpha-2 country (ITU-R
+// M.585, 2023). Missing entries fall through to no flag — the MMSI
+// still renders.
 export const MID_TO_ISO = {
   201:"AL",202:"AD",203:"AT",204:"PT",205:"BE",206:"BY",207:"BG",208:"VA",209:"CY",210:"CY",
   211:"DE",212:"CY",213:"GE",214:"MD",215:"MT",216:"AM",218:"DE",219:"DK",220:"DK",224:"ES",
@@ -157,7 +70,3 @@ export function midIso(mmsi) {
   const mid = parseInt((mmsi || "").slice(0, 3), 10);
   return (mid && MID_TO_ISO[mid]) || "";
 }
-
-// Coast stations use MMSIs starting "00" followed by a 3-digit MID
-// then 4 zeros (mostly). They never broadcast AIS.
-export const isCoastStation = (mmsi) => /^00\d{7}$/.test(mmsi || "");

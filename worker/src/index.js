@@ -1,17 +1,15 @@
-// Skywave gateway — the single Cloudflare Worker that fronts both the
-// v1 and v2 topologies.
+// Skywave gateway — the single Cloudflare Worker behind research.
+// datadesk.eco/skywave.
 //
-// v1 routes (stable; the browser-decoded client still uses these):
-//   GET  /receivers              → kiwisdr_com list as JSON, cached 10 min
-//   WS   /kiwi/:host/:port/<path>  → tunnels to ws://host:port/<path>
-//   GET  /gfw?query=<mmsi>       → GFW identity lookup (proxy)
-//   GET  /gfw/tracks?vesselId=   → GFW decimated 14-day AIS track
+// Routes:
+//   GET  /v2/rack?region=<id>           → regional rack as JSON
+//   WS   /v2/slot/:host/:port/:bandKHz  → attach to a ReceiverDO
+//   GET  /gfw?query=<mmsi>              → GFW identity lookup (proxy)
+//   GET  /gfw/tracks?vesselId=          → GFW decimated 14-day AIS track
+//   GET  /receivers                     → kiwisdr_com list as JSON
+//                                         (kept as a handy debug endpoint;
+//                                          no client code hits it since v2)
 //
-// v2 routes (edge-decoded, slot-shared — see PLAN.md):
-//   GET  /v2/rack?region=<id>    → regional "front page" rack as JSON
-//   WS   /v2/slot/:host/:port/:bandKHz   → attach to a ReceiverDO
-//
-// v1 and v2 coexist during migration; legacy clients keep working.
 // Deploy: (cd worker && npx wrangler deploy)
 
 import { ReceiverDO } from "./receiver-do.js";
@@ -157,47 +155,6 @@ async function gfwTracks(url) {
   });
 }
 
-async function proxyKiwi(request, host, port, rest) {
-  const p = parseInt(port, 10);
-  if (!Number.isFinite(p) || p < 1 || p > 65535) {
-    return new Response("bad port", { status: 400 });
-  }
-  if (!/^\/\d+\/(SND|EXT|W%2FF|W\/F)$/.test(rest)) {
-    return new Response("unexpected path", { status: 400 });
-  }
-  const target = `http://${host}:${port}${rest}`;
-  let upstreamResp;
-  try {
-    upstreamResp = await fetch(target, {
-      headers: {
-        upgrade: "websocket",
-        connection: "upgrade",
-        origin: `http://${host}:${port}`,
-      },
-    });
-  } catch (e) {
-    console.log(`fetch-throw ${host}:${port}${rest} — ${e.message}`);
-    return new Response(`upstream fetch threw: ${e.message}`, { status: 502 });
-  }
-  const upstream = upstreamResp.webSocket;
-  if (!upstream) {
-    console.log(`no-ws ${host}:${port}${rest} — status ${upstreamResp.status}`);
-    return new Response(`upstream upgrade failed (${upstreamResp.status})`, { status: 502 });
-  }
-  upstream.accept();
-  const pair = new WebSocketPair();
-  const client = pair[0], server = pair[1];
-  server.accept();
-  const relay = (from, to) => {
-    from.addEventListener("message", (e) => { try { to.send(e.data); } catch (_) {} });
-    from.addEventListener("close", () => { try { to.close(); } catch (_) {} });
-    from.addEventListener("error", () => { try { to.close(); } catch (_) {} });
-  };
-  relay(server, upstream);
-  relay(upstream, server);
-  return new Response(null, { status: 101, webSocket: client });
-}
-
 // -------------------------------------------------------------------
 // v2 routing — DirectoryDO (rack composition) + ReceiverDO (per-slot WS)
 // -------------------------------------------------------------------
@@ -265,17 +222,12 @@ export default {
     const vSlot = url.pathname.match(/^\/v2\/slot\/([^/]+)\/(\d+)\/([0-9.]+)\/?$/);
     if (vSlot) return handleV2Slot(request, env, decodeURIComponent(vSlot[1]), vSlot[2], vSlot[3]);
 
-    // Legacy v1 surface
     if (url.pathname === "/receivers") return receivers();
     if (url.pathname === "/gfw") return gfw(url);
     if (url.pathname === "/gfw/tracks") return gfwTracks(url);
-    const m = url.pathname.match(/^\/kiwi\/([^/]+)\/(\d+)(\/.+)$/);
-    if (m && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
-      return proxyKiwi(request, m[1], m[2], m[3]);
-    }
 
     return new Response(
-      "skywave gateway · /receivers · /kiwi/:host/:port/* · /v2/rack · /v2/slot/:host/:port/:band",
+      "skywave gateway · /v2/rack · /v2/slot/:host/:port/:band · /gfw · /gfw/tracks · /receivers",
       { status: 404, headers: CORS },
     );
   },

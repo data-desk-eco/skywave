@@ -79,43 +79,122 @@ export function coversBand(rx, khz) {
   return false;
 }
 
-// Rank + pick a rack of receivers that covers every DSC band within a
-// region's bbox. Ported from client/app.js pickReceiversAcrossBands.
-// Same etiquette rules: ≥2 free slots, skip proxy.kiwisdr.com, 2.5°
-// minimum separation between slots on the same band.
-export const MIN_FREE_SLOTS_TO_JOIN = 2;
+// Rack selection — defensible narrative
+// =====================================
+//
+// Out of the ~900 public KiwiSDRs, we pick 8 per DSC band (48 slots
+// total) for a given region. The criteria, in order:
+//
+//   Hard filters (all must pass):
+//     · receiver self-reports `status=active`, not `offline=yes`
+//     · not proxy.kiwisdr.com (307-redirects on handshake, browsers
+//       can't follow — empirically blocks outbound in CF DOs too)
+//     · `ip_blacklist !== "yes"` — some operators exclude CF IPs
+//     · has a GPS fix we can parse
+//     · covers the DSC band's dial frequency (`bands` field)
+//     · lies within the region's bbox
+//     · has ≥ MIN_FREE_SLOTS_TO_JOIN free user slots (etiquette)
+//     · is coastal — within MAX_COAST_DEG of a major port anchor.
+//       DSC is a maritime service; inland KiwiSDRs rarely hear calls
+//     · `snr` field reports ≥ MIN_SNR_DB. Below that the noise floor
+//       leaves nothing for our decoder to work with
+//     · list entry `updated` within UPDATE_RECENCY_SEC. Stale rows
+//       are often dead receivers the public list hasn't GC'd yet
+//
+//   Score (greater = better):
+//     freeSlots × coastalProximity × snrBonus × antennaBonus
+//
+//     · freeSlots          — rewards receivers with headroom
+//     · coastalProximity   — 3 / (coastDeg + 0.5), max 6
+//     · snrBonus           — min(2, snr_dB / 20)
+//     · antennaBonus       — 1.5 if the antenna text mentions a broad-
+//       band design (loop, dipole, T2FD, Beverage); 1 otherwise
+//
+//   Spatial diversity:
+//     · within a band, new picks must be ≥ MIN_SEP_DEG from any pick
+//       already on that band — prevents stacking four Mediterranean
+//       slots in Naples when Valletta, Piraeus and Tel Aviv would
+//       give better coverage
+//     · across bands, the same (host, port) can appear on up to
+//       MAX_BANDS_PER_HOST different bands — one Weston-super-Mare
+//       station on MF + HF4 + HF6 is fine, six is silly
 
-function rankCandidates(receivers, khz, excludeHosts, bbox) {
-  return receivers
-    .filter((r) => r.status === "active" && r.offline !== "yes" && r.url && coversBand(r, khz))
-    .filter((r) => !/proxy\.kiwisdr\.com/i.test(r.url))
-    .map((r) => {
-      let host = "";
-      try { const u = new URL(r.url); host = u.hostname + ":" + (u.port || "8073"); } catch (_) {}
-      if (!host || excludeHosts.has(host)) return null;
-      const free = Math.max(0, (parseInt(r.users_max, 10) || 0) - (parseInt(r.users, 10) || 0));
-      const gps = parseGps(r.gps);
-      if (!gps || free < MIN_FREE_SLOTS_TO_JOIN) return null;
-      if (!inRegion(gps, bbox)) return null;
-      const coast = coastDeg(gps);
-      const coastBoost = Math.max(0.25, 3 / (coast + 0.5));
-      return { r, host, gps, free, coast, score: free * coastBoost };
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.score - a.score);
+export const MIN_FREE_SLOTS_TO_JOIN = 2;
+const MAX_COAST_DEG = 8;       // receiver must be within 8° of a coastal anchor
+const MIN_SNR_DB = 15;         // noise-floor cut-off, per receiver's own report
+const UPDATE_RECENCY_SEC = 3600;
+const MIN_SEP_DEG = 3;         // per-band geographic spread
+const MAX_BANDS_PER_HOST = 2;
+const DEFAULT_FANOUT = 48;
+export const FANOUT_CAP = 60;  // hard ceiling so a malicious query can't drive cost
+
+// Coast-station-style MMSIs and many public KiwiSDRs name-check their
+// antenna in free text. Match a few designs known to pull in weak HF:
+const BROADBAND_ANTENNA = /\b(loop|dipole|t2fd|beverage|folded|longwire|long wire|EWE|K9AY)\b/i;
+
+function snrDb(raw) {
+  // snr field is typically "<snr_weak>,<snr_strong>" in dB. Take the
+  // higher number — represents dynamic range on a clean signal.
+  if (!raw) return null;
+  const nums = String(raw).split(/[,\s]+/).map(Number).filter(Number.isFinite);
+  return nums.length ? Math.max(...nums) : null;
 }
 
-export function pickRack(receivers, bbox, n) {
+function updatedSecondsAgo(raw) {
+  if (!raw) return Infinity;
+  const t = Date.parse(raw);
+  if (!Number.isFinite(t)) return Infinity;
+  return (Date.now() - t) / 1000;
+}
+
+function scoreReceiver(r, gps, free, coast) {
+  const snr = snrDb(r.snr);
+  const snrBonus = snr != null ? Math.min(2, snr / 20) : 1;
+  const coastalProx = Math.max(0.25, 3 / (coast + 0.5));
+  const antennaBonus = BROADBAND_ANTENNA.test(r.antenna || "") ? 1.5 : 1;
+  return { score: free * coastalProx * snrBonus * antennaBonus, snr };
+}
+
+function rankCandidates(receivers, khz, bbox) {
+  const out = [];
+  for (const r of receivers) {
+    if (r.status !== "active" || r.offline === "yes" || !r.url) continue;
+    if (r.ip_blacklist === "yes") continue;
+    if (/proxy\.kiwisdr\.com/i.test(r.url)) continue;
+    if (!coversBand(r, khz)) continue;
+    if (updatedSecondsAgo(r.updated) > UPDATE_RECENCY_SEC) continue;
+    let host;
+    try {
+      const u = new URL(r.url);
+      host = u.hostname + ":" + (u.port || "8073");
+    } catch (_) { continue; }
+    const gps = parseGps(r.gps);
+    if (!gps) continue;
+    if (!inRegion(gps, bbox)) continue;
+    const free = Math.max(0, (parseInt(r.users_max, 10) || 0) - (parseInt(r.users, 10) || 0));
+    if (free < MIN_FREE_SLOTS_TO_JOIN) continue;
+    const coast = coastDeg(gps);
+    if (coast > MAX_COAST_DEG) continue;
+    const { score, snr } = scoreReceiver(r, gps, free, coast);
+    if (snr != null && snr < MIN_SNR_DB) continue;
+    out.push({ r, host, gps, free, coast, snr, score });
+  }
+  out.sort((a, b) => b.score - a.score);
+  return out;
+}
+
+export function pickRack(receivers, bbox, requested = DEFAULT_FANOUT) {
+  const n = Math.max(1, Math.min(FANOUT_CAP, requested | 0));
   const bandsKHz = BANDS.map((b) => b.khz);
   const k = bandsKHz.length;
   const base = Math.floor(n / k);
   const extra = n - base * k;
   const quota = bandsKHz.map((_, i) => base + (i < extra ? 1 : 0));
-  const pools = bandsKHz.map((khz) => rankCandidates(receivers, khz, new Set(), bbox));
+  const pools = bandsKHz.map((khz) => rankCandidates(receivers, khz, bbox));
   const picks = [];
-  const used = new Set();
-  const MIN_SEP = 2.5;
+  const bandsPerHost = new Map();  // host → count of picks using it
 
+  // First pass: respect per-band spatial diversity + per-host band cap.
   let progress = true;
   while (progress && picks.length < n) {
     progress = false;
@@ -124,14 +203,15 @@ export function pickRack(receivers, bbox, n) {
       const pool = pools[bi];
       for (let ci = 0; ci < pool.length; ci++) {
         const c = pool[ci];
-        if (!c || used.has(c.host)) continue;
+        if (!c) continue;
+        if ((bandsPerHost.get(c.host) || 0) >= MAX_BANDS_PER_HOST) continue;
         const sameBand = picks.filter((p) => p.bandKHz === bandsKHz[bi]);
         const tooClose = sameBand.some(
-          (p) => Math.hypot(p.gps[0] - c.gps[0], p.gps[1] - c.gps[1]) < MIN_SEP
+          (p) => Math.hypot(p.gps[0] - c.gps[0], p.gps[1] - c.gps[1]) < MIN_SEP_DEG,
         );
         if (tooClose) continue;
-        used.add(c.host);
         picks.push({ ...c, bandKHz: bandsKHz[bi] });
+        bandsPerHost.set(c.host, (bandsPerHost.get(c.host) || 0) + 1);
         pool[ci] = null;
         quota[bi]--;
         progress = true;
@@ -140,14 +220,18 @@ export function pickRack(receivers, bbox, n) {
       if (picks.length >= n) break;
     }
   }
+  // Top-up pass: if the rack is still short (small region, thin pool),
+  // drop the spatial-diversity rule but keep the per-host cap.
   for (let bi = 0; bi < k && picks.length < n; bi++) {
     for (const c of pools[bi]) {
-      if (!c || used.has(c.host)) continue;
-      used.add(c.host);
+      if (!c) continue;
+      if ((bandsPerHost.get(c.host) || 0) >= MAX_BANDS_PER_HOST) continue;
       picks.push({ ...c, bandKHz: bandsKHz[bi] });
+      bandsPerHost.set(c.host, (bandsPerHost.get(c.host) || 0) + 1);
       if (picks.length >= n) break;
     }
   }
+
   return picks.slice(0, n).map((p) => ({
     host: p.host.split(":")[0],
     port: parseInt(p.host.split(":")[1], 10),
@@ -155,5 +239,7 @@ export function pickRack(receivers, bbox, n) {
     bandLabel: bandLabelFor(p.bandKHz),
     label: (p.r.loc || "").slice(0, 34) || p.r.name || "unknown",
     gps: p.gps,
+    snr: p.snr,
+    coast: +p.coast.toFixed(2),
   }));
 }

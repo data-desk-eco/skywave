@@ -8,27 +8,21 @@ Calling channels (MF 2187.5 kHz and five HF frequencies), decodes every
 burst, dedupes across receivers, and prints the result as a scrolling
 table of who's calling whom, from where, about what.
 
-Two deployments share the same UI:
-
-* **v1 (client-decoded)** — every browser opens its own fleet of
-  WebSockets to the KiwiSDR pool and runs the decoder locally. Still
-  live in `client/`.
-
-* **v2 (edge-decoded, slot-shared)** — one Cloudflare Durable Object
-  per KiwiSDR channel holds the only upstream WebSocket, runs the
-  decoder, and fans decoded calls to every browser attached to it.
-  One listener on each channel, forever, serving everyone who turns
-  up. See `PLAN.md` for the full design and `worker/src/` for the
-  code.
+How it works: one Cloudflare Durable Object per KiwiSDR channel holds
+the only upstream WebSocket, runs the decoder at the edge, and fans
+decoded calls out to every browser attached to it. One listener on
+each channel, forever, serving everyone who turns up — regardless of
+how many people land on the page. See `PLAN.md` for the design
+narrative and `worker/src/` for the code.
 
 
 Using it
 --------
 
-Open the page. It asks the gateway for a rack of receivers covering
-the DSC channels (constrained to the selected region) and subscribes
+Open the page. The gateway composes a rack of ~48 KiwiSDRs covering
+the six DSC channels in the selected region and the browser attaches
 to each. The top-right dropdown narrows the scan — NW Europe, the
-Mediterranean, US East Coast, etc.
+Mediterranean, US East Coast, and so on.
 
 Audio stays silent between transmissions. When a DSC FSK burst is
 detected on one of the receivers we're listening to, the strongest
@@ -45,11 +39,35 @@ type, callsign, IMO and a decimated 14-day AIS track come back
 automatically for every MMSI that GFW has data on. No API key needed.
 
 
+Rack selection
+--------------
+
+Out of the ~900 public KiwiSDRs, the picker keeps the ones that are
+actually worth listening to:
+
+* **Active & reachable** — self-reports `status=active`, list entry
+  refreshed within the last hour, doesn't IP-blacklist Cloudflare's
+  egress ranges.
+* **Coastal** — within 8° of a major port / chokepoint anchor. DSC is
+  a maritime service; inland receivers rarely hear anything.
+* **Healthy** — the receiver's self-reported SNR is ≥ 15 dB; the
+  antenna description gets a small boost when it mentions a known-
+  broadband design (loop, dipole, T2FD, Beverage).
+* **Considerate** — ≥ 2 free user slots so a human listener always
+  has one spare. Skywave never squats the last slot.
+* **Geographically diverse** — same-band picks are ≥ 3° apart, and
+  any single receiver is capped at 2 bands, so the rack spreads
+  across the region's coastline instead of stacking on one port.
+
+Scoring is `freeSlots × coastalProximity × snrBonus × antennaBonus`,
+greedy pick across 6 DSC bands × 8 slots each = 48 total (cap 60).
+
+
 Etiquette
 ---------
 
-Public KiwiSDR receivers have a limited number of user slots. In v2
-the Worker holds exactly one connection per channel per receiver —
+Public KiwiSDR receivers have a limited number of user slots. The
+Worker holds exactly one connection per channel per receiver —
 `ident_user=skywave shared listener` — no matter how many humans are
 viewing. A ReceiverDO tears itself down five minutes after the last
 subscriber disconnects, so a quiet region stops squatting slots.
@@ -69,14 +87,14 @@ Repo layout
     worker/            Cloudflare Worker + Durable Objects
       wrangler.toml    DO bindings + migrations
       src/
-        index.js       router: v1 legacy routes + v2 /v2/rack, /v2/slot
+        index.js       router: /v2/rack, /v2/slot, /gfw(/tracks), /receivers
         directory-do.js  rack composer + receiver-list refresh
         receiver-do.js   per-channel KiwiSDR listener + decoder + fanout
         kiwi-upstream.js server-side KiwiSDR WS client
-        dsc.js           ITU-R M.493 decoder (same as v1)
-        regions.js       server-side subset of regions
+        dsc.js           ITU-R M.493 decoder
+        regions.js       BANDS + bboxes + coastal anchors + pickRack
         location-hint.js GPS → Cloudflare locationHint
-    PLAN.md            the v2 design document
+    PLAN.md            the v2 design narrative (shipped)
 
 
 Local development

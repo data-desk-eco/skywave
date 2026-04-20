@@ -1,5 +1,12 @@
 # Skywave v2 — edge-decoded, slot-shared
 
+**Status: shipped (2026-04-20).** What's below is the design doc that
+drove the rebuild; what's running is close to it but differs in a few
+places — see CLAUDE.md for the delivered shape. Kept for the narrative
+and as a record of the bet.
+
+---
+
 v1 works: every listener's browser opens its own fleet of WebSockets to
 the KiwiSDR pool and decodes locally. It's fine, but the footprint
 scales with users — 96 slots × N listeners. Etiquette creaks.
