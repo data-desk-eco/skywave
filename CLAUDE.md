@@ -51,9 +51,12 @@ Six small modules (ES modules, `<script type="module">`):
   `~/Research/dsc-triangulation/scripts/dsc_decode_ddesk.py`). Only
   exports `decode(samples, sr, opts)`.
 - `kiwi.js` — `KiwiClient` WebSocket client, gateway-URL helper.
-- `vessels.js` — Global Fishing Watch vessel lookup (`search` endpoint
-  only; no position data from GFW, just name/flag/type/callsign/IMO).
-  Cached in localStorage forever.
+- `vessels.js` — Global Fishing Watch integration. Chains `/gfw`
+  (identity: name / flag / type / callsign / IMO / vesselId) → `/gfw/tracks`
+  (last 14 days of AIS positions, decimated to ≤100 points). Both routes
+  are proxied through the Worker because GFW's public endpoints check
+  the Origin and Referer headers and won't serve our own origin. Cached
+  in localStorage (schema-versioned, dropped on version bump).
 - `regions.js` — DSC channel table, regional presets with bboxes, MID
   to ISO country mapping, coastal proximity scoring, small helpers.
 - `map.js` — per-card Leaflet mini-map showing the receivers that
@@ -98,9 +101,16 @@ Six small modules (ES modules, `<script type="module">`):
   messages**, even for MMSIs actively reporting in the unfiltered
   firehose. See `memory/reference_aisstream_filter.md`. We don't use
   aisstream in the shipping version.
-- **GFW search doesn't return position.** Identity only (name, flag,
-  type, callsign, IMO). For position you'd have to cascade into the
-  events endpoint — not currently done.
+- **GFW's public endpoints need Origin + Referer from
+  globalfishingwatch.org.** Browsers refuse to let page JS forge those,
+  so every GFW call goes through the Cloudflare Worker which adds them
+  server-side. No API key needed; `Authorization: Bearer` (literally
+  empty) is what the logged-out map UI sends too.
+- **GFW `/tracks` only accepts `binary=true` without an API key.** The
+  `binary=false` path returns 401. With `binary=true` the response is
+  `application/protobuf` for some formats and `application/geo+json`
+  for others. We use `format=GEOJSON&binary=true` so the Worker can
+  decode without a protobuf dep.
 
 ## Research pointers
 

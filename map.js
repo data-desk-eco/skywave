@@ -1,8 +1,9 @@
 // Per-card mini-map — one tiny Leaflet instance, lazy-mounted on first
-// expand, showing the listening receivers that heard the call. Without
-// a real-time AIS source the vessel itself isn't plotted, but the
-// receiver fan tells you roughly where the ship must have been
-// (inside the reception envelope of every dot at once).
+// expand. Shows the listening receivers (hollow white rings) and, when
+// GFW has track data for the caller, the vessel's last known position
+// (filled white dot) with a decimated 14-day trail.
+
+import { Vessels } from "./vessels.js";
 
 const TILE_URL = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png";
 const TILE_ATTR = '&copy; <a href="https://carto.com/">carto</a> · OSM';
@@ -17,7 +18,7 @@ export function initMiniMap(entry) {
   entry._mapInited = true;
   // Wait one frame so the browser has painted the now-open card; Leaflet
   // reads the container size at init time and produces a 0×0 map if
-  // the parent was still `display:none` during the same paint tick.
+  // the parent was still display:none during the same paint tick.
   requestAnimationFrame(() => {
     const L = window.L;
     entry._map = L.map(container, {
@@ -33,6 +34,8 @@ export function initMiniMap(entry) {
       .addTo(entry._map);
 
     for (const slot of entry.receiverSlots) addReceiverToMiniMap(entry, slot);
+    const info = Vessels.get(entry.call.caller);
+    if (info && info.lastPos) setVesselOnMiniMap(entry, info);
     fitMiniMap(entry);
     setTimeout(() => entry._map && entry._map.invalidateSize(), 120);
   });
@@ -49,11 +52,58 @@ export function addReceiverToMiniMap(entry, slot) {
   });
   m.addTo(entry._map);
   entry._rxMarkers.set(slot.hostKey, m);
+  if (entry._vesselMarker) drawReceiverLines(entry);
   fitMiniMap(entry);
+}
+
+export function setVesselOnMiniMap(entry, info) {
+  if (!entry._mapInited || !info || !info.lastPos) return;
+  const L = window.L;
+  const { lat, lon } = info.lastPos;
+
+  if (info.trail && info.trail.length > 1) {
+    if (entry._trail) entry._map.removeLayer(entry._trail);
+    entry._trail = L.polyline(info.trail.map(([x, y]) => [y, x]), {
+      color: "#fff", weight: 1, opacity: 0.35, lineCap: "round",
+    }).addTo(entry._map);
+  }
+
+  if (entry._vesselMarker) {
+    entry._vesselMarker.setLatLng([lat, lon]);
+  } else {
+    entry._vesselMarker = L.circleMarker([lat, lon], {
+      radius: 5, color: "#fff", weight: 1.5, fillColor: "#fff", fillOpacity: 0.85,
+    }).bindTooltip(info.name || `MMSI ${entry.call.caller}`, {
+      direction: "top", offset: [0, -5],
+    });
+    entry._vesselMarker.addTo(entry._map);
+  }
+
+  drawReceiverLines(entry);
+  fitMiniMap(entry);
+}
+
+function drawReceiverLines(entry) {
+  const L = window.L;
+  for (const l of entry._rxLines || []) entry._map.removeLayer(l);
+  entry._rxLines = [];
+  if (!entry._vesselMarker) return;
+  const vll = entry._vesselMarker.getLatLng();
+  for (const slot of entry.receiverSlots) {
+    if (!slot.gps) continue;
+    const line = L.polyline([slot.gps, [vll.lat, vll.lng]], {
+      color: "#fff", weight: 1, opacity: 0.3, dashArray: "2 3",
+    }).addTo(entry._map);
+    entry._rxLines.push(line);
+  }
 }
 
 function fitMiniMap(entry) {
   const pts = entry.receiverSlots.filter((s) => s.gps).map((s) => s.gps.slice());
+  if (entry._vesselMarker) {
+    const v = entry._vesselMarker.getLatLng();
+    pts.push([v.lat, v.lng]);
+  }
   if (!pts.length) { entry._map.setView([0, 0], 2); return; }
   if (pts.length === 1) { entry._map.setView(pts[0], 5); return; }
   entry._map.fitBounds(pts, { padding: [22, 22], maxZoom: 6 });

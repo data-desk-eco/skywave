@@ -3,22 +3,22 @@
 // stream (computed client-side from audio) and the IMA ADPCM codec (we
 // force compression=0 for code-size).
 
-// When the page is served over HTTPS, a Cloudflare Worker tunnels
-// WSS→WS to the receivers so the mixed-content rule doesn't block
-// ws:// subresources. On http:// (localhost, preview) we talk to
-// KiwiSDRs directly.
+// Cloudflare Worker gateway URL. Used unconditionally for `/gfw` (which
+// must be proxied because GFW checks the Origin header), and for
+// `/kiwi/...` WSS→WS tunnelling only when the page is served over
+// HTTPS — from http:// we can still reach ws://KiwiSDRs directly.
 export const GATEWAY = (() => {
   const meta = document.querySelector('meta[name="skywave-gateway"]');
   const url = meta && meta.content.trim();
-  if (!url) return null;
-  if (location.protocol !== "https:") return null;
-  return url.replace(/\/+$/, "");
+  return url ? url.replace(/\/+$/, "") : null;
 })();
 
-export const wsFor = (host, port, path) =>
-  GATEWAY
-    ? GATEWAY.replace(/^https:/, "wss:") + `/kiwi/${host}/${port}${path}`
-    : `ws://${host}:${port}${path}`;
+export const wsFor = (host, port, path) => {
+  if (GATEWAY && location.protocol === "https:") {
+    return GATEWAY.replace(/^https:/, "wss:") + `/kiwi/${host}/${port}${path}`;
+  }
+  return `ws://${host}:${port}${path}`;
+};
 
 export class KiwiClient {
   constructor(host, port, opts = {}) {

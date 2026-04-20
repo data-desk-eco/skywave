@@ -26,15 +26,13 @@ signal gets routed to your speakers — so you hear the actual tones of
 the protocol the first time it happens, which is the fun bit.
 
 Click a row to expand: decoder internals, the full list of receivers
-that heard the call, and a mini map of where those receivers sit.
+that heard the call, and a mini map of where those receivers sit along
+with the vessel's last known position.
 
-Add a Global Fishing Watch API token to enrich callers with ship name,
-flag, vessel type and callsign:
-
-    localStorage.setItem("skywave.gfwKey", "<your token>")
-
-Free tokens are available at globalfishingwatch.org/our-apis/tokens.
-Without a token the MMSI number is all you get.
+Vessel enrichment uses Global Fishing Watch's public search + tracks
+endpoints, proxied through the Cloudflare Worker. Ship name, flag,
+type, callsign, IMO and a decimated 14-day AIS track come back
+automatically for every MMSI that GFW has data on. No API key needed.
 
 
 Etiquette

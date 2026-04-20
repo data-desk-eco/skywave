@@ -7,7 +7,7 @@
 import { decode as dscDecode } from "./dsc.js";
 import { KiwiClient } from "./kiwi.js";
 import { Vessels } from "./vessels.js";
-import { initMiniMap, addReceiverToMiniMap } from "./map.js";
+import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap } from "./map.js";
 import {
   BANDS, bandLabelFor, REGIONS, MAX_FANOUT, REGION_STORAGE_KEY,
   currentRegion, inRegion, coastDeg, parseGps, coversBand, midIso,
@@ -439,7 +439,16 @@ function renderVessel(mmsi, info) {
   }
 }
 
-Vessels.onUpdate(renderVessel);
+Vessels.onUpdate((mmsi, info) => {
+  renderVessel(mmsi, info);
+  if (!info || !info.lastPos) return;
+  // Push the new position into any already-open mini-map for this MMSI.
+  for (const entry of callIndex.values()) {
+    if (entry.call.caller === mmsi && entry._mapInited) {
+      setVesselOnMiniMap(entry, info);
+    }
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Audio output
@@ -687,3 +696,7 @@ function unlockAudio() {
   catch (e) { rxCountEl.textContent = "no receiver list"; return; }
   start();
 })();
+
+// Debug hook — lets ?debug=1 users poke at state from devtools without
+// us leaking internals into `window` in production.
+if (DEBUG) window.skywave = { slots: () => slots, callIndex, Vessels, dispatchCall };
