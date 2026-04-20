@@ -71,10 +71,17 @@ const DSC = (() => {
   // -- Non-coherent I/Q FSK demod ----------------------------------------
   // Per bit window: correlate samples against cos/sin of mark and space;
   // bit = 1 iff mark power > space power.
+  //
+  // KiwiSDR serves audio at ~11998.9 Hz (not an integer multiple of 100
+  // baud), so we must track bit boundaries as floats — using floor(sr/BAUD)
+  // drifts by ~0.008 samples/bit → ~5 bit periods over a full burst → every
+  // data symbol fails its check. The integer `spb` only sets the correlator
+  // window size; the per-bit start offset is derived from the true rate.
   function fskDemod(samples, sr, mark, space) {
-    const spb = Math.floor(sr / BAUD);
+    const samplesPerBit = sr / BAUD;
+    const spb = Math.floor(samplesPerBit);
     if (spb < 4) throw new Error(`sr ${sr} too low for ${BAUD} baud`);
-    const nb = Math.floor(samples.length / spb);
+    const nb = Math.floor(samples.length / samplesPerBit);
     const bits = new Uint8Array(nb);
     const mc = new Float32Array(spb), ms = new Float32Array(spb);
     const sc = new Float32Array(spb), ss = new Float32Array(spb);
@@ -87,7 +94,8 @@ const DSC = (() => {
     }
     for (let b = 0; b < nb; b++) {
       let mcs = 0, mss = 0, scs = 0, sss = 0;
-      const off = b * spb;
+      const off = Math.round(b * samplesPerBit);
+      if (off + spb > samples.length) break;
       for (let i = 0; i < spb; i++) {
         const s = samples[off + i];
         mcs += s * mc[i]; mss += s * ms[i];
@@ -132,7 +140,10 @@ const DSC = (() => {
     return score;
   }
 
-  function findPhasing(bits, maxScore = 2) {
+  // Accept up to 5 mismatches out of 15 checks — matches Python reference.
+  // Real captures under fading/AGC pumping often score 3–4; tighter than
+  // that and we reject most live traffic.
+  function findPhasing(bits, maxScore = 5) {
     let bestStart = -1, bestScore = maxScore + 1;
     const maxStart = bits.length - 160;
     const bytes_ = new Array(16);
@@ -229,53 +240,112 @@ const DSC = (() => {
     }
     if (!call.eos) call.eos = "—";
 
-    // Sanity: a caller-MMSI with >2 "??" BCD digits is almost certainly a
+    // Sanity: a caller-MMSI with >3 "??" BCD digits is almost certainly a
     // noise lock rather than a real transmission — reject it outright.
+    // Loosened from 2 to 3 to match the Python reference's tolerance for
+    // one-digit BCD corruption in otherwise-valid bursts.
     const badDigits = (s) => (String(s || "").match(/\?/g) || []).length;
-    if (badDigits(call.caller) > 2) return null;
-    if (call.destination && badDigits(call.destination) > 2) return null;
+    if (badDigits(call.caller) > 3) return null;
+    if (call.destination && badDigits(call.destination) > 3) return null;
     return call;
   }
 
+  // -- Autotune (Goertzel peak pair) -------------------------------------
+  // Sweep single-bin tone power across 300–2500 Hz, find the strongest
+  // peak-pair separated by ~170 Hz (the M.493 FSK deviation). Cheaper
+  // than a full FFT; subsamples by 8 so a 10-sec window costs ~30 ms.
+  // Returns null when no plausible FSK peak-pair exists — used as a gate
+  // to skip the expensive sweep on empty/noisy bands.
+  function autotuneMarkSpace(samples, sr) {
+    const STEP = 20;             // Hz — half the FSK shift, plenty for peak ID
+    const FMIN = 300, FMAX = 2500;
+    const SHIFT = 170;
+    const n = samples.length;
+    const w = 2 * Math.PI / sr;
+    const peaks = [];
+    for (let f = FMIN; f <= FMAX; f += STEP) {
+      let cs = 0, ss = 0;
+      const wf = w * f;
+      // Subsample by 8 — tones >300 Hz are nowhere near Nyquist at 12 kHz/8
+      for (let i = 0; i < n; i += 8) {
+        cs += samples[i] * Math.cos(wf * i);
+        ss += samples[i] * Math.sin(wf * i);
+      }
+      peaks.push([f, cs * cs + ss * ss]);
+    }
+    peaks.sort((a, b) => b[1] - a[1]);
+    const top = peaks.slice(0, 8);
+    for (let i = 0; i < top.length; i++) {
+      for (let j = i + 1; j < top.length; j++) {
+        const [f1] = top[i], [f2] = top[j];
+        const lo = Math.min(f1, f2), hi = Math.max(f1, f2);
+        if (Math.abs(hi - lo - SHIFT) <= 15) return [lo, hi];
+      }
+    }
+    return null;
+  }
+
   // -- Top-level pipeline ------------------------------------------------
-  // Tries baseline mark/space first; if no clean lock, sweeps ±200 Hz
-  // around the expected mark centre. Also tries three sub-bit offsets to
-  // handle bit-timing misalignment.
-  function decode(samples, sr) {
+  // Three tiers, mirroring dsc_decode_ddesk.py:
+  //   1. baseline 1615/1785 (what a correct 2185.8 kHz dial produces)
+  //   2. autotune-located peak pair — handles LO offset / non-standard dial
+  //   3. ±60 Hz sweep around the autotune center for fine bit-bin alignment
+  // Each tier tries 3 sub-bit offsets for bit-clock alignment.
+  function decode(samples, sr, opts = {}) {
+    const debug = !!opts.debug;
     const spb = Math.floor(sr / BAUD);
     const subOffsets = [0, (spb / 3) | 0, ((2 * spb) / 3) | 0];
     let best = null;
+    let attempts = 0;
 
     const tryTone = (mark, space) => {
       for (const off of subOffsets) {
+        attempts++;
         const view = samples.subarray(off);
         const bits = fskDemod(view, sr, mark, space);
-        const { start, score } = findPhasing(bits, 2);
+        const { start, score } = findPhasing(bits, 5);
         if (start < 0) continue;
         if (!best || score < best.score) best = { bits, start, score, mark, space };
       }
     };
 
     tryTone(MARK, SPACE);
+    let tuned = null;
     if (!best || best.score > 2) {
-      for (let c = 1500; c <= 1900; c += 10) {
+      tuned = autotuneMarkSpace(samples, sr);
+      if (tuned) tryTone(tuned[0], tuned[1]);
+    }
+    // Tier 3: narrow ±60 Hz sweep around the autotune-located center,
+    // catching the case where the FFT peaks were off by a few bins. We
+    // do NOT do a wide-band sweep — autotune already covered 300–2500 Hz,
+    // and a brute force sweep on noise pairs is the main idle-CPU sink.
+    if (tuned && (!best || best.score > 2)) {
+      const center = (tuned[0] + tuned[1]) / 2;
+      for (let c = center - 60; c <= center + 60; c += 10) {
         tryTone(c - 85, c + 85);
         if (best && best.score <= 1) break;
       }
     }
-    if (!best) return null;
+    if (!best) {
+      if (debug) console.log(`[dsc] no phasing after ${attempts} trials (sr=${sr})`);
+      return null;
+    }
 
     const rawBytes = bitsToBytes(best.bits, best.start);
     const dataSyms = deinterleave(rawBytes);
 
-    // Quality gate — a noise lock will produce mostly check-error symbols
-    // (which deinterleave() sets to -1). Real DSC bursts usually have <2
-    // bad symbols in the first 16. Reject anything >4 (>25%) to keep
-    // garbage out of the log.
+    // Quality gate — noise locks produce mostly check-error symbols
+    // (-1 after deinterleave). Loosened to match Python's pipeline which
+    // accepts any lock with phasing score ≤ 5 and filters garbage downstream.
     const headLen = Math.min(16, dataSyms.length);
     let badSyms = 0;
     for (let i = 0; i < headLen; i++) if (dataSyms[i] === -1) badSyms++;
-    if (badSyms > 4 || headLen < 13) return null;
+    if (debug) {
+      console.log(`[dsc] lock: score=${best.score} mark=${best.mark.toFixed(0)} ` +
+                  `space=${best.space.toFixed(0)} bad=${badSyms}/${headLen} ` +
+                  `attempts=${attempts}`);
+    }
+    if (badSyms > 6 || headLen < 13) return null;
 
     const call = parseCall(dataSyms);
     if (call) {
@@ -283,6 +353,8 @@ const DSC = (() => {
       call.spaceHz = best.space;
       call.phasingScore = best.score;
       call.badSymbols = badSyms;
+    } else if (debug) {
+      console.log(`[dsc] parseCall rejected (too many '??' BCD digits)`);
     }
     return call;
   }
@@ -439,6 +511,7 @@ class KiwiClient {
 
 const FANOUT = 16;
 const AUDIO_LEAD_SEC = 0.25;                 // how far ahead of currentTime we schedule
+const DEBUG = /(\?|&)debug=1\b/.test(location.search);  // ?debug=1 → console traces
 
 // ITU-R M.493 DSC channels.
 const BANDS = [
@@ -747,10 +820,10 @@ class RxSlot {
       this.buffer = merged;
     }
     const now = performance.now();
-    // 3-sec attempts, staggered per-slot so 16 decoders don't pile up
-    const staggerOffset = (this.idx * 3000 / FANOUT);
-    if (now - this.lastRun > 3000 + staggerOffset * 0 &&
-        this.buffer.length >= sr * 10) {
+    // 3-sec attempts; the idx-based stagger was dead code. Slots converge
+    // on the same cadence but `setTimeout(..., 0)` yields the event loop
+    // so 16 decoders don't block the audio callback.
+    if (now - this.lastRun > 3000 && this.buffer.length >= sr * 10) {
       this.lastRun = now;
       setTimeout(() => this._runDecoder(), 0);
     }
@@ -764,9 +837,13 @@ class RxSlot {
     for (let i = 0; i < view.length; i += 64) rms += view[i] * view[i];
     rms = Math.sqrt(rms * 64 / view.length);
     if (rms < 0.005) return;
+    if (DEBUG) console.log(`[dsc] ${this.bandLabel} ${this.label}: rms=${rms.toFixed(3)} run decoder`);
 
     let call;
-    try { call = DSC.decode(view, this.sr); } catch (e) { return; }
+    try { call = DSC.decode(view, this.sr, { debug: DEBUG }); } catch (e) {
+      if (DEBUG) console.log(`[dsc] decoder threw:`, e);
+      return;
+    }
     if (!call) return;
 
     // per-slot dedupe so one burst seen across the decode window doesn't
@@ -897,13 +974,11 @@ function formatBytes(n) {
 }
 
 // -- Call row -------------------------------------------------------------
-const flagEmoji = (mmsi) => {
+// MID → ISO lookup (table at bottom of file) is used for the country
+// abbreviation in the detail panel; the row itself stays text-only.
+const midIso = (mmsi) => {
   const mid = parseInt((mmsi || "").slice(0, 3), 10);
-  if (!mid) return "";
-  const code = MID_TO_ISO[mid];
-  if (!code || code.length !== 2) return "";
-  const a = 127397;
-  return String.fromCodePoint(code.charCodeAt(0) + a, code.charCodeAt(1) + a);
+  return (mid && MID_TO_ISO[mid]) || "";
 };
 
 function addCallRow(call, entry) {
@@ -921,11 +996,12 @@ function addCallRow(call, entry) {
   const callerMmsi = call.caller || "—";
   const destMmsi = call.destination || (call.formatCode === 112 ? "all ships" : "—");
 
+  const iso = midIso(callerMmsi);
   row.innerHTML = `
     <span class="t">${hh}:${mm}:${ss}Z</span>
     <span class="who">
-      <span class="flag">${flagEmoji(callerMmsi)}</span><span class="name" data-mmsi="${callerMmsi}">MMSI ${callerMmsi}</span>
-      <span class="mmsi">${callerMmsi}</span>
+      <span class="name" data-mmsi="${callerMmsi}">MMSI ${callerMmsi}</span>
+      <span class="mmsi">${callerMmsi}${iso ? " / " + iso : ""}</span>
     </span>
     <span class="flow">→ ${escapeHtml(destMmsi)}</span>
     <span class="payload">${escapeHtml(call.category || "?")} · ${escapeHtml(call.tc1 || "?")}${call.tc2 && call.tc2 !== call.tc1 ? " · " + escapeHtml(call.tc2) : ""} · ${escapeHtml(call.eos)}</span>
@@ -1027,7 +1103,7 @@ function start() {
   // stagger connect to avoid a 16-way simultaneous handshake burst
   slots.forEach((s, i) => setTimeout(() => s.connect(), i * 120));
 
-  listenBtn.textContent = "■ Stop";
+  listenBtn.textContent = "Stop";
   listenBtn.classList.add("stop");
   updateRxCount();
 }
@@ -1037,7 +1113,7 @@ function stop() {
   slots = [];
   audioSlot = null;
   rackEl.innerHTML = "";
-  listenBtn.textContent = "▶ Listen · 16 RX";
+  listenBtn.textContent = "Listen";
   listenBtn.classList.remove("stop");
   updateRxCount();
 }
@@ -1062,7 +1138,8 @@ gainIn.addEventListener("input", () => {
 });
 muteBtn.addEventListener("click", () => {
   muted = !muted;
-  muteBtn.textContent = muted ? "🔇" : "🔊";
+  muteBtn.textContent = muted ? "unmute" : "mute";
+  muteBtn.classList.toggle("on", muted);
   if (gainNode) gainNode.gain.value = muted ? 0 : (parseFloat(gainIn.value) / 100);
 });
 

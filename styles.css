@@ -15,7 +15,7 @@
 html, body {
   background: var(--bg);
   color: var(--fg);
-  font-family: "IBM Plex Mono", "SF Mono", "Menlo", "Consolas", monospace;
+  font-family: "JetBrains Mono", "SF Mono", "Menlo", "Consolas", monospace;
   font-size: 13px;
   line-height: 1.45;
   margin: 0;
@@ -36,13 +36,6 @@ header {
   letter-spacing: 0.14em;
   font-size: 15px;
 }
-.brand .sub {
-  color: var(--dim);
-  font-weight: 400;
-  letter-spacing: 0.02em;
-  font-size: 12px;
-  margin-left: 10px;
-}
 #status {
   color: var(--dim);
   font-size: 11px;
@@ -53,7 +46,7 @@ header {
 #status.err  { color: var(--fg); text-decoration: underline; }
 
 .controls {
-  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap;
   padding: 14px 20px;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
@@ -151,7 +144,22 @@ button.primary.stop { background: var(--bg); color: var(--fg); border-color: var
   width: 8px; height: 16px;
   background: var(--fg); border: 0; cursor: pointer;
 }
-.mute { cursor: pointer; user-select: none; width: 20px; text-align: center; font-size: 14px; filter: grayscale(1); }
+.mute {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--fg);
+  padding: 8px 14px;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.mute:hover { background: var(--fg); color: var(--bg); }
+.mute.on { background: var(--fg); color: var(--bg); }
+button:focus-visible, .mute:focus-visible {
+  outline: 1px solid var(--fg);
+  outline-offset: 2px;
+}
 
 /* -- Receiver rack: 16 slots, one per live client ---------------------- */
 .rack {
@@ -281,7 +289,6 @@ button.primary.stop { background: var(--bg); color: var(--fg); border-color: var
 .call .t    { color: var(--dim); font-variant-numeric: tabular-nums; }
 .call .who  { color: var(--fg); }
 .call .who .mmsi { color: var(--dim); font-size: 11px; margin-left: 6px; }
-.call .who .flag { margin-right: 6px; filter: grayscale(1); }
 .call .flow { color: var(--fg); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
 .call .payload { color: var(--dim); }
 .call .heard { color: var(--dim); font-size: 10px; text-align: right; font-variant-numeric: tabular-nums; }
