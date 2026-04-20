@@ -6,7 +6,13 @@
 // Results are cached in localStorage forever so repeat MMSIs don't
 // re-hit the upstream.
 
-import { GATEWAY } from "./kiwi.js";
+// Gateway URL lives in a <meta> tag — same source of truth as app.js.
+// Inlined so vessels.js stays a leaf module with no intra-app deps.
+const GATEWAY = (() => {
+  const meta = document.querySelector('meta[name="skywave-gateway"]');
+  const url = meta && meta.content.trim();
+  return url ? url.replace(/\/+$/, "") : null;
+})();
 
 // Bump `STORAGE_VERSION` when the cached-entry schema changes — we drop
 // mismatches on load rather than trying to migrate.

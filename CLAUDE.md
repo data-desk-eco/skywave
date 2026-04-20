@@ -1,11 +1,18 @@
 # Skywave
 
-Single-page browser app that fans out across dozens of public KiwiSDR
-receivers, tunes each to a DSC channel, decodes every call, and prints
-the result as a scrolling table. Optional GFW enrichment adds ship
-name / flag / type to each caller. No backend of our own; the
-Cloudflare Worker in `worker/` only tunnels WSS→WS so HTTPS pages can
-reach the ws:// KiwiSDRs.
+Single-page browser app that watches a rack of public KiwiSDR receivers
+tuned to the six international DSC channels, decodes every call, and
+prints the result as a scrolling table. Optional GFW enrichment adds
+ship name / flag / type to each caller.
+
+Two topologies share the same UI:
+
+- **v1**: browser opens ~24 WSs to KiwiSDRs, runs the decoder locally.
+  The Cloudflare Worker only tunnels WSS→WS.
+- **v2**: browser subscribes to a rack composed by a Worker. One
+  `ReceiverDO` per channel per receiver holds the sole upstream WS,
+  runs the decoder at the edge, and fans decoded calls out to every
+  attached browser. See `PLAN.md`.
 
 ## What it is
 
@@ -43,24 +50,43 @@ Radio-ham tinker spirit served with Data Desk restraint.
 
 ## Code shape
 
-Six small modules (ES modules, `<script type="module">`):
+### `client/` — static site (ES modules, no build step)
 
-- `app.js` — orchestration, the `RxSlot` class, audio routing, call
-  dedupe & rendering, CSV export, bootstrap.
-- `dsc.js` — self-contained ITU-R M.493 decoder (port of
-  `~/Research/dsc-triangulation/scripts/dsc_decode_ddesk.py`). Only
-  exports `decode(samples, sr, opts)`.
-- `kiwi.js` — `KiwiClient` WebSocket client, gateway-URL helper.
+- `app.js` — v2 viewer. Owns `SlotConn` (one WS per rack slot), call
+  dedupe / rendering, audio picker (follow the loudest live burst),
+  CSV export, region dropdown, bootstrap.
 - `vessels.js` — Global Fishing Watch integration. Chains `/gfw`
-  (identity: name / flag / type / callsign / IMO / vesselId) → `/gfw/tracks`
-  (last 14 days of AIS positions, decimated to ≤100 points). Both routes
-  are proxied through the Worker because GFW's public endpoints check
-  the Origin and Referer headers and won't serve our own origin. Cached
-  in localStorage (schema-versioned, dropped on version bump).
+  (identity: name / flag / type / callsign / IMO / vesselId) →
+  `/gfw/tracks` (last 14 days of AIS positions, decimated to ≤100
+  points). Both routes proxy through the Worker because GFW's public
+  endpoints check Origin + Referer. Cached in localStorage
+  (schema-versioned, dropped on bump).
 - `regions.js` — DSC channel table, regional presets with bboxes, MID
-  to ISO country mapping, coastal proximity scoring, small helpers.
+  to ISO country mapping, coastal proximity scoring.
 - `map.js` — per-card Leaflet mini-map showing the receivers that
   heard the call. Lazy-mounted on first expand.
+
+### `worker/src/` — Cloudflare Worker + Durable Objects
+
+- `index.js` — router. Keeps v1 routes (`/receivers`, `/kiwi/...`,
+  `/gfw`, `/gfw/tracks`); adds v2 (`/v2/rack`, `/v2/slot/...`). Both
+  coexist during migration.
+- `directory-do.js` — singleton `DirectoryDO`. Refreshes the public
+  KiwiSDR list, composes the "front page" rack for each region. No
+  traffic flows through it; it just answers HTTP GETs.
+- `receiver-do.js` — `ReceiverDO`, keyed `<host>:<port>:<bandKHz>`.
+  Owns the sole upstream WebSocket to that channel, runs `dsc.js`,
+  broadcasts decoded calls to every attached client via the
+  hibernation API. Alarm-based idle teardown after 5 min with no
+  subscribers.
+- `kiwi-upstream.js` — server-side `KiwiClient`, mirrors `kiwi.js` but
+  runs in the Worker runtime.
+- `dsc.js` — ITU-R M.493 decoder (identical to the one `client/` used
+  to carry; copy of `~/Research/dsc-triangulation/scripts/dsc_decode_ddesk.py`).
+- `regions.js` — server subset of the regions data; adds `pickRack`
+  which replaces v1's client-side `pickReceiversAcrossBands`.
+- `location-hint.js` — maps a receiver's GPS to a Cloudflare
+  `locationHint` so a Tokyo DO wakes up in apac, not wnam.
 
 ## Do
 
@@ -72,12 +98,14 @@ Six small modules (ES modules, `<script type="module">`):
 
 ## Don't
 
-- Any framework or bundler. `npm` is banned.
+- Any framework or bundler. `npm` is banned (except for wrangler in
+  `worker/`, which npx-runs without a package.json).
 - Auto-reconnect loops, multi-slot occupation, or any "listen forever"
   behaviour. A listener connected for 10–30 min is normal KiwiSDR
   usage; anything that squats on a slot indefinitely is not. The
-  etiquette gate (≥2 free slots to join, drop on fill) runs every 45 s
-  and is non-negotiable.
+  etiquette gate (≥2 free slots to join) still applies; v2 enforces it
+  server-side when `DirectoryDO` picks the rack, and ReceiverDOs
+  self-destruct 5 min after the last subscriber leaves.
 - Storing secrets. The aisstream.io key was hard-coded for a while
   during development but has been removed (aisstream was dropped
   entirely — the MMSI filter doesn't work and real-time positions for

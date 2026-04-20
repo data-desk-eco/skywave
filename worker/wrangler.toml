@@ -5,3 +5,19 @@ workers_dev = true
 
 [observability]
 enabled = true
+
+# v2: one Durable Object per KiwiSDR channel, plus a singleton for
+# receiver-list refresh + per-region rack composition. See PLAN.md.
+[[durable_objects.bindings]]
+name = "RECEIVER"
+class_name = "ReceiverDO"
+
+[[durable_objects.bindings]]
+name = "DIRECTORY"
+class_name = "DirectoryDO"
+
+# SQLite-backed DO classes — the default after 2025-01-01 compat date,
+# but be explicit so migrations survive compat-date bumps.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ReceiverDO", "DirectoryDO"]

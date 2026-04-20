@@ -1,43 +1,46 @@
-// Skywave gateway — a thin Cloudflare Worker that lets the static
-// HTTPS site talk to the HTTP-only KiwiSDR ecosystem.
+// Skywave gateway — the single Cloudflare Worker that fronts both the
+// v1 and v2 topologies.
 //
-// Two routes:
+// v1 routes (stable; the browser-decoded client still uses these):
 //   GET  /receivers              → kiwisdr_com list as JSON, cached 10 min
 //   WS   /kiwi/:host/:port/<path>  → tunnels to ws://host:port/<path>
+//   GET  /gfw?query=<mmsi>       → GFW identity lookup (proxy)
+//   GET  /gfw/tracks?vesselId=   → GFW decimated 14-day AIS track
 //
-// Why this exists: rx.linkfanel.net serves the public receiver list over
-// plain HTTP, and every KiwiSDR speaks plain ws://. Mixed-content rules
-// block both from an HTTPS origin. This Worker terminates TLS and relays.
+// v2 routes (edge-decoded, slot-shared — see PLAN.md):
+//   GET  /v2/rack?region=<id>    → regional "front page" rack as JSON
+//   WS   /v2/slot/:host/:port/:bandKHz   → attach to a ReceiverDO
 //
+// v1 and v2 coexist during migration; legacy clients keep working.
 // Deploy: (cd worker && npx wrangler deploy)
+
+import { ReceiverDO } from "./receiver-do.js";
+import { DirectoryDO } from "./directory-do.js";
+import { locationHintFor } from "./location-hint.js";
+
+export { ReceiverDO, DirectoryDO };
 
 const CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, OPTIONS",
 };
 
+// -------------------------------------------------------------------
+// v1 helpers (unchanged from pre-v2)
+// -------------------------------------------------------------------
+
 async function receivers() {
-  // CF fetches this upstream via its own edge cache (cacheTtl); browsers
-  // honour the Cache-Control header on our response. No need for an
-  // explicit caches.default dance, which is per-POP and painful to bust.
   const upstream = await fetch(
     "http://rx.linkfanel.net/kiwisdr_com.js",
     { cf: { cacheTtl: 600, cacheEverything: true } },
   );
   if (!upstream.ok) {
-    return new Response(`upstream ${upstream.status}`, {
-      status: 502,
-      headers: CORS,
-    });
+    return new Response(`upstream ${upstream.status}`, { status: 502, headers: CORS });
   }
   const text = await upstream.text();
   const m = text.match(/var\s+kiwisdr_com\s*=\s*(\[[\s\S]*\])\s*;?/);
   if (!m) return new Response("list parse failed", { status: 502, headers: CORS });
-
-  // The upstream blob is JS (object-literal), not JSON — trailing commas
-  // before `}` or `]` are valid there and invalid here. Strip them.
   const json = m[1].replace(/,(\s*[\]}])/g, "$1");
-
   return new Response(json, {
     headers: {
       "content-type": "application/json",
@@ -47,11 +50,6 @@ async function receivers() {
   });
 }
 
-// GFW vessel identity lookup. The public gateway.api.globalfishingwatch.org
-// endpoint accepts an empty bearer token (`Authorization: Bearer`) so long
-// as the request's Origin and Referer come from globalfishingwatch.org —
-// same allowance that backs the logged-out vessel search on their map.
-// Browsers won't let us forge those headers client-side, so we proxy.
 async function gfw(url) {
   const q = url.searchParams.get("query") || "";
   if (!/^\d{9}$/.test(q)) {
@@ -83,10 +81,6 @@ async function gfw(url) {
   });
 }
 
-// GFW vessel tracks. Same permission shape as /gfw, but responses can
-// be enormous (a fortnight of a busy ferry is > 700 KB) so we parse the
-// GeoJSON upstream and return a compact { lastPos, trail } shape to
-// the client. Trail is decimated to ≤100 points.
 async function gfwTracks(url) {
   const vesselId = url.searchParams.get("vesselId") || "";
   if (!/^[a-z0-9-]{10,}$/i.test(vesselId)) {
@@ -103,7 +97,6 @@ async function gfwTracks(url) {
     "&format=GEOJSON" +
     "&dataset=public-global-all-tracks%3Av4.0" +
     `&start-date=${fmt(start)}&end-date=${fmt(end)}`;
-
   const upstream = await fetch(target, {
     cf: { cacheTtl: 1800, cacheEverything: true },
     headers: {
@@ -116,7 +109,6 @@ async function gfwTracks(url) {
   if (!upstream.ok) {
     return new Response(`upstream ${upstream.status}`, { status: upstream.status, headers: CORS });
   }
-
   const json = (obj) => new Response(JSON.stringify(obj), {
     headers: {
       "content-type": "application/json",
@@ -124,13 +116,9 @@ async function gfwTracks(url) {
       ...CORS,
     },
   });
-
   const data = await upstream.json();
   const feature = data.features && data.features[0];
   if (!feature || !feature.geometry) return json({ lastPos: null, trail: [] });
-
-  // Flatten into parallel coords/times arrays, regardless of whether
-  // the geometry is LineString or MultiLineString.
   const coords = [];
   const times = [];
   const timesProp = feature.properties && feature.properties.coordinateProperties
@@ -151,7 +139,6 @@ async function gfwTracks(url) {
     }
   }
   if (!coords.length) return json({ lastPos: null, trail: [] });
-
   const last = coords[coords.length - 1];
   const lastTs = times[times.length - 1] || null;
   const MAX_TRAIL = 100;
@@ -164,7 +151,6 @@ async function gfwTracks(url) {
       trail[trail.length - 1][1] !== +last[1].toFixed(4)) {
     trail.push([+last[0].toFixed(4), +last[1].toFixed(4)]);
   }
-
   return json({
     lastPos: { lat: +last[1].toFixed(5), lon: +last[0].toFixed(5), ts: lastTs },
     trail,
@@ -176,11 +162,9 @@ async function proxyKiwi(request, host, port, rest) {
   if (!Number.isFinite(p) || p < 1 || p > 65535) {
     return new Response("bad port", { status: 400 });
   }
-  // Only allow KiwiSDR-ish path shapes: /<timestamp>/SND|EXT|W%2FF|W/F
   if (!/^\/\d+\/(SND|EXT|W%2FF|W\/F)$/.test(rest)) {
     return new Response("unexpected path", { status: 400 });
   }
-
   const target = `http://${host}:${port}${rest}`;
   let upstreamResp;
   try {
@@ -195,53 +179,104 @@ async function proxyKiwi(request, host, port, rest) {
     console.log(`fetch-throw ${host}:${port}${rest} — ${e.message}`);
     return new Response(`upstream fetch threw: ${e.message}`, { status: 502 });
   }
-
   const upstream = upstreamResp.webSocket;
   if (!upstream) {
     console.log(`no-ws ${host}:${port}${rest} — status ${upstreamResp.status}`);
-    return new Response(`upstream upgrade failed (${upstreamResp.status})`, {
-      status: 502,
-    });
+    return new Response(`upstream upgrade failed (${upstreamResp.status})`, { status: 502 });
   }
-  console.log(`ok ${host}:${port}${rest}`);
   upstream.accept();
-
   const pair = new WebSocketPair();
-  const client = pair[0];
-  const server = pair[1];
+  const client = pair[0], server = pair[1];
   server.accept();
-
   const relay = (from, to) => {
-    from.addEventListener("message", (e) => {
-      try { to.send(e.data); } catch {}
-    });
-    from.addEventListener("close", () => { try { to.close(); } catch {} });
-    from.addEventListener("error", () => { try { to.close(); } catch {} });
+    from.addEventListener("message", (e) => { try { to.send(e.data); } catch (_) {} });
+    from.addEventListener("close", () => { try { to.close(); } catch (_) {} });
+    from.addEventListener("error", () => { try { to.close(); } catch (_) {} });
   };
   relay(server, upstream);
   relay(upstream, server);
-
   return new Response(null, { status: 101, webSocket: client });
 }
 
+// -------------------------------------------------------------------
+// v2 routing — DirectoryDO (rack composition) + ReceiverDO (per-slot WS)
+// -------------------------------------------------------------------
+
+function directoryStub(env) {
+  const id = env.DIRECTORY.idFromName("directory");
+  return env.DIRECTORY.get(id);
+}
+
+function receiverStub(env, host, port, bandKHz, gps) {
+  const name = `${host}:${port}:${bandKHz}`;
+  const id = env.RECEIVER.idFromName(name);
+  const locationHint = locationHintFor(gps);
+  return env.RECEIVER.get(id, locationHint ? { locationHint } : undefined);
+}
+
+async function handleV2Rack(request, env) {
+  const url = new URL(request.url);
+  const inner = new URL("https://do/rack");
+  for (const [k, v] of url.searchParams) inner.searchParams.set(k, v);
+  // Inner host is ignored by the DO; only pathname + query matter to
+  // the DO handler, but we still want the user-facing host when the DO
+  // builds WS URLs — smuggle it through as a query param.
+  inner.searchParams.set("__origin", `${url.protocol}//${url.host}`);
+  return (await directoryStub(env).fetch(new Request(inner, request)));
+}
+
+async function handleV2Slot(request, env, host, port, bandKHz) {
+  if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+    return new Response("websocket required", { status: 400 });
+  }
+  const p = parseInt(port, 10);
+  const band = parseFloat(bandKHz);
+  if (!Number.isFinite(p) || p < 1 || p > 65535 || !Number.isFinite(band)) {
+    return new Response("bad slot", { status: 400 });
+  }
+  const url = new URL(request.url);
+  const lat = parseFloat(url.searchParams.get("lat") || "NaN");
+  const lon = parseFloat(url.searchParams.get("lon") || "NaN");
+  const gps = Number.isFinite(lat) && Number.isFinite(lon) ? [lat, lon] : null;
+
+  // Forward the upgrade to the receiver DO, passing config via the query
+  // so the first attach doesn't need a separate /init round-trip.
+  const inner = new URL(`https://do/attach`);
+  inner.searchParams.set("host", host);
+  inner.searchParams.set("port", String(p));
+  inner.searchParams.set("band", String(band));
+  if (url.searchParams.get("label")) inner.searchParams.set("label", url.searchParams.get("label"));
+  if (gps) {
+    inner.searchParams.set("lat", String(gps[0]));
+    inner.searchParams.set("lon", String(gps[1]));
+  }
+  const fwd = new Request(inner, request);
+  return receiverStub(env, host, p, band, gps).fetch(fwd);
+}
+
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: CORS });
     }
+
+    if (url.pathname === "/v2/rack") return handleV2Rack(request, env);
+    const vSlot = url.pathname.match(/^\/v2\/slot\/([^/]+)\/(\d+)\/([0-9.]+)\/?$/);
+    if (vSlot) return handleV2Slot(request, env, decodeURIComponent(vSlot[1]), vSlot[2], vSlot[3]);
+
+    // Legacy v1 surface
     if (url.pathname === "/receivers") return receivers();
     if (url.pathname === "/gfw") return gfw(url);
     if (url.pathname === "/gfw/tracks") return gfwTracks(url);
-
     const m = url.pathname.match(/^\/kiwi\/([^/]+)\/(\d+)(\/.+)$/);
     if (m && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
       return proxyKiwi(request, m[1], m[2], m[3]);
     }
 
-    return new Response("skywave gateway · /receivers · /kiwi/:host/:port/*", {
-      status: 404,
-      headers: CORS,
-    });
+    return new Response(
+      "skywave gateway · /receivers · /kiwi/:host/:port/* · /v2/rack · /v2/slot/:host/:port/:band",
+      { status: 404, headers: CORS },
+    );
   },
 };

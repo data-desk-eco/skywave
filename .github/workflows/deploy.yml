@@ -21,11 +21,7 @@ jobs:
       - name: Prepare dist
         run: |
           mkdir -p dist
-          # Ship every top-level HTML / JS / CSS / SVG — easier to keep
-          # honest than a hand-maintained filename list. The Worker
-          # sub-directory and research/dev artefacts are excluded by
-          # virtue of not matching the globs.
-          cp *.html *.js *.css *.svg dist/
+          cp client/*.html client/*.js client/*.css client/*.svg dist/
           ls -la dist/
 
       - uses: actions/configure-pages@v5

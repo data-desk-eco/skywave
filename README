@@ -1,33 +1,43 @@
 Skywave — live DSC monitor
 ==========================
 
-A browser-native decoder for the routine maritime radio traffic almost
-nobody reads anymore. Skywave picks dozens of public KiwiSDRs around the
-world, tunes each to one of the six international Digital Selective
+A browser-native view onto the routine maritime radio traffic almost
+nobody reads anymore. Skywave picks dozens of public KiwiSDRs around
+the world, tunes each to one of the six international Digital Selective
 Calling channels (MF 2187.5 kHz and five HF frequencies), decodes every
-burst in JavaScript, deduplicates across receivers, and prints the
-result as a scrolling table of who's calling whom, from where, about
-what.
+burst, dedupes across receivers, and prints the result as a scrolling
+table of who's calling whom, from where, about what.
 
-One HTML file, five little JS modules, one CSS file, no build step.
+Two deployments share the same UI:
+
+* **v1 (client-decoded)** — every browser opens its own fleet of
+  WebSockets to the KiwiSDR pool and runs the decoder locally. Still
+  live in `client/`.
+
+* **v2 (edge-decoded, slot-shared)** — one Cloudflare Durable Object
+  per KiwiSDR channel holds the only upstream WebSocket, runs the
+  decoder, and fans decoded calls to every browser attached to it.
+  One listener on each channel, forever, serving everyone who turns
+  up. See `PLAN.md` for the full design and `worker/src/` for the
+  code.
 
 
 Using it
 --------
-Open the page. It picks up to ~96 public KiwiSDRs covering the DSC
-channels and starts listening. The top-right dropdown narrows the scan
-to a region (NW Europe, Mediterranean, US East Coast, etc.) — useful
-if you want to concentrate on one body of water instead of the whole
-ocean.
 
-The audio stays silent between transmissions. When a DSC FSK burst is
+Open the page. It asks the gateway for a rack of receivers covering
+the DSC channels (constrained to the selected region) and subscribes
+to each. The top-right dropdown narrows the scan — NW Europe, the
+Mediterranean, US East Coast, etc.
+
+Audio stays silent between transmissions. When a DSC FSK burst is
 detected on one of the receivers we're listening to, the strongest
 signal gets routed to your speakers — so you hear the actual tones of
 the protocol the first time it happens, which is the fun bit.
 
 Click a row to expand: decoder internals, the full list of receivers
-that heard the call, and a mini map of where those receivers sit along
-with the vessel's last known position.
+that heard the call, and a mini-map showing where those receivers sit
+along with the vessel's last known position.
 
 Vessel enrichment uses Global Fishing Watch's public search + tracks
 endpoints, proxied through the Cloudflare Worker. Ship name, flag,
@@ -37,46 +47,60 @@ automatically for every MMSI that GFW has data on. No API key needed.
 
 Etiquette
 ---------
-Public KiwiSDR receivers have a limited number of user slots. Skywave
-only joins a receiver that has at least two free slots at the time of
-connection, and drops out automatically if a receiver subsequently
-fills up. There is always one slot available for another human
-listener. Please don't run Skywave 24/7 in a background tab for
-weeks on end — occupying a slot for an hour or two at a time is normal,
-occupying it forever is not.
+
+Public KiwiSDR receivers have a limited number of user slots. In v2
+the Worker holds exactly one connection per channel per receiver —
+`ident_user=skywave shared listener` — no matter how many humans are
+viewing. A ReceiverDO tears itself down five minutes after the last
+subscriber disconnects, so a quiet region stops squatting slots.
 
 
-File layout
+Repo layout
 -----------
-index.html    entry point; Leaflet + JetBrains Mono + the app
-styles.css    the whole stylesheet, mobile-first
-app.js        orchestration: rack, audio routing, call dedupe, CSV
-dsc.js        ITU-R M.493 decoder
-kiwi.js       KiwiSDR WebSocket audio client
-vessels.js    GFW vessel identity lookup
-regions.js    DSC channels, regional presets, MID→ISO, geographic helpers
-map.js        per-card mini map (Leaflet)
-favicon.svg   Data Desk mark
-worker/       Cloudflare Worker gateway (WSS→WS tunnel for HTTPS pages)
+
+    client/            static site (Pages / any HTTP server)
+      index.html       entry point; Leaflet + JetBrains Mono + the app
+      styles.css       the whole stylesheet, mobile-first
+      app.js           v2 viewer: rack subscription, rendering, audio
+      vessels.js       GFW vessel identity lookup
+      regions.js       DSC channels, regional presets, MID→ISO
+      map.js           per-card mini map (Leaflet)
+      favicon.svg      Data Desk mark
+    worker/            Cloudflare Worker + Durable Objects
+      wrangler.toml    DO bindings + migrations
+      src/
+        index.js       router: v1 legacy routes + v2 /v2/rack, /v2/slot
+        directory-do.js  rack composer + receiver-list refresh
+        receiver-do.js   per-channel KiwiSDR listener + decoder + fanout
+        kiwi-upstream.js server-side KiwiSDR WS client
+        dsc.js           ITU-R M.493 decoder (same as v1)
+        regions.js       server-side subset of regions
+        location-hint.js GPS → Cloudflare locationHint
+    PLAN.md            the v2 design document
 
 
 Local development
 -----------------
-ES modules need an HTTP server; file:// won't work:
 
-    python3 -m http.server 8000
+The client is pure static ES modules; any HTTP server does it:
 
-Then open http://localhost:8000/ — from http:// origins Skywave talks
-to KiwiSDRs directly. From https:// origins it tunnels through the
-Cloudflare Worker in worker/.
+    cd client && python3 -m http.server 8000
 
-Add ?debug=1 to the URL for verbose console logging of the decoder and
-the GFW lookups.
+The gateway needs wrangler:
+
+    cd worker && npx wrangler dev
+    # or: npx wrangler deploy
+
+Point `index.html`'s `<meta name="skywave-gateway">` at your wrangler-
+dev URL (e.g. `http://127.0.0.1:8787`) if you want local end-to-end.
+
+Add `?debug=1` to the page URL for verbose console logging.
 
 
 Credits & research
 ------------------
+
 Decoder ported from the Data Desk research repo at
-~/Research/dsc-triangulation. Original Python reference:
-scripts/dsc_decode_ddesk.py. Canonical .NET reference:
-vendor/TAOSW.DSC_Decoder.Core/GMDSSDecoder.cs.
+`~/Research/dsc-triangulation`. Original Python reference:
+`scripts/dsc_decode_ddesk.py`. Canonical .NET reference:
+`vendor/TAOSW.DSC_Decoder.Core/GMDSSDecoder.cs`.
