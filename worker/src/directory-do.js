@@ -93,7 +93,10 @@ export class DirectoryDO {
 
     return Response.json(
       { region: region.id, regionName: region.name, slots },
-      { headers: { "cache-control": "public, max-age=30" } },
+      { headers: {
+        "cache-control": "public, max-age=30",
+        "access-control-allow-origin": "*",
+      } },
     );
   }
 }
