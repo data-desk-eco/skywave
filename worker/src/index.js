@@ -17,14 +17,12 @@ const CORS = {
 };
 
 async function receivers() {
-  const cache = caches.default;
-  const cacheKey = new Request("https://skywave-gateway/receivers");
-  let resp = await cache.match(cacheKey);
-  if (resp) return resp;
-
+  // CF fetches this upstream via its own edge cache (cacheTtl); browsers
+  // honour the Cache-Control header on our response. No need for an
+  // explicit caches.default dance, which is per-POP and painful to bust.
   const upstream = await fetch(
-    "http://rx.linkfanel.net/kiwisdr_com.js?t=" + Date.now(),
-    { cf: { cacheTtl: 600 } },
+    "http://rx.linkfanel.net/kiwisdr_com.js",
+    { cf: { cacheTtl: 600, cacheEverything: true } },
   );
   if (!upstream.ok) {
     return new Response(`upstream ${upstream.status}`, {
@@ -36,15 +34,17 @@ async function receivers() {
   const m = text.match(/var\s+kiwisdr_com\s*=\s*(\[[\s\S]*\])\s*;?/);
   if (!m) return new Response("list parse failed", { status: 502, headers: CORS });
 
-  resp = new Response(m[1], {
+  // The upstream blob is JS (object-literal), not JSON — trailing commas
+  // before `}` or `]` are valid there and invalid here. Strip them.
+  const json = m[1].replace(/,(\s*[\]}])/g, "$1");
+
+  return new Response(json, {
     headers: {
       "content-type": "application/json",
       "cache-control": "public, max-age=600",
       ...CORS,
     },
   });
-  await cache.put(cacheKey, resp.clone());
-  return resp;
 }
 
 async function proxyKiwi(request, host, port, rest) {
@@ -58,21 +58,28 @@ async function proxyKiwi(request, host, port, rest) {
   }
 
   const target = `http://${host}:${port}${rest}`;
-  const upstreamResp = await fetch(target, {
-    headers: {
-      upgrade: "websocket",
-      connection: "upgrade",
-      // KiwiSDR checks origin loosely; forward a safe one
-      origin: `http://${host}:${port}`,
-    },
-  });
+  let upstreamResp;
+  try {
+    upstreamResp = await fetch(target, {
+      headers: {
+        upgrade: "websocket",
+        connection: "upgrade",
+        origin: `http://${host}:${port}`,
+      },
+    });
+  } catch (e) {
+    console.log(`fetch-throw ${host}:${port}${rest} — ${e.message}`);
+    return new Response(`upstream fetch threw: ${e.message}`, { status: 502 });
+  }
 
   const upstream = upstreamResp.webSocket;
   if (!upstream) {
+    console.log(`no-ws ${host}:${port}${rest} — status ${upstreamResp.status}`);
     return new Response(`upstream upgrade failed (${upstreamResp.status})`, {
       status: 502,
     });
   }
+  console.log(`ok ${host}:${port}${rest}`);
   upstream.accept();
 
   const pair = new WebSocketPair();
