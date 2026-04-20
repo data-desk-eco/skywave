@@ -1,0 +1,84 @@
+Skywave — live DSC monitor
+==========================
+
+A browser-native decoder for the routine maritime radio traffic almost
+nobody reads anymore. Skywave picks dozens of public KiwiSDRs around the
+world, tunes each to one of the six international Digital Selective
+Calling channels (MF 2187.5 kHz and five HF frequencies), decodes every
+burst in JavaScript, deduplicates across receivers, and prints the
+result as a scrolling table of who's calling whom, from where, about
+what.
+
+One HTML file, five little JS modules, one CSS file, no build step.
+
+
+Using it
+--------
+Open the page. It picks up to ~96 public KiwiSDRs covering the DSC
+channels and starts listening. The top-right dropdown narrows the scan
+to a region (NW Europe, Mediterranean, US East Coast, etc.) — useful
+if you want to concentrate on one body of water instead of the whole
+ocean.
+
+The audio stays silent between transmissions. When a DSC FSK burst is
+detected on one of the receivers we're listening to, the strongest
+signal gets routed to your speakers — so you hear the actual tones of
+the protocol the first time it happens, which is the fun bit.
+
+Click a row to expand: decoder internals, the full list of receivers
+that heard the call, and a mini map of where those receivers sit.
+
+Add a Global Fishing Watch API token to enrich callers with ship name,
+flag, vessel type and callsign:
+
+    localStorage.setItem("skywave.gfwKey", "<your token>")
+
+Free tokens are available at globalfishingwatch.org/our-apis/tokens.
+Without a token the MMSI number is all you get.
+
+
+Etiquette
+---------
+Public KiwiSDR receivers have a limited number of user slots. Skywave
+only joins a receiver that has at least two free slots at the time of
+connection, and drops out automatically if a receiver subsequently
+fills up. There is always one slot available for another human
+listener. Please don't run Skywave 24/7 in a background tab for
+weeks on end — occupying a slot for an hour or two at a time is normal,
+occupying it forever is not.
+
+
+File layout
+-----------
+index.html    entry point; Leaflet + JetBrains Mono + the app
+styles.css    the whole stylesheet, mobile-first
+app.js        orchestration: rack, audio routing, call dedupe, CSV
+dsc.js        ITU-R M.493 decoder
+kiwi.js       KiwiSDR WebSocket audio client
+vessels.js    GFW vessel identity lookup
+regions.js    DSC channels, regional presets, MID→ISO, geographic helpers
+map.js        per-card mini map (Leaflet)
+favicon.svg   Data Desk mark
+worker/       Cloudflare Worker gateway (WSS→WS tunnel for HTTPS pages)
+
+
+Local development
+-----------------
+ES modules need an HTTP server; file:// won't work:
+
+    python3 -m http.server 8000
+
+Then open http://localhost:8000/ — from http:// origins Skywave talks
+to KiwiSDRs directly. From https:// origins it tunnels through the
+Cloudflare Worker in worker/.
+
+Add ?debug=1 to the URL for verbose console logging of the decoder and
+the GFW lookups.
+
+
+Credits & research
+------------------
+Decoder ported from the Data Desk research repo at
+~/Research/dsc-triangulation. Original Python reference:
+scripts/dsc_decode_ddesk.py. Canonical .NET reference:
+vendor/TAOSW.DSC_Decoder.Core/GMDSSDecoder.cs.
