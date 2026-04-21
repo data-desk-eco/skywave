@@ -254,7 +254,11 @@ function stopFollowing(conn) {
 
 // The header indicator doubles as the audio-locked hint: on iOS the
 // AudioContext can be running but muted until the user taps, so don't
-// pretend a station is audible when it isn't.
+// pretend a station is audible when it isn't. On fine-pointer devices
+// any click anywhere unlocks audio, so the hint is noise — drop it
+// and let the bare label sit unstyled until the first interaction.
+const NEEDS_TAP_HINT = !!window.matchMedia?.("(pointer: coarse)").matches;
+
 function updatePlayingLabel() {
   const conn = audioFollowKey ? slots.get(audioFollowKey) : null;
   if (!conn) {
@@ -269,7 +273,7 @@ function updatePlayingLabel() {
     playingEl.textContent = label;
     playingEl.classList.add("on");
   } else {
-    playingEl.textContent = `tap to enable audio · ${label}`;
+    playingEl.textContent = NEEDS_TAP_HINT ? `tap to enable audio · ${label}` : label;
     playingEl.classList.remove("on");
   }
 }
