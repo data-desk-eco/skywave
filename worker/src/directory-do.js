@@ -8,7 +8,7 @@
 // ReceiverDO (via its own alarm), so this DO stays stateless beyond
 // a short in-memory cache of the receiver list.
 
-import { pickRack, regionById, FANOUT_CAP } from "./regions.js";
+import { pickRack, regionById, DEFAULT_FANOUT } from "./regions.js";
 
 const RECEIVER_TTL_MS = 10 * 60 * 1000;
 
@@ -27,8 +27,8 @@ export class DirectoryDO {
 
     if (path.endsWith("/rack")) {
       const regionId = url.searchParams.get("region") || "global";
-      const fanoutRaw = parseInt(url.searchParams.get("fanout") || "48", 10);
-      const fanout = Math.min(FANOUT_CAP, Math.max(1, Number.isFinite(fanoutRaw) ? fanoutRaw : 48));
+      const fanoutRaw = parseInt(url.searchParams.get("fanout") || String(DEFAULT_FANOUT), 10);
+      const fanout = Math.min(DEFAULT_FANOUT, Math.max(1, Number.isFinite(fanoutRaw) ? fanoutRaw : DEFAULT_FANOUT));
       return this._handleRack(url, regionId, fanout);
     }
     if (path.endsWith("/refresh")) {

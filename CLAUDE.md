@@ -39,8 +39,8 @@ the URL on first attach anyway.
 ## Why the rack looks the way it does
 
 Defensible: out of ~900 public KiwiSDRs, the picker (in
-`worker/src/regions.js`) selects 8 per DSC band (48 total by default,
-cap 60) that are **active**, **coastal** (≤8° from a major port
+`worker/src/regions.js`) selects 8 per DSC band (48 total; also the
+hard ceiling) that are **active**, **coastal** (≤8° from a major port
 anchor), **healthy** (self-reported SNR ≥ 15 dB, list entry updated in
 the last hour, not IP-blacklisting us), and **considerate** (≥ 2 free
 user slots so a human listener always has one). Same-band picks are

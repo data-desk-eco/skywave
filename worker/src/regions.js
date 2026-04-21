@@ -125,8 +125,7 @@ const MIN_SNR_DB = 15;         // noise-floor cut-off, per receiver's own report
 const UPDATE_RECENCY_SEC = 3600;
 const MIN_SEP_DEG = 3;         // per-band geographic spread
 const MAX_BANDS_PER_HOST = 2;
-const DEFAULT_FANOUT = 48;
-export const FANOUT_CAP = 60;  // hard ceiling so a malicious query can't drive cost
+export const DEFAULT_FANOUT = 48;  // also the hard ceiling — ?fanout= can only narrow the rack
 
 // Coast-station-style MMSIs and many public KiwiSDRs name-check their
 // antenna in free text. Match a few designs known to pull in weak HF:
@@ -184,7 +183,7 @@ function rankCandidates(receivers, khz, bbox) {
 }
 
 export function pickRack(receivers, bbox, requested = DEFAULT_FANOUT) {
-  const n = Math.max(1, Math.min(FANOUT_CAP, requested | 0));
+  const n = Math.max(1, Math.min(DEFAULT_FANOUT, requested | 0));
   const bandsKHz = BANDS.map((b) => b.khz);
   const k = bandsKHz.length;
   const base = Math.floor(n / k);
