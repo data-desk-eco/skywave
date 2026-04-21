@@ -33,7 +33,7 @@ header {
   grid-template-columns: auto auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 12px;
-  padding: 12px var(--pad) 10px;
+  padding: 12px 8px 10px var(--pad);
   border-bottom: 1px solid var(--line);
   position: sticky; top: 0; z-index: 5;
   background: var(--bg);
@@ -288,6 +288,7 @@ header {
 @media (min-width: 900px) {
   :root { --pad: 20px; }
   html, body { font-size: 13px; }
+  header { padding-right: var(--pad); }
   .log-head {
     display: grid;
     grid-template-columns: 88px minmax(200px, 1fr) 150px minmax(200px, 2fr) 110px;
