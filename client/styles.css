@@ -274,11 +274,12 @@ header {
 .mini-map .leaflet-tooltip::before { display: none; }
 
 .empty {
-  padding: 40px 10px;
+  padding: 32px 10px;
   color: var(--dim);
-  text-align: center;
-  font-style: italic;
   font-size: 12px;
+  line-height: 1.6;
+  max-width: 58ch;
+  margin: 0 auto;
 }
 
 /* -- Desktop layout: table-ish row ------------------------------------- */
