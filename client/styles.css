@@ -140,6 +140,7 @@ header {
     ". pay   pay";
   column-gap: 10px;
   row-gap: 2px;
+  align-items: baseline;
   padding: 10px 0;
   border-bottom: 1px dashed var(--line);
   cursor: pointer;
