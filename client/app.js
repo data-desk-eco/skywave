@@ -46,6 +46,7 @@ const slots = new Map();
 const callIndex = new Map();
 let audioCtx = null;
 let destinationGain = null;
+let audioEl = null;
 let nextStart = 0;
 let audioFollowKey = null;
 let audioUnlocked = false;
@@ -262,7 +263,9 @@ function updatePlayingLabel() {
     return;
   }
   const label = `${conn.bandLabel} · ${conn.label}`;
-  if (audioCtx && audioCtx.state === "running" && audioUnlocked) {
+  const ctxReady = audioCtx && audioCtx.state === "running" && audioUnlocked;
+  const elReady  = !audioEl || !audioEl.paused;
+  if (ctxReady && elReady) {
     playingEl.textContent = label;
     playingEl.classList.add("on");
   } else {
@@ -304,7 +307,27 @@ function ensureAudio() {
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   destinationGain = audioCtx.createGain();
   destinationGain.gain.value = 1;
-  destinationGain.connect(audioCtx.destination);
+
+  // Route through an <audio> element via a MediaStreamDestination.
+  // On iOS a direct audioCtx.destination output plays in the "ambient"
+  // audio category, which the hardware Ring/Silent switch mutes — so
+  // tapping "unlocks" the context but nothing is audible. Feeding the
+  // graph into an <audio srcObject> re-categorises playback as "media",
+  // which ignores the silent switch.
+  try {
+    const streamDest = audioCtx.createMediaStreamDestination();
+    destinationGain.connect(streamDest);
+    audioEl = document.createElement("audio");
+    audioEl.autoplay = true;
+    audioEl.playsInline = true;
+    audioEl.srcObject = streamDest.stream;
+    audioEl.addEventListener("play", updatePlayingLabel);
+    audioEl.addEventListener("pause", updatePlayingLabel);
+    document.body.appendChild(audioEl);
+  } catch (_) {
+    destinationGain.connect(audioCtx.destination);
+  }
+
   nextStart = audioCtx.currentTime + AUDIO_LEAD_SEC;
   audioCtx.addEventListener("statechange", updatePlayingLabel);
 }
@@ -314,10 +337,8 @@ function unlockAudio() {
   if (audioCtx.state === "suspended") {
     try { audioCtx.resume(); } catch (_) {}
   }
-  // iOS WebKit (Safari + Chrome on iOS) leaves the AudioContext muted
-  // until something is actually scheduled inside a user-activation
-  // gesture — resume() alone isn't enough. Schedule one silent frame to
-  // flip the audio session into a state that allows later playback.
+  // iOS WebKit needs an actual buffer scheduled inside the gesture to
+  // unmute the AudioContext — resume() alone isn't enough.
   try {
     const silent = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
     const src = audioCtx.createBufferSource();
@@ -326,6 +347,13 @@ function unlockAudio() {
     src.start(0);
     audioUnlocked = true;
   } catch (_) {}
+  // And kick the <audio> element's play() inside the same gesture so
+  // iOS actually starts pulling from the MediaStream. Without this the
+  // element stays paused, silencing every later sample.
+  if (audioEl) {
+    try { const p = audioEl.play(); if (p && p.catch) p.catch(() => {}); }
+    catch (_) {}
+  }
   updatePlayingLabel();
 }
 
