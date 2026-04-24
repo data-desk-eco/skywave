@@ -144,17 +144,15 @@ export class TDOADO {
     };
   }
 
-  // Pair by MMSI + GPS-ns proximity: a new detection joins the newest
-  // open bucket for this caller whose detections all sit within
-  // MAX_SPREAD_MS of the incoming one (on packetGpsNs, the wall-clock
-  // anchor). Fixed-window bucketing falsely splits cohorts whose anchors
-  // straddle a window boundary — a ship heard at 1.9 s and 2.1 s past
-  // the minute shouldn't end up in different buckets.
+  // Pair by fuzzy MMSI + GPS-ns proximity. Different receivers decode
+  // the same BCD MMSI with different error patterns under noise — one
+  // may see "563250300" while another sees "5632??300" and a third
+  // "563252??0". Exact-string bucketing splits these into separate
+  // cohorts and nothing ever reaches quorum. Compare with '?' as a
+  // wildcard instead, and let the bucket carry forward the most
+  // complete MMSI it's seen (fewest '?') so the broadcast reports it.
   _ingest(det) {
     this._reap();
-    // Pin the DO in memory for a minute after every detection so the
-    // rest of a same-packet cohort can land in the same in-memory
-    // bucket rather than a freshly-constructed one.
     this.state.storage.setAlarm(Date.now() + KEEPALIVE_MS).catch(() => {});
     const mmsi = det.call.caller ?? "?";
     let b = this._findMatchingBucket(mmsi, det.packetGpsNs);
@@ -167,9 +165,15 @@ export class TDOADO {
       };
       if (!this.buckets.has(mmsi)) this.buckets.set(mmsi, []);
       this.buckets.get(mmsi).push(b);
+    } else if (mmsiQuality(mmsi) > mmsiQuality(b.mmsi)) {
+      b.mmsi = mmsi;
     }
-    if (b.dets.some((d) => d.slotId === det.slotId)) {
-      console.log(`tdoa/ingest: dedup same-slot ${det.slotId} mmsi=${mmsi}`);
+    // Dedup by host (not slotId): the same physical KiwiSDR hearing
+    // the same burst on two bands gives identical geometry, so the
+    // second arrival adds nothing to a TDOA solve. Ignore the extras.
+    const detHost = hostOf(det.slotId);
+    if (b.dets.some((d) => hostOf(d.slotId) === detHost)) {
+      console.log(`tdoa/ingest: dedup same-host ${detHost} mmsi=${mmsi}`);
       return;
     }
     b.dets.push(det);
@@ -199,23 +203,25 @@ export class TDOADO {
   }
 
   _findMatchingBucket(mmsi, packetGpsNs) {
-    const list = this.buckets.get(mmsi);
-    if (!list) return null;
     const spreadNs = BigInt(MAX_SPREAD_MS) * 1_000_000n;
-    for (let i = list.length - 1; i >= 0; i--) {
-      const b = list[i];
-      // A bucket matches if the new anchor is within MAX_SPREAD_MS of
-      // every detection already in it (== within spread of the min and
-      // max anchors). Anchors are BigInts (ns).
-      let minNs = b.dets[0]?.packetGpsNs ?? b.anchorNs;
-      let maxNs = minNs;
-      for (const d of b.dets) {
-        if (d.packetGpsNs < minNs) minNs = d.packetGpsNs;
-        if (d.packetGpsNs > maxNs) maxNs = d.packetGpsNs;
+    // Scan all buckets across the Map: fuzzy-match lets a noise-garbled
+    // variant of the MMSI join an existing bucket for the same packet.
+    // N is small (tens of buckets live simultaneously) so O(N) per
+    // ingest is cheap.
+    for (const list of this.buckets.values()) {
+      for (let i = list.length - 1; i >= 0; i--) {
+        const b = list[i];
+        if (!mmsiCompatible(mmsi, b.mmsi)) continue;
+        let minNs = b.dets[0]?.packetGpsNs ?? b.anchorNs;
+        let maxNs = minNs;
+        for (const d of b.dets) {
+          if (d.packetGpsNs < minNs) minNs = d.packetGpsNs;
+          if (d.packetGpsNs > maxNs) maxNs = d.packetGpsNs;
+        }
+        const lo = packetGpsNs < minNs ? packetGpsNs : minNs;
+        const hi = packetGpsNs > maxNs ? packetGpsNs : maxNs;
+        if (hi - lo <= spreadNs) return b;
       }
-      const lo = packetGpsNs < minNs ? packetGpsNs : minNs;
-      const hi = packetGpsNs > maxNs ? packetGpsNs : maxNs;
-      if (hi - lo <= spreadNs) return b;
     }
     return null;
   }
@@ -344,4 +350,30 @@ export class TDOADO {
     }
     this.state.storage.put("recentDets", this.recentDets).catch(() => {});
   }
+}
+
+// MMSI fuzzy-match helpers. DSC symbols decode to 0–9 digits plus '?'
+// for ECC failures; two strings are compatible if they share length and
+// every non-'?' position agrees. We keep the most-complete string in
+// the bucket so the broadcast carries the cleanest form.
+function mmsiCompatible(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const ca = a[i], cb = b[i];
+    if (ca === "?" || cb === "?") continue;
+    if (ca !== cb) return false;
+  }
+  return true;
+}
+function mmsiQuality(m) {
+  let q = 0;
+  for (let i = 0; i < m.length; i++) if (m[i] !== "?") q++;
+  return q;
+}
+
+// slotId is "host:port|band"; hostOf strips the band so same-host
+// multi-band detections collapse for quorum purposes.
+function hostOf(slotId) {
+  const bar = slotId.indexOf("|");
+  return bar < 0 ? slotId : slotId.slice(0, bar);
 }

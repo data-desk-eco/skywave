@@ -11,9 +11,9 @@
 //      un-follow the others so the server doesn't waste bandwidth
 //      streaming PCM we'd never play.
 
-import { Vessels } from "./vessels.js?v=18";
-import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=18";
-import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=18";
+import { Vessels } from "./vessels.js?v=21";
+import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=21";
+import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=21";
 
 const DEBUG = /(\?|&)debug=1\b/.test(location.search);
 const AUDIO_LEAD_SEC = 0.25;

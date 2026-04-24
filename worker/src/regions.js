@@ -82,7 +82,7 @@ export function coversBand(rx, khz) {
 // Rack selection — defensible narrative
 // =====================================
 //
-// Out of the ~900 public KiwiSDRs, we pick 8 per DSC band (48 slots
+// Out of the ~900 public KiwiSDRs, we pick 16 per DSC band (96 slots
 // total) for a given region. The criteria, in order:
 //
 //   Hard filters (all must pass):
@@ -132,7 +132,7 @@ const MIN_SEP_DEG = 3;         // per-band geographic spread
 const MAX_BANDS_PER_HOST = 2;
 const MIN_GPS_FIXES_HOUR = 100;  // GPS hardware must actually be fixing
 const GPS_HW_MARKER = "📡 GPS"; // substring in `sdr_hw` when the option is present
-export const DEFAULT_FANOUT = 48;  // also the hard ceiling — ?fanout= can only narrow the rack
+export const DEFAULT_FANOUT = 96;  // also the hard ceiling — ?fanout= can only narrow the rack
 
 // Coast-station-style MMSIs and many public KiwiSDRs name-check their
 // antenna in free text. Match a few designs known to pull in weak HF:

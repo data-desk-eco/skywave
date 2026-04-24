@@ -3,7 +3,7 @@
 // GFW has track data for the caller, the vessel's last known position
 // (filled white dot) with a decimated 14-day trail.
 
-import { Vessels } from "./vessels.js?v=18";
+import { Vessels } from "./vessels.js?v=21";
 
 const TILE_URL = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png";
 const TILE_ATTR = '&copy; <a href="https://carto.com/">carto</a> · OSM';

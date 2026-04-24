@@ -25,6 +25,13 @@ export const REGIONS = [
 ];
 
 export function currentRegion() {
+  // ?region=... in the URL takes precedence and pins localStorage, so
+  // sharing a link like /skywave/?region=nw-europe just works.
+  const urlRegion = new URLSearchParams(location.search).get("region");
+  if (urlRegion && REGIONS.some((r) => r.id === urlRegion)) {
+    localStorage.setItem(REGION_STORAGE_KEY, urlRegion);
+    return REGIONS.find((r) => r.id === urlRegion);
+  }
   const saved = localStorage.getItem(REGION_STORAGE_KEY);
   return REGIONS.find((r) => r.id === saved) || REGIONS[0];
 }
