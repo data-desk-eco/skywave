@@ -19,6 +19,13 @@ const DEBUG = /(\?|&)debug=1\b/.test(location.search);
 const AUDIO_LEAD_SEC = 0.25;
 const AUDIO_HOLD_MS  = 6000;
 const RACK_REFRESH_MS = 60_000;
+// Only surface TDOA fixes whose solver residual is tight enough to be
+// worth trusting. Bigger residuals usually mean a 3-receiver mirror
+// ambiguity landed on the wrong hyperbola basin, or the packet reached
+// some receivers via an extra skywave hop the solver models as
+// straight-line c. Silent is better than misleading; a later re-solve
+// with more receivers often tightens the fix and it'll appear then.
+const TDOA_MAX_RESIDUAL_KM = 100;
 
 const GATEWAY = (() => {
   const meta = document.querySelector('meta[name="skywave-gateway"]');
@@ -434,6 +441,11 @@ function connectTdoaFeed() {
 }
 
 function renderTdoaInCard(entry, tdoa) {
+  // Drop low-confidence fixes entirely — no summary badge, no detail
+  // line, no map pin. If the coordinator re-solves with more receivers
+  // and the residual tightens, we'll see that broadcast and render then.
+  const residKm = tdoa && tdoa.position && tdoa.position.residualKm;
+  if (!Number.isFinite(residKm) || residKm >= TDOA_MAX_RESIDUAL_KM) return;
   entry.tdoa = tdoa;
   if (!entry.row) return;
   // A TDOA broadcast is authoritative about receiver count: the
