@@ -87,6 +87,13 @@ class SlotConn {
     this.audioFollow = false;
     this.closed = false;
     this.retryDelay = 2000;
+    // Timestamp the slot most recently entered "dead". A dead slot
+    // whose DO-side WebSocket is still open won't fix itself — nothing
+    // on the server tries to re-open a failed upstream unless a fresh
+    // fetch handler runs. The global watchdog below force-closes the
+    // client WS after ~60 s of "dead", which bounces the DO and lets
+    // its reconnect logic fire on the next attach.
+    this.deadSince = 0;
   }
 
   connect() {
@@ -137,6 +144,7 @@ class SlotConn {
     switch (msg.t) {
       case "hello":
         this.state = "live";
+        this.deadSince = 0;
         updateRxCount();
         return;
       case "status":
@@ -146,9 +154,11 @@ class SlotConn {
           reconsiderAudio();
         } else if (msg.state === "live") {
           this.state = "live";
+          this.deadSince = 0;
           reconsiderAudio();
         } else if (msg.state === "down" || msg.state === "err") {
           this.state = "dead";
+          if (!this.deadSince) this.deadSince = performance.now();
           reconsiderAudio();
         }
         updateRxCount();
@@ -224,6 +234,7 @@ async function start() {
     emptyEl.style.display = "";
     applyRack(rack);
     rackTimer = setInterval(refreshRack, RACK_REFRESH_MS);
+    startDeadSlotWatchdog();
     connectTdoaFeed();
   } catch (e) {
     rxCountEl.textContent = "no rack";
@@ -232,6 +243,39 @@ async function start() {
 }
 
 function restart() { stop(); start(); }
+
+// -------------------------------------------------------------------
+// Dead-slot watchdog
+//
+// A slot can report state=err/down while its client-DO WebSocket is
+// still open (the DO is up, only its upstream to the KiwiSDR failed).
+// The SlotConn's retry loop is wired to ws.onclose, which never fires
+// in that case — so the slot stays dark forever unless we kick it.
+// Once every DEAD_WATCH_MS we close any WS whose slot has been dead
+// for longer than DEAD_GRACE_MS. The DO sees the WS close, cancels
+// our subscription, and on our reconnect runs a fresh _ensureUpstream
+// — which on the retry-enabled worker self-heals, and on the older
+// worker at least gets one more shot.
+// -------------------------------------------------------------------
+
+const DEAD_GRACE_MS = 60_000;
+const DEAD_WATCH_MS = 15_000;
+let deadWatchTimer = null;
+
+function startDeadSlotWatchdog() {
+  if (deadWatchTimer) return;
+  deadWatchTimer = setInterval(() => {
+    const now = performance.now();
+    for (const s of slots.values()) {
+      if (!s.ws || s.ws.readyState !== 1) continue;
+      if (s.state !== "dead") continue;
+      if (!s.deadSince || now - s.deadSince < DEAD_GRACE_MS) continue;
+      if (DEBUG) console.log(`[skywave] watchdog bouncing ${s.key}`);
+      try { s.ws.close(); } catch (_) {}
+      s.deadSince = 0;  // avoid re-bouncing before onclose fires
+    }
+  }, DEAD_WATCH_MS);
+}
 
 // -------------------------------------------------------------------
 // Audio picker — follow the loudest live burst, drop the rest
