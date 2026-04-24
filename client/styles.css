@@ -30,7 +30,7 @@ a:hover { text-decoration-color: var(--fg); }
 /* -- Header ------------------------------------------------------------ */
 header {
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: 12px;
   padding: 12px 8px 10px var(--pad);
