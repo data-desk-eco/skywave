@@ -41,6 +41,17 @@ export const REGIONS = [
   { id: "oceania",   name: "Australia / NZ", bbox: [-48, 110, -8, 180]   },
   { id: "black-sea", name: "Black Sea",      bbox: null,
     target: { gps: [45.5, 36.5], radiusKm: 2000, cohortSize: 6 } },
+  // North Atlantic — transatlantic shipping lanes between NW Europe
+  // and E North America. Centroid mid-Atlantic so the cohort pulls
+  // in Kaena/Canterbury/Tostedt-class receivers on both sides.
+  { id: "n-atlantic", name: "N Atlantic",    bbox: null,
+    target: { gps: [45.0, -30.0], radiusKm: 3500, cohortSize: 7 } },
+  // Persian Gulf / Strait of Hormuz — the oil chokepoint. ~20% of
+  // global crude flows through here; VLCC movements are routinely
+  // announced on DSC HF. Doha + Iraq + Cyprus form the core vertex
+  // set; everything else is propagation-dependent.
+  { id: "persian-gulf", name: "Persian Gulf", bbox: null,
+    target: { gps: [26.5, 56.5], radiusKm: 2500, cohortSize: 6 } },
 ];
 
 export const regionById = (id) => REGIONS.find((r) => r.id === id) || REGIONS[0];
@@ -166,6 +177,36 @@ const MIN_GPS_FIXES_HOUR = 100;  // GPS hardware must actually be fixing
 const GPS_HW_MARKER = "📡 GPS"; // substring in `sdr_hw` when the option is present
 export const DEFAULT_FANOUT = 96;  // also the hard ceiling — ?fanout= can only narrow the rack
 
+// Cluster gate — a candidate is only kept if at least one other same-
+// band candidate exists within the band's cluster radius. Purely a
+// short-range-propagation filter: MF is ground-wave / short skywave
+// (<1500 km useful range), so an MF receiver with no peer in that
+// radius cannot co-hear a burst and just burns a slot. HF4 is similar
+// during daylight (NVIS). HF6+ use F2 skywave whose skip zone routinely
+// exceeds 2500 km — a Hawaii or Johannesburg receiver hears European
+// traffic via long-path and IS valuable despite geographic isolation.
+// So we only gate the short-range bands.
+const CLUSTER_RADIUS_KM_BY_BAND = {
+  2187.5: 1500,    // MF
+  4207.5: 2500,    // HF4
+  // HF6+: no gate. F2 long-path makes "isolated" receivers productive.
+};
+
+// Per-band slot allocation for the global (bbox) rack. HF8 + HF12
+// produced 80% of multi-hearings in the same capture; HF4 produced
+// zero during daylight; MF is under-represented but matters for
+// coastal work. Weights sum to 1.0. A `?fanout=N` request scales
+// these proportionally and rounds to integers; any residual goes to
+// the highest-weighted band.
+const BAND_WEIGHTS = {
+  2187.5:  0.145,   // MF   — 14/96
+  4207.5:  0.063,   // HF4  —  6/96
+  6312.0:  0.188,   // HF6  — 18/96
+  8414.5:  0.208,   // HF8  — 20/96
+  12577.0: 0.208,   // HF12 — 20/96
+  16804.5: 0.188,   // HF16 — 18/96
+};
+
 // Coast-station-style MMSIs and many public KiwiSDRs name-check their
 // antenna in free text. Match a few designs known to pull in weak HF:
 const BROADBAND_ANTENNA = /\b(loop|dipole|t2fd|beverage|folded|longwire|long wire|EWE|K9AY)\b/i;
@@ -227,6 +268,39 @@ function rankCandidates(receivers, khz, bbox) {
   }
   out.sort((a, b) => b.score - a.score);
   return out;
+}
+
+// Cluster-gate a per-band candidate pool: drop any candidate that has
+// no other same-band candidate within CLUSTER_RADIUS_KM. O(N²) over
+// the pool, which is fine — pool size is <300 even for "Global".
+function clusterGate(candidates, radiusKm) {
+  if (candidates.length < 2) return candidates;
+  return candidates.filter((a) =>
+    candidates.some((b) => a !== b && kmDistance(a.gps, b.gps) <= radiusKm),
+  );
+}
+
+// Convert BAND_WEIGHTS to an integer quota summing exactly to `total`.
+// Rounds each proportional share, then distributes any residual
+// (positive or negative) from highest-weight band downward so HF4 is
+// never inflated past its data-driven share.
+function bandQuota(bandsKHz, total) {
+  const rawShares = bandsKHz.map((khz) => total * (BAND_WEIGHTS[khz] ?? 1 / bandsKHz.length));
+  const quota = rawShares.map((x) => Math.max(0, Math.round(x)));
+  let residual = total - quota.reduce((a, b) => a + b, 0);
+  const order = bandsKHz
+    .map((khz, i) => [i, BAND_WEIGHTS[khz] ?? 0])
+    .sort((a, b) => b[1] - a[1])
+    .map(([i]) => i);
+  let oi = 0;
+  while (residual > 0) { quota[order[oi % order.length]]++; residual--; oi++; }
+  while (residual < 0) {
+    // Take from the lightest-weighted non-zero band first.
+    for (let i = order.length - 1; i >= 0 && residual < 0; i--) {
+      if (quota[order[i]] > 0) { quota[order[i]]--; residual++; break; }
+    }
+  }
+  return quota;
 }
 
 // ---- Target-region picker ----------------------------------------------
@@ -366,10 +440,22 @@ export function pickRack(receivers, bbox, requested = DEFAULT_FANOUT) {
   const n = Math.max(1, Math.min(DEFAULT_FANOUT, requested | 0));
   const bandsKHz = BANDS.map((b) => b.khz);
   const k = bandsKHz.length;
-  const base = Math.floor(n / k);
-  const extra = n - base * k;
-  const quota = bandsKHz.map((_, i) => base + (i < extra ? 1 : 0));
-  const pools = bandsKHz.map((khz) => rankCandidates(receivers, khz, bbox));
+  // Band-weighted allocation — see BAND_WEIGHTS for the data basis.
+  const quota = bandQuota(bandsKHz, n);
+  // Cluster-gate each band pool so isolated receivers (no same-band
+  // peer within CLUSTER_RADIUS_KM) don't eat a slot. They decode but
+  // never into a TDOA quorum. Small regions / thin pools fall back to
+  // the ungated pool below, same as the top-up pass.
+  const pools = bandsKHz.map((khz) => {
+    const ranked = rankCandidates(receivers, khz, bbox);
+    const radius = CLUSTER_RADIUS_KM_BY_BAND[khz];
+    if (!radius) return ranked;                  // long-range bands: no gate
+    const gated = clusterGate(ranked, radius);
+    // If the gate would leave a band empty (e.g. a tight bbox with one
+    // receiver), fall back to the ungated pool rather than serving
+    // zero slots for that band.
+    return gated.length >= 2 ? gated : ranked;
+  });
   const picks = [];
   const bandsPerHost = new Map();  // host → count of picks using it
 
