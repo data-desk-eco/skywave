@@ -11,9 +11,9 @@
 //      un-follow the others so the server doesn't waste bandwidth
 //      streaming PCM we'd never play.
 
-import { Vessels } from "./vessels.js?v=26";
-import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=26";
-import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=26";
+import { Vessels } from "./vessels.js?v=27";
+import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=27";
+import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=27";
 
 const DEBUG = /(\?|&)debug=1\b/.test(location.search);
 const AUDIO_LEAD_SEC = 0.25;
@@ -482,19 +482,23 @@ function renderTdoaInCard(entry, tdoa) {
   const isPrelim = tdoa.tier === "preliminary";
   if (!isPrelim && (!Number.isFinite(residKm) || residKm >= TDOA_MAX_RESIDUAL_KM)) return;
   entry.tdoa = tdoa;
+  // Merge the coordinator's authoritative receiver list into
+  // entry.receivers. MMSIs decoded under noise vary between receivers,
+  // so the client's exact-match dedupe can't see the full cohort that
+  // the server's fuzzy-match bucket does — without this merge the
+  // heard-by list stays stuck at 1-2 even when the summary says 7 RX.
+  if (Array.isArray(tdoa.receivers)) {
+    for (const r of tdoa.receivers) {
+      if (r && r.label && r.band) entry.receivers.set(r.label, r.band);
+    }
+  }
   if (!entry.row) return;
   entry.row.classList.add("has-tdoa");
   entry.row.classList.toggle("tdoa-prelim", isPrelim);
 
-  // Summary reflects the coordinator's authoritative quorum, not the
-  // local WS-feed count (which can be lower when this browser isn't
-  // attached to every cohort member).
+  updateHeard(entry);
   const summary = entry.row.querySelector(".c-heard");
-  if (summary) {
-    summary.classList.add("has-tdoa");
-    const bands = new Set(entry.receivers.values());
-    summary.textContent = `${tdoa.quorum} RX · ${Array.from(bands).join("/")}`;
-  }
+  if (summary) summary.classList.add("has-tdoa");
 
   const detail = entry.row.querySelector(".detail-text");
   if (detail) {
@@ -554,27 +558,39 @@ function addCallRow(call, entry) {
   const callerMmsi = call.caller || "—";
   const destMmsi = call.destination || (call.formatCode === 112 ? "all ships" : "—");
 
+  const tc1 = call.tc1 && call.tc1 !== "?" ? call.tc1 : null;
+  const tc2 = call.tc2 && call.tc2 !== "?" && call.tc2 !== call.tc1 ? call.tc2 : null;
+  const kvRows = [
+    ["MMSI", escapeHtml(callerMmsi)],
+    ["format", `${escapeHtml(call.format)} (${call.formatCode})`],
+    ["category", escapeHtml(call.category || "?")],
+    ...(tc1 ? [["telecommand 1", escapeHtml(tc1)]] : []),
+    ...(tc2 ? [["telecommand 2", escapeHtml(tc2)]] : []),
+    ["EOS", escapeHtml(call.eos)],
+    ["ECC", call.ecc_valid ? "ok" : "—"],
+    ["mark / space", `${(+call.markHz || 0).toFixed(0)} / ${(+call.spaceHz || 0).toFixed(0)} Hz`],
+    ["phasing score", String(call.phasingScore)],
+  ];
+  const kvHtml = kvRows.map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join("");
+  const paySummary = [
+    call.category || "?",
+    tc1,
+    tc2,
+    call.eos,
+  ].filter(Boolean).map(escapeHtml).join(" · ");
+
   row.innerHTML = `
     <span class="c-t">${hh}:${mm}:${ss}Z</span>
     <span class="c-who">
       <span class="name" data-mmsi="${callerMmsi}">MMSI ${callerMmsi}</span><span class="flag">${midIso(callerMmsi)}</span>
     </span>
     <span class="c-flow">→ ${escapeHtml(destMmsi)}</span>
-    <span class="c-pay">${escapeHtml(call.category || "?")} · ${escapeHtml(call.tc1 || "?")}${call.tc2 && call.tc2 !== call.tc1 ? " · " + escapeHtml(call.tc2) : ""} · ${escapeHtml(call.eos)}</span>
+    <span class="c-pay">${paySummary}</span>
     <span class="c-heard">${entry.receivers.size} RX · ${entry.primaryBand}</span>
     <div class="call-detail">
       <div class="detail-text">
         <div class="vessel" data-mmsi="${callerMmsi}"></div>
-        <div class="kv">
-          <span>format</span><span>${escapeHtml(call.format)} (${call.formatCode})</span>
-          <span>category</span><span>${escapeHtml(call.category || "?")}</span>
-          <span>telecommand 1</span><span>${escapeHtml(call.tc1 || "?")}</span>
-          <span>telecommand 2</span><span>${escapeHtml(call.tc2 || "?")}</span>
-          <span>EOS</span><span>${escapeHtml(call.eos)}</span>
-          <span>ECC</span><span>${call.ecc_valid ? "ok" : "—"}</span>
-          <span>mark / space</span><span>${(+call.markHz || 0).toFixed(0)} / ${(+call.spaceHz || 0).toFixed(0)} Hz</span>
-          <span>phasing score</span><span>${call.phasingScore}</span>
-        </div>
+        <div class="kv">${kvHtml}</div>
         <div class="heard-list">heard by: ${Array.from(entry.receivers).map(([rx, band]) => `<span>${escapeHtml(rx)}</span> <em>${band}</em>`).join(", ")}</div>
         <code>${(call.symbols || []).map((s) => s < 0 ? "?" : s).join(" ")}</code>
       </div>

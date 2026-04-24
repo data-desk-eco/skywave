@@ -14,6 +14,7 @@ export const REGION_STORAGE_KEY = "skywave.region";
 // Add future presets here as they prove out.
 export const REGIONS = [
   { id: "global",       name: "ALL",  bbox: null                   },
+  { id: "sea-pac",      name: "SEAP", bbox: [-35, 95,  35, 155]    },
   { id: "black-sea",    name: "BSK",  bbox: [40,  25,  48,  42]    },
   { id: "n-atlantic",   name: "NAT",  bbox: [28, -65,  60,   2]    },
   { id: "persian-gulf", name: "PG",   bbox: [20,  48,  32,  62]    },

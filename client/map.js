@@ -6,7 +6,7 @@
 //     with extra receiver rings for cohort members this browser isn't
 //     directly attached to.
 
-import { Vessels } from "./vessels.js?v=26";
+import { Vessels } from "./vessels.js?v=27";
 
 const TILE_URL = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png";
 const TILE_ATTR = '&copy; <a href="https://carto.com/">carto</a> · OSM';

@@ -48,10 +48,23 @@ export const REGIONS = [
     target: { gps: [45.0, -30.0], radiusKm: 3500, cohortSize: 7 } },
   // Persian Gulf / Strait of Hormuz — the oil chokepoint. ~20% of
   // global crude flows through here; VLCC movements are routinely
-  // announced on DSC HF. Doha + Iraq + Cyprus form the core vertex
-  // set; everything else is propagation-dependent.
+  // announced on DSC HF. Local KiwiSDR coverage is sparse: Doha is
+  // typically slot-saturated, Baghdad's GPS often loses lock. The
+  // 4000 km radius pulls in Eastern European GPS-fixing receivers
+  // (Bucharest / Zakynthos / Hungary / Moscow) which give long-
+  // baseline geometry. Big baselines = bigger ionospheric residuals
+  // but more bearing diversity around the target.
   { id: "persian-gulf", name: "Persian Gulf", bbox: null,
-    target: { gps: [26.5, 56.5], radiusKm: 2500, cohortSize: 6 } },
+    target: { gps: [26.5, 56.5], radiusKm: 4000, cohortSize: 6 } },
+  // SE Asia / West Pacific — natural surround geometry from the
+  // Chiba (N) / Bandung (S) / Cha-Am (W) / NZ (SE) clusters. Centroid
+  // on the South China Sea so the octant picker produces all four
+  // compass quadrants. Shipping density is enormous here: tanker
+  // traffic from the Gulf, container traffic Asia-Europe-Americas,
+  // and the FJELD SVEA-class long-path HF that we've already seen
+  // produce ~20 km fixes.
+  { id: "sea-pac", name: "SE Asia / W Pacific", bbox: null,
+    target: { gps: [10.0, 125.0], radiusKm: 10000, cohortSize: 8 } },
 ];
 
 export const regionById = (id) => REGIONS.find((r) => r.id === id) || REGIONS[0];
@@ -372,9 +385,66 @@ function targetCandidates(receivers, target) {
   return out;
 }
 
+// Octant-based surround picker. Divides the compass into N (default
+// 6) wedges around the target and takes the best-scoring receiver in
+// each occupied wedge. Naturally produces surround geometry when the
+// receiver distribution allows it, and naturally produces a small
+// cohort when it doesn't (rather than packing the "closest" side with
+// receivers that all give the same bearing). For TDOA this is the
+// direct geometry lever: one vertex per compass octant is the
+// difference between solvable (bearing gap ≤ ~180°) and unsolvable.
+function pickSurroundCohort(candidates, octants = 6, maxPerOctant = 1) {
+  if (!candidates.length) return [];
+  const buckets = Array.from({ length: octants }, () => []);
+  const wedgeDeg = 360 / octants;
+  for (const c of candidates) {
+    const bi = Math.floor((c.bearing % 360) / wedgeDeg) % octants;
+    buckets[bi].push(c);
+  }
+  // Score within each wedge: best SNR, closer to target, broadband
+  // antenna already implicit in the original `score`. Here we re-score
+  // purely for cohort selection — snr > dist > free slots.
+  const score = (c) => {
+    const snrBonus = c.snr != null ? Math.min(2, c.snr / 20) : 1;
+    const distPenalty = 1 + c.distKm / 4000;
+    return snrBonus / distPenalty;
+  };
+  const picks = [];
+  const usedHosts = new Set();
+  for (const bucket of buckets) {
+    bucket.sort((a, b) => score(b) - score(a));
+    let taken = 0;
+    for (const c of bucket) {
+      if (usedHosts.has(c.host)) continue;
+      picks.push(c);
+      usedHosts.add(c.host);
+      taken++;
+      if (taken >= maxPerOctant) break;
+    }
+  }
+  return picks;
+}
+
 function pickTargetCohort(candidates, size) {
   if (!candidates.length) return [];
-  // Seed: closest receiver with decent SNR (fall back to closest overall).
+  // Strategy 1 — octant surround. If we get ≥ 3 occupied octants, use
+  // them: compass surround is worth more than a same-side pile-on.
+  const surround = pickSurroundCohort(candidates, 6, 1);
+  if (surround.length >= 3) {
+    // If surround is smaller than the requested size, top up with the
+    // next best bearing-distant receivers, preserving host uniqueness.
+    if (surround.length >= size) return surround.slice(0, size);
+    const usedHosts = new Set(surround.map(c => c.host));
+    const remaining = candidates.filter(c => !usedHosts.has(c.host));
+    remaining.sort((a, b) => (b.snr ?? 0) - (a.snr ?? 0));
+    return surround.concat(remaining.slice(0, size - surround.length));
+  }
+  // Strategy 2 (fallback) — old greedy bearing-spread when the target
+  // simply doesn't have octant coverage. Preserves backwards-compat
+  // for target regions whose receiver pool is geographically one-sided
+  // (e.g. Black Sea with EU-only receivers). Those fixes won't pass
+  // the confirmed bearing gate anyway but the cohort still gives the
+  // preliminary tier a chance.
   const bySnrThenDist = [...candidates].sort((a, b) => a.distKm - b.distKm);
   const seed = bySnrThenDist.find(c => (c.snr ?? 0) >= MIN_SNR_DB + 2) || bySnrThenDist[0];
   const picks = [seed];
