@@ -51,7 +51,19 @@ export function xcorr(a, b, maxLag) {
       refined = bestLag + 0.5 * (y0 - y2) / denom;
     }
   }
-  return { lag: refined, peak: best };
+  // Peak prominence: ratio of the main peak to the highest correlation
+  // outside a narrow window around the peak. A clean, unambiguous
+  // alignment has prominence ≫ 1; a noisy or multi-peaked cross-
+  // correlation has prominence ~1 and its `lag` can't be trusted.
+  // Used downstream as a quality gate before feeding lags to solveTdoa.
+  const exclude = 20;               // samples either side of the peak to skip
+  let offPeakMax = 0;
+  for (let i = 0; i < corrs.length; i++) {
+    if (Math.abs(i - idx) <= exclude) continue;
+    if (corrs[i] > offPeakMax) offPeakMax = corrs[i];
+  }
+  const prominence = offPeakMax > 0 ? best / offPeakMax : Infinity;
+  return { lag: refined, peak: best, prominence };
 }
 
 // Solve TDOA. Input: array of {gps:[lat,lon], t:<seconds>} (t on any

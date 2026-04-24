@@ -23,13 +23,22 @@ import { solveTdoa, xcorr } from "./tdoa.js";
 // signal and the broadcast tier is `confirmed`.
 const MIN_RECEIVERS  = 3;
 const CONFIRMED_MIN_RECEIVERS = 4;
-const PRELIM_MAX_BEARING_GAP_DEG = 120;
-// Maximum solver RMS time residual, converted to km (c·Δt). Solves
-// above this threshold mean the cross-correlated lags are not
-// self-consistent — usually a sign of ghost-basin solution or a bad
-// cross-correlation peak. We reject them rather than broadcast a
-// plausible-looking fix that's actually thousands of km wrong.
-const MAX_RESIDUAL_KM = 200;
+// Preliminary-tier bearing gap — how tightly must the three receivers
+// surround the solution. 120° was rejecting 20 of 20 3-receiver
+// cohorts in live test (most global co-hearings span two continents,
+// so bearings cluster). 150° still demands the receivers be spread
+// around more than just one hemisphere but admits the common pattern
+// of Europe + one Asian/Pacific vertex heard via long-path HF.
+const PRELIM_MAX_BEARING_GAP_DEG = 150;
+// Maximum solver RMS time residual, converted to km (c·Δt). Above
+// this threshold the cross-correlated lags are not self-consistent —
+// usually a sign of ghost-basin solution or a bad xcorr peak.
+// Calibrated against live rejections: 200 km was biting ~50% of real
+// q=5+ solves where one noisy pair inflated the RMS; 500 km still
+// catches obvious ghosts (>1000 km residuals are real failures) while
+// admitting normal multi-hop F2 fixes where ionospheric path bias
+// legitimately lifts the residual into the low hundreds.
+const MAX_RESIDUAL_KM = 500;
 // Maximum permitted angular gap between consecutive receivers as seen
 // from the solved position. If the receivers are all in one hemisphere
 // (gap > 180°) the TDOA residual landscape has a mirror basin the
@@ -252,12 +261,14 @@ export class TDOADO {
 
     const solverDets = [{ gps: ref.gps, t: 0 }];
     const lagsReport = [{ slot: ref.slotId, gps: ref.gps, lagSamples: 0, dtSec: 0 }];
+    let minProminence = Infinity;
     for (let k = 1; k < dets.length; k++) {
       const d = dets[k];
       const startDtSec = Number(d.snippet.startGpsNs - ref.snippet.startGpsNs) / 1e9;
       const maxLag = Math.ceil((Math.abs(startDtSec) + SKYWAVE_SLACK_SEC) * refSR);
-      const { lag, peak } = xcorr(ref.snippet.samples, d.snippet.samples, maxLag);
+      const { lag, peak, prominence } = xcorr(ref.snippet.samples, d.snippet.samples, maxLag);
       if (!Number.isFinite(lag) || !(peak > 0)) return null;
+      if (prominence < minProminence) minProminence = prominence;
       const dtSec = startDtSec + lag / refSR;
       solverDets.push({ gps: d.gps, t: dtSec });
       lagsReport.push({ slot: d.slotId, gps: d.gps, lagSamples: lag, dtSec });
@@ -265,6 +276,12 @@ export class TDOADO {
 
     const sol = solveTdoa(solverDets);
     if (!sol) return null;
+
+    // Note: minProminence is a candidate reliability signal (the
+    // weakest pair's xcorr peak-over-noise ratio). We report it on
+    // every solve via the geometry payload so we can observe the
+    // real-world distribution before committing to a threshold —
+    // gating on a blind guess would just rediscover bearing-prelim.
 
     // Reliability gates — see constants at the top of the file for the
     // rationale. A rejected solve returns null so _ingest() silently
@@ -319,7 +336,7 @@ export class TDOADO {
       call: ref.call,
       position: { lat: sol.lat, lon: sol.lon, residualKm: sol.residualKm },
       receivers: lagsReport,
-      geometry: { maxBearingGapDeg: +maxGap.toFixed(1) },
+      geometry: { maxBearingGapDeg: +maxGap.toFixed(1), minXcorrProminence: Number.isFinite(minProminence) ? +minProminence.toFixed(2) : null },
       packetGpsNs: ref.packetGpsNs.toString(),
       broadcastMs: Date.now(),
     };
@@ -332,8 +349,10 @@ export class TDOADO {
     }
     this.recentSolves.push({
       mmsi: msg.mmsi,
+      tier: msg.tier,
       position: msg.position,
       quorum: msg.quorum,
+      geometry: msg.geometry,
       receivers: msg.receivers.map((r) => r.slot),
       broadcastMs: msg.broadcastMs,
     });

@@ -53,6 +53,8 @@ const stats = {
   decodeEvents: 0,            // raw `t:"call"` across all slots
   uniqueDecodes: 0,           // after dedup
   solves: 0,                  // `t:"tdoa"` events from subscribe
+  prelimSolves: 0,            // tier="preliminary"
+  confirmedSolves: 0,         // tier="confirmed"
   trustedSolves: 0,           // solves where solver residual < 50 km
   implausibleSolves: 0,       // solves that would require >60 kn speed
   residKm: [],                // solver residuals for every solve
@@ -103,53 +105,118 @@ const GFW_HEADERS = {
   referer: "https://globalfishingwatch.org/map/fishing-activity/default-public/vessel-search",
 };
 
-const vesselIdCache = new Map(); // mmsi → vesselId | null
+// LSEG Workspace proxy — premium realtime AIS source. The Workspace is
+// hosted on a GCE Windows VM, the in-VM Data API Proxy listens on 9000,
+// and proxy.ps1 exposes it on 8080 with an X-Api-Key gate. Auth needs
+// LSEG_APP_KEY plus a handshake-derived bearer token.
+const LSEG_BASE = process.env.LSEG_PROXY_URL || "http://34.13.53.112:8080";
+const LSEG_PROXY_KEY = process.env.LSEG_PROXY_API_KEY || "";
+const LSEG_APP_KEY = process.env.LSEG_APP_KEY || "";
+let lsegToken = null;
+function lsegHeaders() {
+  return {
+    "Content-Type": "application/json",
+    "X-Api-Key": LSEG_PROXY_KEY,
+    "x-tr-applicationid": LSEG_APP_KEY,
+    Authorization: `Bearer ${lsegToken}`,
+  };
+}
+async function lsegHandshake() {
+  if (!LSEG_APP_KEY || !LSEG_PROXY_KEY) {
+    console.error("# LSEG creds missing — set LSEG_APP_KEY + LSEG_PROXY_API_KEY (or use --no-ais)");
+    return false;
+  }
+  const r = await fetch(`${LSEG_BASE}/api/handshake`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Api-Key": LSEG_PROXY_KEY },
+    body: JSON.stringify({
+      AppKey: LSEG_APP_KEY, AppScope: "trapi", ApiVersion: "1",
+      LibraryName: "skywave-watch", LibraryVersion: "1.0",
+    }),
+  });
+  if (!r.ok) { console.error(`# LSEG handshake failed: ${r.status}`); return false; }
+  const j = await r.json();
+  lsegToken = j.access_token;
+  console.error(`# LSEG handshake OK (token expires in ${(j.expires_in/86400).toFixed(0)}d)`);
+  return true;
+}
 
-async function gfwVesselIdForMmsi(mmsi) {
+// MMSI → IMO via GFW (free, public dataset has IMO for many cargo/
+// tanker MMSIs even when it can't return their tracks). Cached.
+const mmsiToImoCache = new Map();
+async function gfwImoForMmsi(mmsi) {
   if (!/^\d{9}$/.test(mmsi)) return null;
-  if (vesselIdCache.has(mmsi)) return vesselIdCache.get(mmsi);
+  if (mmsiToImoCache.has(mmsi)) return mmsiToImoCache.get(mmsi);
   const url = `${GFW_BASE}/vessels/search` +
     `?includes%5B0%5D=MATCH_CRITERIA` +
     `&datasets%5B0%5D=public-global-vessel-identity%3Av4.0` +
     `&query=${mmsi}`;
   try {
     const r = await fetch(url, { headers: GFW_HEADERS });
-    if (!r.ok) { vesselIdCache.set(mmsi, null); return null; }
+    if (!r.ok) { mmsiToImoCache.set(mmsi, null); return null; }
     const j = await r.json();
-    const entry = (j.entries || [])[0];
-    const id = entry?.selfReportedInfo?.[0]?.id ?? entry?.id ?? null;
-    vesselIdCache.set(mmsi, id);
-    return id;
-  } catch { vesselIdCache.set(mmsi, null); return null; }
+    // Prefer the entry with an IMO populated.
+    let imo = null, name = null;
+    for (const e of j.entries || []) {
+      const si = (e.selfReportedInfo || [])[0] || {};
+      if (si.imo) { imo = si.imo; name = si.shipname; break; }
+      if (!name && si.shipname) name = si.shipname;
+    }
+    const result = imo ? { imo, name } : null;
+    mmsiToImoCache.set(mmsi, result);
+    return result;
+  } catch { mmsiToImoCache.set(mmsi, null); return null; }
 }
 
-async function gfwLastPos(vesselId) {
-  const end = new Date();
-  const start = new Date(end.getTime() - 14 * 24 * 3600 * 1000);
-  const fmt = (d) => d.toISOString().slice(0, 10);
-  const url = `${GFW_BASE}/vessels/${vesselId}/tracks` +
-    `?binary=true&fields%5B0%5D=LONLAT&fields%5B1%5D=TIMESTAMP` +
-    `&format=GEOJSON&dataset=public-global-all-tracks%3Av4.0` +
-    `&start-date=${fmt(start)}&end-date=${fmt(end)}`;
+// IMO → RIC via LSEG SymbologySearch. Cached.
+const imoToRicCache = new Map();
+async function lsegRicForImo(imo) {
+  if (imoToRicCache.has(imo)) return imoToRicCache.get(imo);
   try {
-    const r = await fetch(url, { headers: GFW_HEADERS });
-    if (!r.ok) return null;
+    const r = await fetch(`${LSEG_BASE}/api/udf`, {
+      method: "POST",
+      headers: lsegHeaders(),
+      body: JSON.stringify({
+        Entity: { E: "SymbologySearch", W: {
+          symbols: [String(imo)], from: "IMO", to: ["RIC"], bestMatchOnly: true,
+        }}
+      }),
+    });
     const j = await r.json();
-    const f = j.features?.[0];
-    if (!f?.geometry) return null;
-    const times = f.properties?.coordinateProperties?.times;
-    let lastCoord, lastTime;
-    if (f.geometry.type === "MultiLineString") {
-      const segs = f.geometry.coordinates;
-      lastCoord = segs[segs.length - 1]?.slice(-1)[0];
-      const tsegs = times || [];
-      lastTime = tsegs[tsegs.length - 1]?.slice(-1)[0];
-    } else {
-      lastCoord = f.geometry.coordinates.slice(-1)[0];
-      lastTime = (times || []).slice(-1)[0];
-    }
-    if (!lastCoord) return null;
-    return { lat: lastCoord[1], lon: lastCoord[0], ts: lastTime || null };
+    const ric = j.mappedSymbols?.[0]?.bestMatch?.RIC || null;
+    imoToRicCache.set(imo, ric);
+    return ric;
+  } catch { imoToRicCache.set(imo, null); return null; }
+}
+
+// RIC → live LSEG AIS position (lat, lon, timestamp, speed). NOT
+// cached — we always want the freshest position.
+async function lsegPositionForRic(ric) {
+  try {
+    const r = await fetch(`${LSEG_BASE}/api/udf`, {
+      method: "POST",
+      headers: lsegHeaders(),
+      body: JSON.stringify({
+        Entity: { E: "DataGrid_StandardAsync", W: { requests: [{
+          instruments: [ric],
+          fields: [
+            { name: "TR.AssetName" },
+            { name: "TR.AssetLocationLatitude" },
+            { name: "TR.AssetLocationLongitude" },
+            { name: "TR.AssetDateTime" },
+            { name: "TR.AssetSpeed" },
+            { name: "TR.AssetDestination" },
+          ],
+        }]}}
+      }),
+    });
+    const j = await r.json();
+    const row = j.responses?.[0]?.data?.[0];
+    if (!row) return null;
+    const [, name, lat, lon, dateStr, speed, dest] = row;
+    if (lat == null || lon == null) return null;
+    const ts = dateStr ? Date.parse(dateStr) : null;
+    return { lat: +lat, lon: +lon, ts, name, speed: +speed || null, dest: dest || null };
   } catch { return null; }
 }
 
@@ -171,17 +238,26 @@ async function checkSolveAgainstAIS(solve) {
     return;
   }
   stats.aisChecks++;
-  const vId = await gfwVesselIdForMmsi(mmsi);
-  if (!vId) {
+  const imoRec = await gfwImoForMmsi(mmsi);
+  if (!imoRec) {
     rec.ais = null;
-    rec.ais_reason = "no-vessel-match";
+    rec.ais_reason = "no-imo-from-gfw";
     jlog({ kind: "solve", ...rec });
     return;
   }
-  const lastPos = await gfwLastPos(vId);
+  rec.vessel_name = imoRec.name || null;
+  rec.imo = imoRec.imo;
+  const ric = await lsegRicForImo(imoRec.imo);
+  if (!ric) {
+    rec.ais = null;
+    rec.ais_reason = "no-ric-for-imo";
+    jlog({ kind: "solve", ...rec });
+    return;
+  }
+  const lastPos = await lsegPositionForRic(ric);
   if (!lastPos) {
     rec.ais = null;
-    rec.ais_reason = "no-track";
+    rec.ais_reason = "no-lseg-position";
     jlog({ kind: "solve", ...rec });
     return;
   }
@@ -230,6 +306,8 @@ async function checkSolveAgainstAIS(solve) {
 
 // ---------- Main loop -----------------------------------------------------
 
+if (!NO_AIS) await lsegHandshake();
+
 const rack = await (await fetch(`${GATEWAY}/v2/rack?region=${encodeURIComponent(REGION)}`)).json();
 if (!rack.slots?.length) {
   console.error(`no slots for region "${REGION}"`); process.exit(1);
@@ -238,31 +316,52 @@ console.error(`# Region ${rack.regionName} — ${rack.slots.length} slots`);
 console.error(`# Output: ${path.resolve(OUT)}`);
 jlog({ kind: "start", region: REGION, slots: rack.slots.length, startedAt: new Date().toISOString() });
 
-// Subscribe to TDOA solves first so we don't miss anything emitted
-// during the rack warm-up.
+// Subscribe to TDOA solves with auto-reconnect. A Worker redeploy or
+// ordinary DO eviction drops the WS; without reconnect we go blind
+// for the rest of the run and wildly under-report solves.
 const subUrl = GATEWAY.replace(/^http/, "ws") + "/v2/tdoa/subscribe";
-const tdoaWs = new WebSocket(subUrl);
-tdoaWs.onopen = () => console.error("# TDOA subscribe open");
-tdoaWs.onmessage = (ev) => {
-  let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-  if (msg.t !== "tdoa") return;
-  stats.solves++;
-  // Slot id is "host:port|BAND" — take the part after the "|".
-  const band = (msg.receivers?.[0]?.slot || "").split("|").pop();
-  stats.perBandSolves.set(band, (stats.perBandSolves.get(band) || 0) + 1);
-  checkSolveAgainstAIS(msg).catch((e) =>
-    console.error("# ais check error:", e.message || e));
-};
-tdoaWs.onclose = () => console.error("# TDOA subscribe closed");
-tdoaWs.onerror = (e) => console.error("# TDOA subscribe error:", e.message || e.type);
+let tdoaWs;
+let tdoaBackoff = 2000;
+let shuttingDown = false;
+function connectTdoaSubscribe() {
+  tdoaWs = new WebSocket(subUrl);
+  tdoaWs.onopen = () => { tdoaBackoff = 2000; console.error("# TDOA subscribe open"); };
+  tdoaWs.onmessage = (ev) => {
+    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.t !== "tdoa") return;
+    stats.solves++;
+    if (msg.tier === "preliminary") stats.prelimSolves++;
+    else stats.confirmedSolves++;
+    const band = (msg.receivers?.[0]?.slot || "").split("|").pop();
+    stats.perBandSolves.set(band, (stats.perBandSolves.get(band) || 0) + 1);
+    checkSolveAgainstAIS(msg).catch((e) => console.error("# ais check error:", e.message || e));
+  };
+  tdoaWs.onerror = () => {};
+  tdoaWs.onclose = () => {
+    if (shuttingDown) return;
+    console.error(`# TDOA subscribe closed — reconnecting in ${tdoaBackoff}ms`);
+    setTimeout(connectTdoaSubscribe, tdoaBackoff);
+    tdoaBackoff = Math.min(tdoaBackoff * 2, 30_000);
+  };
+}
+connectTdoaSubscribe();
 
-// Attach to every slot in the rack.
-const conns = [];
-for (const s of rack.slots) {
+// Attach to every slot in the rack, with auto-reconnect. Worker
+// redeploys kick all the slot WSs; without reconnect we go silent.
+const conns = new Map();  // s.wsUrl → ws
+function attachSlot(s) {
   const ws = new WebSocket(s.wsUrl);
-  conns.push(ws);
+  conns.set(s.wsUrl, ws);
+  ws._slot = s;
   stats.totalConns++;
   ws.onopen = () => { stats.openConns++; };
+  ws.onclose = () => {
+    stats.openConns = Math.max(0, stats.openConns - 1);
+    if (shuttingDown) return;
+    // Back-off so a storm of closes (e.g. Worker redeploy) doesn't DOS.
+    setTimeout(() => attachSlot(s), 4000 + Math.random() * 6000);
+  };
+  ws.onerror = () => {};
   ws.onmessage = (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.t !== "call") return;
@@ -293,9 +392,8 @@ for (const s of rack.slots) {
       console.log(`CALL  ${new Date().toISOString().slice(11, 19)}  ${s.band.padEnd(5)} ${s.label.slice(0, 24).padEnd(24)}  ${msg.call?.caller} → ${msg.call?.destination}`);
     }
   };
-  ws.onerror = () => {};
-  ws.onclose = () => { stats.openConns = Math.max(0, stats.openConns - 1); };
 }
+for (const s of rack.slots) attachSlot(s);
 
 // Prune dedup map periodically.
 setInterval(() => {
@@ -315,7 +413,7 @@ const heartbeat = setInterval(() => {
     `${Math.round(elapsed)}s  ` +
     `conn=${stats.openConns}/${stats.totalConns}  ` +
     `decodes=${stats.decodeEvents} unique=${stats.uniqueDecodes}  ` +
-    `solves=${stats.solves} (${pct(stats.solves)}) trusted=${stats.trustedSolves} (${pct(stats.trustedSolves)})  ` +
+    `solves=${stats.solves} (conf=${stats.confirmedSolves} prelim=${stats.prelimSolves}, ${pct(stats.solves)} of unique)  ` +
     `ais=${stats.aisHits}/${stats.aisChecks}  ` +
     (p50 != null ? `Δkm p50=${p50.toFixed(0)} p90=${p90.toFixed(0)}  implausible=${stats.implausibleSolves}/${stats.aisHits}` : ``);
   console.error(line);
@@ -357,8 +455,9 @@ function finish(reason) {
          perRecvDecodes: Object.fromEntries(stats.perRecvDecodes),
          perRecvMulti: Object.fromEntries(stats.perRecvMulti) });
   outStream.end();
-  try { tdoaWs.close(); } catch {}
-  for (const w of conns) try { w.close(); } catch {}
+  shuttingDown = true;
+  try { tdoaWs?.close(); } catch {}
+  for (const w of conns.values()) try { w.close(); } catch {}
   setTimeout(() => process.exit(0), 400);
 }
 
