@@ -39,16 +39,17 @@ the URL on first attach anyway.
 ## Why the rack looks the way it does
 
 Defensible: out of ~900 public KiwiSDRs, the picker (in
-`worker/src/regions.js`) selects 8 per DSC band (48 total; also the
+`worker/src/regions.js`) selects 16 per DSC band (96 total; also the
 hard ceiling) that are **active**, **GPS-equipped and actively fixing**
 (TDOA needs per-frame GNSS timestamps — this also cuts the pool by
-~37%), **coastal** (≤8° from a major port anchor), **healthy**
-(self-reported SNR ≥ 15 dB, list entry updated in the last hour, not
-IP-blacklisting us), and **considerate** (≥ 2 free user slots so a
-human listener always has one). Same-band picks are ≥ 3° apart for
-geographic diversity; any one (host, port) is capped at 2 bands so
-the rack doesn't over-index on a single operator. The "Global" view
-and per-region views share the same 48-slot ceiling.
+~37%), **reasonably coastal** (≤20° of a major port anchor), **not
+deaf** (self-reported SNR ≥ 8 dB, list entry updated in the last hour,
+not IP-blacklisting us), and **considerate** (≥ 2 free user slots so a
+human listener always has one). Same-band picks are ≥ 1.5° apart
+(just enough to prevent two Kiwis on the same street from both being
+picked); any one (host, port) is capped at 2 bands so the rack
+doesn't over-index on a single operator. The "Global" view and
+per-region views share the same 96-slot ceiling.
 
 Scoring: `freeSlots × coastalProximity × snrBonus × antennaBonus`,
 with `antennaBonus = 1.5` when the antenna free-text mentions a
@@ -84,16 +85,36 @@ Radio-ham tinker spirit served with Data Desk restraint.
 ### `worker/src/` — Cloudflare Worker + Durable Objects
 
 - `index.js` — HTTP routing. `/v2/rack`, `/v2/slot/:host/:port/:band`,
-  `/gfw`, `/gfw/tracks`, `/receivers` (debug).
+  `/v2/tdoa/subscribe`, `/v2/tdoa/recent`, `/gfw`, `/gfw/tracks`,
+  `/receivers` (debug).
 - `directory-do.js` — `DirectoryDO`. Composes the rack; no fan-out.
 - `receiver-do.js` — `ReceiverDO`. The hot path. Upstream + decoder
-  + hibernation fanout + idle alarm.
-- `kiwi-upstream.js` — server-side `KiwiClient`; mirrors the old
-  `client/kiwi.js` but uses Workers' outbound-WebSocket fetch pattern.
-- `dsc.js` — ITU-R M.493 decoder (identical port of
+  + hibernation fanout + idle alarm. Also emits TDOA detection
+  records (GPS-anchored audio snippets) to `TDOADO`.
+- `tdoa-do.js` — `TDOADO`. Singleton coordinator. Fuzzy-MMSI-pairs
+  detections across receivers, cross-correlates snippets, calls the
+  solver, broadcasts positions to subscribed browsers.
+- `tdoa.js` — pure solver math. `xcorr` + `solveTdoa` (two-phase
+  grid-search over the hyperbola landscape). Exercised offline by
+  the scripts under `scripts/`.
+- `kiwi-upstream.js` — server-side KiwiSDR WebSocket client. Runs in
+  IQ mode so every frame carries a GPS-ns header — the shared time
+  base the TDOA coordinator needs.
+- `dsc.js` — ITU-R M.493 decoder (port of
   `~/Research/dsc-triangulation/scripts/dsc_decode_ddesk.py`).
 - `regions.js` — BANDS + regional bboxes + coastal anchors + `pickRack`.
 - `location-hint.js` — GPS → CF region string.
+
+### `scripts/` — offline validation
+
+- `test_tdoa.mjs` — synthetic geometry against `tdoa.js` solver,
+  p50 ≈ 1.6 km on 50 trials.
+- `test_tdoa_e2e.mjs` — synthetic multi-receiver cohorts through
+  `TDOADO._solveBucket` with realistic sample-rate + snippet-start
+  jitter, p50 ≈ 2.8 km.
+- `attach_nwe.mjs`, `inject_tdoa.mjs`, `inject_tdoa_real.mjs` —
+  live-operations tools: attach to a whole region's rack, or inject
+  a known cohort against production to sanity-check the live path.
 
 ## Do
 
@@ -139,11 +160,19 @@ Radio-ham tinker spirit served with Data Desk restraint.
   This is fine here — the DO is only alive while a viewer is
   attached; 5 minutes after the last WebSocketClose, the idle alarm
   fires and tears the DO down.
-- **CF DO costs scale with listener-hours, not listeners.** 48 slots
-  in a region = 48 DOs active while anyone is watching, each handling
+- **CF DO costs scale with listener-hours, not listeners.** 96 slots
+  in a region = 96 DOs active while anyone is watching, each handling
   ~100 audio frames/sec (each = 1 billable WS message). Nobody
   watching = zero cost. Ten people watching the same region = same
   cost as one person.
+- **TDOA cohorts need `host:port` dedup, not `slotId` dedup.** A
+  single physical KiwiSDR hearing the same burst on two bands gives
+  identical geometry — counting both toward quorum wastes the solve
+  on degenerate math. `tdoa-do.js` collapses on `host:port`.
+- **MMSIs decoded under noise differ between receivers.** One Kiwi
+  reads `563250300`, another `5632??300`, a third `563252??0` — all
+  the same ship. The coordinator fuzzy-matches with `?` as a
+  wildcard and carries the cleanest variant forward.
 
 ## Research pointers
 

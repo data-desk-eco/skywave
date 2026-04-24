@@ -11,9 +11,9 @@
 //      un-follow the others so the server doesn't waste bandwidth
 //      streaming PCM we'd never play.
 
-import { Vessels } from "./vessels.js?v=22";
-import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=22";
-import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=22";
+import { Vessels } from "./vessels.js?v=23";
+import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=23";
+import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=23";
 
 const DEBUG = /(\?|&)debug=1\b/.test(location.search);
 const AUDIO_LEAD_SEC = 0.25;
@@ -87,12 +87,9 @@ class SlotConn {
     this.audioFollow = false;
     this.closed = false;
     this.retryDelay = 2000;
-    // Timestamp the slot most recently entered "dead". A dead slot
-    // whose DO-side WebSocket is still open won't fix itself — nothing
-    // on the server tries to re-open a failed upstream unless a fresh
-    // fetch handler runs. The global watchdog below force-closes the
-    // client WS after ~60 s of "dead", which bounces the DO and lets
-    // its reconnect logic fire on the next attach.
+    // Set when the slot enters "dead" via a status frame (DO is up,
+    // upstream Kiwi failed). The dead-slot watchdog uses this to
+    // force-close and reconnect a slot that's been dark too long.
     this.deadSince = 0;
   }
 
@@ -244,19 +241,12 @@ async function start() {
 
 function restart() { stop(); start(); }
 
-// -------------------------------------------------------------------
-// Dead-slot watchdog
-//
-// A slot can report state=err/down while its client-DO WebSocket is
-// still open (the DO is up, only its upstream to the KiwiSDR failed).
-// The SlotConn's retry loop is wired to ws.onclose, which never fires
-// in that case — so the slot stays dark forever unless we kick it.
-// Once every DEAD_WATCH_MS we close any WS whose slot has been dead
-// for longer than DEAD_GRACE_MS. The DO sees the WS close, cancels
-// our subscription, and on our reconnect runs a fresh _ensureUpstream
-// — which on the retry-enabled worker self-heals, and on the older
-// worker at least gets one more shot.
-// -------------------------------------------------------------------
+// Dead-slot watchdog: a slot can report state=err/down while the
+// client-DO WebSocket stays open (the DO is up, only its Kiwi upstream
+// failed). The SlotConn retry path is wired to ws.onclose, so without a
+// kick the slot sits dead indefinitely. Every DEAD_WATCH_MS we close
+// any WS whose slot has been dead for longer than DEAD_GRACE_MS; the
+// reconnect triggers a fresh _ensureUpstream inside the DO.
 
 const DEAD_GRACE_MS = 60_000;
 const DEAD_WATCH_MS = 15_000;
@@ -268,11 +258,11 @@ function startDeadSlotWatchdog() {
     const now = performance.now();
     for (const s of slots.values()) {
       if (!s.ws || s.ws.readyState !== 1) continue;
-      if (s.state !== "dead") continue;
-      if (!s.deadSince || now - s.deadSince < DEAD_GRACE_MS) continue;
+      if (s.state !== "dead" || !s.deadSince) continue;
+      if (now - s.deadSince < DEAD_GRACE_MS) continue;
       if (DEBUG) console.log(`[skywave] watchdog bouncing ${s.key}`);
       try { s.ws.close(); } catch (_) {}
-      s.deadSince = 0;  // avoid re-bouncing before onclose fires
+      s.deadSince = 0;  // don't re-bounce before onclose fires
     }
   }, DEAD_WATCH_MS);
 }
@@ -456,18 +446,16 @@ function dispatchCall(call, slot) {
   for (const [k, v] of callIndex) if (now - v.firstSeen > 600000) callIndex.delete(k);
 }
 
-// -------------------------------------------------------------------
-// TDOA feed — a single WebSocket to the coordinator DO. Fills in the
-// card detail + mini-map when a broadcast arrives for an MMSI we're
-// already showing (or have shown).
-// -------------------------------------------------------------------
+// TDOA feed — one WebSocket to the coordinator DO. Keeps a MMSI→fix
+// map so a late call decode for a previously-solved ship still picks up
+// its position when the card is rendered. Auto-reconnects on close.
 
 function connectTdoaFeed() {
   if (!GATEWAY) return;
-  const url = GATEWAY.replace(/^http/, "ws") + "/v2/tdoa/subscribe";
   if (tdoaWs) { try { tdoaWs.close(); } catch (_) {} }
-  tdoaWs = new WebSocket(url);
+  tdoaWs = new WebSocket(GATEWAY.replace(/^http/, "ws") + "/v2/tdoa/subscribe");
   tdoaWs.onopen = () => { tdoaRetry = 2000; };
+  tdoaWs.onerror = () => {};
   tdoaWs.onmessage = (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
     if (!msg || msg.t !== "tdoa" || !msg.mmsi || !msg.position) return;
@@ -481,37 +469,34 @@ function connectTdoaFeed() {
     setTimeout(connectTdoaFeed, tdoaRetry);
     tdoaRetry = Math.min(tdoaRetry * 2, 30_000);
   };
-  tdoaWs.onerror = () => {};
 }
 
 function renderTdoaInCard(entry, tdoa) {
-  // Drop low-confidence fixes entirely — no summary badge, no detail
-  // line, no map pin. If the coordinator re-solves with more receivers
-  // and the residual tightens, we'll see that broadcast and render then.
-  const residKm = tdoa && tdoa.position && tdoa.position.residualKm;
+  // Low-confidence fixes stay silent — no badge, no detail line, no
+  // pin. A subsequent re-solve with more receivers often tightens the
+  // residual and that broadcast will render as normal.
+  const residKm = tdoa?.position?.residualKm;
   if (!Number.isFinite(residKm) || residKm >= TDOA_MAX_RESIDUAL_KM) return;
   entry.tdoa = tdoa;
   if (!entry.row) return;
-  // A TDOA broadcast is authoritative about receiver count: the
-  // coordinator saw the same packet at `quorum` GPS-disciplined
-  // stations, which by definition is ≥3. The client-local count
-  // may be lower (we may not be attached to all those slots, or
-  // only one beat us to the call frame) so override the summary
-  // to reflect the network-wide quorum instead.
+
+  // Summary reflects the coordinator's authoritative quorum, not the
+  // local WS-feed count (which can be lower when this browser isn't
+  // attached to every cohort member).
   const summary = entry.row.querySelector(".c-heard");
   if (summary) {
     summary.classList.add("has-tdoa");
     const bands = new Set(entry.receivers.values());
     summary.textContent = `${tdoa.quorum} RX · ${Array.from(bands).join("/")}`;
   }
+
   const detail = entry.row.querySelector(".detail-text");
   if (detail) {
     let tdoaEl = detail.querySelector(".tdoa-fix");
     if (!tdoaEl) {
       tdoaEl = document.createElement("div");
       tdoaEl.className = "tdoa-fix";
-      // Place immediately after the GFW vessel chips so the fix sits
-      // at the top of the detail pane where the eye lands first.
+      // Sit just under the GFW vessel chips, above the format/kv block.
       const anchor = detail.querySelector(".vessel");
       if (anchor && anchor.nextSibling) detail.insertBefore(tdoaEl, anchor.nextSibling);
       else detail.prepend(tdoaEl);

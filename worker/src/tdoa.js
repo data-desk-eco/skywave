@@ -135,9 +135,3 @@ export function solveTdoa(dets, opts = {}) {
   const rmsTimeErr = Math.sqrt(best.r / Math.max(1, dets.length - 1));
   return { lat: best.la, lon: best.lo, residualKm: rmsTimeErr * C / 1000 };
 }
-
-function centroid(points) {
-  let la = 0, lo = 0;
-  for (const p of points) { la += p[0]; lo += p[1]; }
-  return [la / points.length, lo / points.length];
-}

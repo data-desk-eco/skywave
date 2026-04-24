@@ -1,12 +1,24 @@
 // Per-card mini-map — one tiny Leaflet instance, lazy-mounted on first
-// expand. Shows the listening receivers (hollow white rings) and, when
-// GFW has track data for the caller, the vessel's last known position
-// (filled white dot) with a decimated 14-day trail.
+// expand. Renders three layers:
+//   · listening receivers (hollow white rings) — local WS feed
+//   · GFW vessel position (filled white dot + 14-day trail) if available
+//   · TDOA solved position (hollow diamond + dashed residual circle)
+//     with extra receiver rings for cohort members this browser isn't
+//     directly attached to.
 
-import { Vessels } from "./vessels.js?v=22";
+import { Vessels } from "./vessels.js?v=23";
 
 const TILE_URL = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png";
 const TILE_ATTR = '&copy; <a href="https://carto.com/">carto</a> · OSM';
+const RX_STYLE = { radius: 4, color: "#fff", weight: 1.5, fillColor: "#000", fillOpacity: 1 };
+
+function addRxRing(entry, hostKey, gps, tooltip) {
+  if (entry._rxMarkers.has(hostKey)) return;
+  const m = window.L.circleMarker(gps, RX_STYLE)
+    .bindTooltip(tooltip, { direction: "top", offset: [0, -4] });
+  m.addTo(entry._map);
+  entry._rxMarkers.set(hostKey, m);
+}
 
 export function initMiniMap(entry) {
   if (entry._mapInited || !window.L) {
@@ -48,15 +60,7 @@ export function initMiniMap(entry) {
 
 export function addReceiverToMiniMap(entry, slot) {
   if (!entry._mapInited || !slot.gps) return;
-  if (entry._rxMarkers.has(slot.hostKey)) return;
-  const L = window.L;
-  const m = L.circleMarker(slot.gps, {
-    radius: 4, color: "#fff", weight: 1.5, fillColor: "#000", fillOpacity: 1,
-  }).bindTooltip(`${slot.bandLabel} · ${slot.label}`, {
-    direction: "top", offset: [0, -4],
-  });
-  m.addTo(entry._map);
-  entry._rxMarkers.set(slot.hostKey, m);
+  addRxRing(entry, slot.hostKey, slot.gps, `${slot.bandLabel} · ${slot.label}`);
   if (entry._vesselMarker) drawReceiverLines(entry);
   fitMiniMap(entry);
 }
@@ -106,49 +110,27 @@ function drawReceiverLines(entry) {
   }
 }
 
-// TDOA fix marker: a hollow diamond at the solved lat/lon with a
-// translucent circle whose radius matches the solver's reported RMS
-// timing residual (converted to km). Distinct from the filled-disc
-// GFW track marker so both can coexist on the same mini-map when
-// available.
-//
-// Also draws receiver rings for every cohort member in tdoa.receivers,
-// skipping any already on the map. The TDOA quorum is authoritative
-// about who heard the packet network-wide — the client's own WS fanout
-// may have missed some of them, and we want to show the full geometry
-// not just what this browser happened to decode locally.
+// TDOA fix: hollow diamond at the solved position with a translucent
+// dashed circle sized by the solver's residual. Also adds receiver
+// rings for any cohort members this browser isn't directly attached
+// to — the TDOA quorum is authoritative about who heard the packet,
+// the local WS feed may have missed some.
 export function setTdoaOnMiniMap(entry, tdoa) {
   if (!entry._mapInited || !entry._map || !tdoa || !tdoa.position) return;
   const L = window.L;
   const { lat, lon, residualKm } = tdoa.position;
-  const radiusM = Math.max(500, (residualKm || 0) * 1000);
 
-  // Draw rings for TDOA-only receivers (ones this browser isn't
-  // directly attached to). Dedupe by `host:port` against receivers
-  // already placed by the client-local feed.
-  if (Array.isArray(tdoa.receivers)) {
-    for (const r of tdoa.receivers) {
-      if (!r || !Array.isArray(r.gps) || typeof r.slot !== "string") continue;
-      const hostKey = r.slot.split("|")[0];
-      if (entry._rxMarkers.has(hostKey)) continue;
-      const label = r.slot.replace("|", " · ");
-      const m = L.circleMarker(r.gps, {
-        radius: 4, color: "#fff", weight: 1.5, fillColor: "#000", fillOpacity: 1,
-      }).bindTooltip(label, { direction: "top", offset: [0, -4] });
-      m.addTo(entry._map);
-      entry._rxMarkers.set(hostKey, m);
-    }
+  for (const r of tdoa.receivers || []) {
+    if (!r || !Array.isArray(r.gps) || typeof r.slot !== "string") continue;
+    const hostKey = r.slot.split("|")[0];
+    addRxRing(entry, hostKey, r.gps, r.slot.replace("|", " · "));
   }
 
   if (entry._tdoaCircle) entry._map.removeLayer(entry._tdoaCircle);
   entry._tdoaCircle = L.circle([lat, lon], {
-    radius: radiusM,
-    color: "#fff",
-    weight: 1,
-    fillColor: "#fff",
-    fillOpacity: 0.08,
-    opacity: 0.5,
-    dashArray: "2 3",
+    radius: Math.max(500, (residualKm || 0) * 1000),
+    color: "#fff", weight: 1, opacity: 0.5, dashArray: "2 3",
+    fillColor: "#fff", fillOpacity: 0.08,
     interactive: false,
   }).addTo(entry._map);
 
@@ -159,8 +141,7 @@ export function setTdoaOnMiniMap(entry, tdoa) {
       icon: L.divIcon({
         className: "tdoa-marker",
         html: '<div class="tdoa-diamond"></div>',
-        iconSize: [14, 14],
-        iconAnchor: [7, 7],
+        iconSize: [14, 14], iconAnchor: [7, 7],
       }),
     }).bindTooltip(
       `TDOA fix · ±${(residualKm || 0).toFixed(1)} km · q=${tdoa.quorum}`,

@@ -92,6 +92,12 @@ function mockState() {
   return {
     getWebSockets: () => [],
     acceptWebSocket: () => {},
+    blockConcurrencyWhile: (fn) => fn(),
+    storage: {
+      get: async () => null,
+      put: async () => {},
+      setAlarm: async () => {},
+    },
   };
 }
 
@@ -129,17 +135,7 @@ function runTrial(txGps, rng) {
 
   const coord = new TDOADO(mockState(), {});
   let latest = null;
-  let solveAttempts = 0;
-  let solveNullReason = null;
   coord._broadcast = (m) => { latest = m; };
-  // Monkey-patch _solveBucket to surface failure reasons.
-  const origSolve = coord._solveBucket.bind(coord);
-  coord._solveBucket = (b) => {
-    solveAttempts++;
-    const r = origSolve(b);
-    if (!r) solveNullReason = "null from _solveBucket";
-    return r;
-  };
 
   for (const rec of records) {
     coord._ingest({
@@ -156,7 +152,7 @@ function runTrial(txGps, rng) {
     });
   }
 
-  if (!latest) return { ok: false, reason: `no solve (attempts=${solveAttempts} reason=${solveNullReason})` };
+  if (!latest) return { ok: false, reason: "no solve" };
   const errKm = geodist([latest.position.lat, latest.position.lon], txGps) / 1000;
   return { ok: true, errKm, residualKm: latest.position.residualKm, lags: latest.receivers };
 }
