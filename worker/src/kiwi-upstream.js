@@ -4,9 +4,16 @@
 //   * ArrayBuffer → Uint8Array without needing DataView ceremony
 //   * no onStatus DOM hook; callers get a terse onReady / onError
 //
-// Protocol: we ask the receiver for USB-demodulated audio at 12 kHz,
-// passband 300–3000 Hz, dial 1.7 kHz below the DSC channel. Compression
-// is disabled (compression=0) so frames arrive as raw int16 PCM.
+// Protocol: we ask the receiver for IQ at 12 kHz, dial 1.7 kHz below
+// the DSC channel, passband 300–3000 Hz. That passband is positive-
+// only in IQ space so the Kiwi pre-filters the stream to be analytic,
+// which means real(IQ) reproduces USB audio sample-for-sample — what
+// the DSC decoder expects.
+//
+// Why IQ instead of plain USB: stereo (IQ) frames carry a 10-byte GPS
+// header per block (last_gps_solution / gpssec / gpsnsec), which the
+// mono USB path discards. That per-frame GNSS timestamp is the shared
+// time base TDOA geolocation needs.
 
 export class KiwiUpstream {
   constructor(host, port, opts = {}) {
@@ -110,7 +117,7 @@ export class KiwiUpstream {
       this._send("SET squelch=0 max=0");
       this._send("SET genattn=0");
       this._send("SET gen=0 mix=-1");
-      this._send(`SET mod=usb low_cut=${this.lowCut} high_cut=${this.highCut} freq=${this.dialKHz.toFixed(3)}`);
+      this._send(`SET mod=iq low_cut=${this.lowCut} high_cut=${this.highCut} freq=${this.dialKHz.toFixed(3)}`);
       this._send("SET agc=1 hang=0 thresh=-100 slope=6 decay=1000 manGain=50");
       this._send("SET compression=0");
       this._send("SET keepalive");
@@ -119,25 +126,41 @@ export class KiwiUpstream {
   }
 
   _handleSnd(body) {
-    // 3-byte "SND" already stripped. Next: flags(1), seq(u32 LE),
-    // smeter(u16 BE), then int16-BE audio PCM.
+    // 3-byte "SND" already stripped. Fixed 7-byte header:
+    //   flags(1), seq(u32 LE), smeter(u16 BE)
+    // Then, in stereo (IQ) mode, a 10-byte GPS block:
+    //   last_gps_solution(u8), dummy(u8), gpssec(u32 LE), gpsnsec(u32 LE)
+    // Then int16-BE samples. In IQ mode these are interleaved I, Q pairs.
     if (body.length < 7) return;
     const flags = body[0];
+    const seq = body[1] | (body[2] << 8) | (body[3] << 16) | (body[4] << 24);
     const smeter = (body[5] << 8) | body[6];
     const rssi = 0.1 * smeter - 127;
-    // compression=0 may not have propagated to the very first frame.
+    // compression=0 — stereo/IQ is never compressed, but a stray mono-
+    // compressed frame can still land before our SET settles.
     if (flags & 0x10) return;
-    const count = (body.length - 7) >> 1;
-    const samples = new Float32Array(count);
-    for (let i = 0; i < count; i++) {
-      const hi = body[7 + i * 2], lo = body[7 + i * 2 + 1];
+    if (!(flags & 0x08)) return;  // not stereo/IQ; ignore until mod=iq settles
+    if (body.length < 17) return;
+    const gpsSolution = body[7];
+    const gpssec = body[9]  | (body[10] << 8) | (body[11] << 16) | (body[12] << 24);
+    const gpsnsec = body[13] | (body[14] << 8) | (body[15] << 16) | (body[16] << 24);
+    const gpsFresh = gpsSolution === 0;  // kiwirecorder convention: 0 = fresh fix
+
+    const iqBytes = body.subarray(17);          // int16-BE I,Q,I,Q,...
+    const pairs = iqBytes.length >> 2;          // 4 bytes per complex sample
+    const audio = new Float32Array(pairs);      // real(IQ) — USB audio
+    // Mono PCM (I channel only) as int16-BE bytes, for verbatim browser
+    // fanout. Same shape the old USB path produced.
+    const pcmBytes = new Uint8Array(pairs * 2);
+    for (let i = 0; i < pairs; i++) {
+      const hi = iqBytes[i * 4], lo = iqBytes[i * 4 + 1];
+      pcmBytes[i * 2] = hi;
+      pcmBytes[i * 2 + 1] = lo;
       let s = (hi << 8) | lo;
       if (s & 0x8000) s |= ~0xFFFF;
-      samples[i] = s / 32768;
+      audio[i] = s / 32768;
     }
-    // Hand the raw int16 bytes up too so we can forward them verbatim
-    // as PCM without re-encoding Float32 → int16 for the fanout.
-    const pcmBytes = body.subarray(7);
-    this.onAudio(samples, this.sampleRate, rssi, pcmBytes);
+    const gps = { fresh: gpsFresh, gpssec, gpsnsec, seq, nSamples: pairs };
+    this.onAudio(audio, this.sampleRate, rssi, pcmBytes, gps, iqBytes);
   }
 }

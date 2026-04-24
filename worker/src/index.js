@@ -14,9 +14,10 @@
 
 import { ReceiverDO } from "./receiver-do.js";
 import { DirectoryDO } from "./directory-do.js";
+import { TDOADO } from "./tdoa-do.js";
 import { locationHintFor } from "./location-hint.js";
 
-export { ReceiverDO, DirectoryDO };
+export { ReceiverDO, DirectoryDO, TDOADO };
 
 const CORS = {
   "access-control-allow-origin": "*",
@@ -221,6 +222,18 @@ export default {
     if (url.pathname === "/v2/rack") return handleV2Rack(request, env);
     const vSlot = url.pathname.match(/^\/v2\/slot\/([^/]+)\/(\d+)\/([0-9.]+)\/?$/);
     if (vSlot) return handleV2Slot(request, env, decodeURIComponent(vSlot[1]), vSlot[2], vSlot[3]);
+
+    // TDOA subscription and debug. POST /detect is used only by
+    // ReceiverDOs (via service binding) so it isn't routed here.
+    if (url.pathname === "/v2/tdoa/subscribe" || url.pathname === "/v2/tdoa/recent"
+        || url.pathname === "/v2/tdoa/inject") {
+      const id = env.TDOA.idFromName("singleton");
+      const innerPath = url.pathname === "/v2/tdoa/recent" ? "https://do/recent"
+                      : url.pathname === "/v2/tdoa/inject" ? "https://do/detect"
+                      : "https://do/subscribe";
+      const inner = new URL(innerPath);
+      return env.TDOA.get(id).fetch(new Request(inner, request));
+    }
 
     if (url.pathname === "/receivers") return receivers();
     if (url.pathname === "/gfw") return gfw(url);

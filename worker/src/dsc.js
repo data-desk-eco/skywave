@@ -280,7 +280,7 @@ export function decode(samples, sr, opts = {}) {
       const bits = fskDemod(view, sr, mark, space);
       const { start, score } = findPhasing(bits, 5);
       if (start < 0) continue;
-      if (!best || score < best.score) best = { bits, start, score, mark, space };
+      if (!best || score < best.score) best = { bits, start, score, mark, space, off };
     }
   };
 
@@ -321,6 +321,14 @@ export function decode(samples, sr, opts = {}) {
     call.spaceHz = best.space;
     call.phasingScore = best.score;
     call.badSymbols = badSyms;
+    // Approximate sample index in `samples` where the decoded bitstream
+    // begins (i.e. the end of the phasing preamble). TDOA needs a shared
+    // wall-clock reference per packet; this is the anchor the receiver
+    // side uses to look up a GPS-ns timestamp against its IQ frame ring.
+    // Resolution is one bit (samples/BAUD = 120 at 12 kHz = 10 ms); good
+    // enough as a pairing hint — sub-sample alignment happens later via
+    // cross-correlation at the TDOA coordinator.
+    call.startSample = (best.off | 0) + Math.floor(best.start * spb);
   } else if (debug) {
     console.log(`[dsc] parseCall rejected (too many '??' BCD digits)`);
   }

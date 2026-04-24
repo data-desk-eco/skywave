@@ -12,7 +12,7 @@
 //      streaming PCM we'd never play.
 
 import { Vessels } from "./vessels.js";
-import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap } from "./map.js";
+import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js";
 import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js";
 
 const DEBUG = /(\?|&)debug=1\b/.test(location.search);
@@ -44,6 +44,12 @@ const rxCountEl = $("rxcount"), playingEl = $("playing"),
 const slots = new Map();
 /** Cross-slot dedupe: sig → { firstSeen, receivers, row, ... } */
 const callIndex = new Map();
+/** MMSI → latest TDOA fix from the coordinator DO. Kept for the whole
+ *  session so a call decoded long after its TDOA still picks up the
+ *  position when the card is opened. */
+const tdoaByMmsi = new Map();
+let tdoaWs = null;
+let tdoaRetry = 2000;
 let audioCtx = null;
 let destinationGain = null;
 let audioEl = null;
@@ -211,6 +217,7 @@ async function start() {
     emptyEl.style.display = "";
     applyRack(rack);
     rackTimer = setInterval(refreshRack, RACK_REFRESH_MS);
+    connectTdoaFeed();
   } catch (e) {
     rxCountEl.textContent = "no rack";
     if (DEBUG) console.log("[skywave] start failed:", e);
@@ -391,7 +398,68 @@ function dispatchCall(call, slot) {
   callIndex.set(sig, entry);
   entry.row = addCallRow(call, entry);
   if (/^\d{9}$/.test(call.caller || "")) Vessels.lookup(call.caller);
+  // TDOA may have arrived before this call's card was rendered (coord
+  // DO broadcasts on quorum, which can beat a decoder re-run elsewhere).
+  const tdoa = tdoaByMmsi.get(call.caller);
+  if (tdoa) renderTdoaInCard(entry, tdoa);
   for (const [k, v] of callIndex) if (now - v.firstSeen > 600000) callIndex.delete(k);
+}
+
+// -------------------------------------------------------------------
+// TDOA feed — a single WebSocket to the coordinator DO. Fills in the
+// card detail + mini-map when a broadcast arrives for an MMSI we're
+// already showing (or have shown).
+// -------------------------------------------------------------------
+
+function connectTdoaFeed() {
+  if (!GATEWAY) return;
+  const url = GATEWAY.replace(/^http/, "ws") + "/v2/tdoa/subscribe";
+  if (tdoaWs) { try { tdoaWs.close(); } catch (_) {} }
+  tdoaWs = new WebSocket(url);
+  tdoaWs.onopen = () => { tdoaRetry = 2000; };
+  tdoaWs.onmessage = (ev) => {
+    let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
+    if (!msg || msg.t !== "tdoa" || !msg.mmsi || !msg.position) return;
+    tdoaByMmsi.set(msg.mmsi, msg);
+    for (const entry of callIndex.values()) {
+      if (entry.call.caller === msg.mmsi) renderTdoaInCard(entry, msg);
+    }
+  };
+  tdoaWs.onclose = () => {
+    tdoaWs = null;
+    setTimeout(connectTdoaFeed, tdoaRetry);
+    tdoaRetry = Math.min(tdoaRetry * 2, 30_000);
+  };
+  tdoaWs.onerror = () => {};
+}
+
+function renderTdoaInCard(entry, tdoa) {
+  entry.tdoa = tdoa;
+  if (!entry.row) return;
+  const summary = entry.row.querySelector(".c-heard");
+  if (summary && !summary.classList.contains("has-tdoa")) {
+    summary.classList.add("has-tdoa");
+  }
+  const detail = entry.row.querySelector(".detail-text");
+  if (detail) {
+    let tdoaEl = detail.querySelector(".tdoa-fix");
+    if (!tdoaEl) {
+      tdoaEl = document.createElement("div");
+      tdoaEl.className = "tdoa-fix";
+      // Place immediately after the GFW vessel chips so the fix sits
+      // at the top of the detail pane where the eye lands first.
+      const anchor = detail.querySelector(".vessel");
+      if (anchor && anchor.nextSibling) detail.insertBefore(tdoaEl, anchor.nextSibling);
+      else detail.prepend(tdoaEl);
+    }
+    const { lat, lon, residualKm } = tdoa.position;
+    const when = new Date(tdoa.broadcastMs).toISOString().slice(11, 19) + "Z";
+    tdoaEl.innerHTML =
+      `<span class="tdoa-label">TDOA fix</span>` +
+      `<span class="tdoa-coord">${lat.toFixed(3)}°, ${lon.toFixed(3)}°</span>` +
+      `<span class="tdoa-meta">±${residualKm.toFixed(1)} km · q=${tdoa.quorum} · ${when}</span>`;
+  }
+  if (entry._mapInited) setTdoaOnMiniMap(entry, tdoa);
 }
 
 function updateHeard(entry) {
@@ -449,7 +517,10 @@ function addCallRow(call, entry) {
   row.addEventListener("click", (e) => {
     if (e.target.closest(".mini-map, a")) return;
     row.classList.toggle("open");
-    if (row.classList.contains("open")) initMiniMap(entry);
+    if (row.classList.contains("open")) {
+      initMiniMap(entry);
+      if (entry.tdoa) setTdoaOnMiniMap(entry, entry.tdoa);
+    }
   });
   callsEl.prepend(row);
   while (callsEl.children.length > 200) callsEl.lastChild.remove();

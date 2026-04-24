@@ -16,8 +16,19 @@ class_name = "ReceiverDO"
 name = "DIRECTORY"
 class_name = "DirectoryDO"
 
+# TDOADO — singleton that fans in detections from every ReceiverDO and
+# runs the cross-correlation + hyperboloid solve when ≥3 receivers hear
+# the same packet.
+[[durable_objects.bindings]]
+name = "TDOA"
+class_name = "TDOADO"
+
 # SQLite-backed DO classes — the default after 2025-01-01 compat date,
 # but be explicit so migrations survive compat-date bumps.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ReceiverDO", "DirectoryDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["TDOADO"]

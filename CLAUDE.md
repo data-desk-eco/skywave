@@ -40,12 +40,15 @@ the URL on first attach anyway.
 
 Defensible: out of ~900 public KiwiSDRs, the picker (in
 `worker/src/regions.js`) selects 8 per DSC band (48 total; also the
-hard ceiling) that are **active**, **coastal** (≤8° from a major port
-anchor), **healthy** (self-reported SNR ≥ 15 dB, list entry updated in
-the last hour, not IP-blacklisting us), and **considerate** (≥ 2 free
-user slots so a human listener always has one). Same-band picks are
-≥ 3° apart for geographic diversity; any one (host, port) is capped
-at 2 bands so the rack doesn't over-index on a single operator.
+hard ceiling) that are **active**, **GPS-equipped and actively fixing**
+(TDOA needs per-frame GNSS timestamps — this also cuts the pool by
+~37%), **coastal** (≤8° from a major port anchor), **healthy**
+(self-reported SNR ≥ 15 dB, list entry updated in the last hour, not
+IP-blacklisting us), and **considerate** (≥ 2 free user slots so a
+human listener always has one). Same-band picks are ≥ 3° apart for
+geographic diversity; any one (host, port) is capped at 2 bands so
+the rack doesn't over-index on a single operator. The "Global" view
+and per-region views share the same 48-slot ceiling.
 
 Scoring: `freeSlots × coastalProximity × snrBonus × antennaBonus`,
 with `antennaBonus = 1.5` when the antenna free-text mentions a

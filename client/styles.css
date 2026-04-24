@@ -234,6 +234,46 @@ header {
   z-index: 500;
 }
 
+/* TDOA fix line in the call-detail panel. Shown only when the
+ * coordinator DO has broadcast a position for this MMSI. */
+.tdoa-fix {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 8px;
+  margin-bottom: 10px;
+  border: 1px dashed var(--dimmer);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+.tdoa-fix .tdoa-label {
+  color: var(--dim);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.tdoa-fix .tdoa-coord { color: var(--fg); font-weight: 700; }
+.tdoa-fix .tdoa-meta  { color: var(--dim); font-size: 11px; }
+
+/* Indicator on the always-visible summary row when a fix exists. */
+.call .c-heard.has-tdoa::before {
+  content: "◆ ";
+  color: var(--fg);
+  margin-right: 2px;
+}
+
+/* Diamond icon for the TDOA marker on the mini-map. */
+.tdoa-marker { background: transparent; border: none; }
+.tdoa-diamond {
+  width: 10px;
+  height: 10px;
+  margin: 2px;
+  background: rgba(255, 255, 255, 0.15);
+  border: 1.5px solid #fff;
+  transform: rotate(45deg);
+}
+
 /* Vessel info header in a call's detail panel (populated by GFW). */
 .vessel:empty { display: none; }
 .vessel {

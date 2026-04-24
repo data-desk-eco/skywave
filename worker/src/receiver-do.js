@@ -35,6 +35,14 @@ const DECODE_EVERY_MS    = 3000;
 const DECODE_WINDOW_SEC  = 10;
 const RING_MAX_SEC       = 15;
 
+// TDOA snippet: window of audio around each detection handed to the
+// coordinator for cross-correlation. 2 s centred on the packet start
+// comfortably covers the ~500 ms burst plus enough flanking context for
+// sub-sample lag refinement across receivers whose GPS-ns timestamps
+// may disagree by tens of ms due to decoder scheduling jitter.
+const SNIPPET_BEFORE_SEC = 0.5;
+const SNIPPET_AFTER_SEC  = 1.5;
+
 export class ReceiverDO {
   constructor(state, env) {
     this.state = state;
@@ -46,6 +54,16 @@ export class ReceiverDO {
     this.upstreamAttempt = 0;
     this.sampleRate = 12000;
     this.ring = new Float32Array(0);
+    // Running count of samples we've received on this upstream. Used to
+    // convert decoder sample offsets (inside the ring view) back to an
+    // absolute index that can be looked up in `gpsFrames` below.
+    this.totalSamples = 0;
+    // Parallel ring of per-upstream-frame GPS timestamps. Each entry:
+    //   { absSample, gpssec, gpsnsec, fresh, nSamples }
+    // `absSample` is the index of the first sample of that frame in the
+    // cumulative stream. We trim in lockstep with the audio ring so the
+    // coverage stays aligned.
+    this.gpsFrames = [];
     this.rssi = -127;
     this.rmsEMA = 0;
     this.inBandEMA = 0;
@@ -176,8 +194,8 @@ export class ReceiverDO {
     const up = new KiwiUpstream(host, port, {
       dialKHz: bandKHz - 1.7,
       ident: "skywave shared listener",
-      onAudio: (samples, sr, rssi, pcmBytes) =>
-        this._onAudio(samples, sr, rssi, pcmBytes),
+      onAudio: (samples, sr, rssi, pcmBytes, gps) =>
+        this._onAudio(samples, sr, rssi, pcmBytes, gps),
       onReady: (sr) => {
         this.sampleRate = sr;
         this._announce({ t: "status", state: "live", sr });
@@ -213,11 +231,33 @@ export class ReceiverDO {
   // Audio path — activity detection, ring buffer, decode, fanout
   // -------------------------------------------------------------------
 
-  _onAudio(samples, sr, rssi, pcmBytes) {
+  _onAudio(samples, sr, rssi, pcmBytes, gps) {
     this.rssi = rssi;
     this.sampleRate = sr;
     const N = samples.length;
     if (!N) return;
+
+    // Track cumulative sample index and per-frame GPS timestamp so the
+    // decoder can later translate its in-ring sample offset into a
+    // GPS-ns wall-clock anchor for TDOA pairing.
+    const frameAbs = this.totalSamples;
+    this.totalSamples += N;
+    if (gps) {
+      this.gpsFrames.push({
+        absSample: frameAbs,
+        gpssec:  gps.gpssec  >>> 0,
+        gpsnsec: gps.gpsnsec >>> 0,
+        fresh:   !!gps.fresh,
+        nSamples: N,
+      });
+      // Trim in lockstep with the audio ring. Keep ~ RING_MAX_SEC of
+      // history plus a small safety margin.
+      const keepFromAbs = this.totalSamples - Math.floor(sr * (RING_MAX_SEC + 1));
+      while (this.gpsFrames.length > 1
+             && this.gpsFrames[1].absSample <= keepFromAbs) {
+        this.gpsFrames.shift();
+      }
+    }
 
     let totalP = 0;
     for (let i = 0; i < N; i++) totalP += samples[i] * samples[i];
@@ -284,7 +324,8 @@ export class ReceiverDO {
   _runDecoder() {
     const sr = this.sampleRate;
     const windowLen = Math.floor(sr * DECODE_WINDOW_SEC);
-    const view = this.ring.subarray(Math.max(0, this.ring.length - windowLen));
+    const viewOffsetInRing = Math.max(0, this.ring.length - windowLen);
+    const view = this.ring.subarray(viewOffsetInRing);
 
     // Cheap RMS gate; skip obviously-silent chunks so we don't run the
     // decoder's autotune sweep on 100 dB of nothing.
@@ -309,7 +350,140 @@ export class ReceiverDO {
       if (now - t > 120000) this.decodedSigs.delete(k);
     }
 
+    // TDOA detection record. `call.startSample` is the bit-aligned packet
+    // start within `view`; translate to an absolute sample index, then
+    // look up the straddling GPS-timestamped frame and interpolate to
+    // sub-frame precision.
+    const startInRing = viewOffsetInRing + (call.startSample | 0);
+    const absStart = this.totalSamples - this.ring.length + startInRing;
+    const det = this._detectionRecord(call, absStart, sr);
+    if (det) {
+      this._emitDetection(det);
+    } else {
+      // Surface why so we can diagnose from the client. Common failure:
+      // no fresh GPS anchor in the ring (Kiwi's GNSS not reporting yet).
+      const gf = this.gpsFrames;
+      const withFix = gf.filter((f) => f.gpssec || f.gpsnsec).length;
+      const freshCount = gf.filter((f) => f.fresh).length;
+      this._announce({
+        t: "status",
+        state: "no-tdoa-anchor",
+        msg: `gpsFrames=${gf.length} withFix=${withFix} fresh=${freshCount}`,
+      });
+    }
+
     this._announce({ t: "call", call });
+  }
+
+  // Assemble the detection record: receiver metadata, GPS-ns anchor, and
+  // an audio snippet spanning the burst for cross-correlation upstream.
+  //
+  // The snippet has a FIXED length anchored at `packet_start −
+  // SNIPPET_BEFORE_SEC`, zero-padded if the ring doesn't contain that
+  // much history. Every receiver's snippet for the same packet then
+  // begins at the same wall-clock moment (up to the TDOA itself), which
+  // is what the coordinator relies on when cross-correlating. The
+  // earlier "clamp to ring head" behaviour made startGpsNs wildly
+  // divergent across receivers on short-ring slots and blew out the
+  // coordinator's spread-check.
+  _detectionRecord(call, absStartSample, sr) {
+    const anchor = this._gpsAtAbsSample(absStartSample, sr);
+    if (!anchor) return null;
+
+    const snippetStartAbs = absStartSample - Math.floor(SNIPPET_BEFORE_SEC * sr);
+    const totalLen = Math.floor((SNIPPET_BEFORE_SEC + SNIPPET_AFTER_SEC) * sr);
+    const audio = new Float32Array(totalLen);
+    const ringHead = this.totalSamples - this.ring.length;
+    const availFrom = Math.max(snippetStartAbs, ringHead);
+    const availTo   = Math.min(snippetStartAbs + totalLen, ringHead + this.ring.length);
+    if (availTo > availFrom) {
+      const writeOff = availFrom - snippetStartAbs;
+      const readOff  = availFrom - ringHead;
+      audio.set(this.ring.subarray(readOff, readOff + (availTo - availFrom)), writeOff);
+    }
+    const snippetStartAnchor = this._gpsAtAbsSample(snippetStartAbs, sr);
+    if (!snippetStartAnchor) return null;
+
+    return {
+      slot: this._slotInfo(),
+      call: {
+        caller: call.caller,
+        destination: call.destination,
+        formatCode: call.formatCode,
+        categoryCode: call.categoryCode,
+        eos: call.eos,
+      },
+      // GPS-ns at the packet's decoder-identified start (phasing→data).
+      packetGpsNs: anchor.ns,
+      // Snippet metadata: audio is Float32, SR-rate, starts at this
+      // wall-clock time. Base64-encoded on the wire (done by whoever
+      // transports this record — keep the record plain JS here).
+      snippet: {
+        sampleRate: sr,
+        startGpsNs: snippetStartAnchor.ns,
+        samples: audio,      // Float32Array
+      },
+    };
+  }
+
+  // Map an absolute sample index to a GPS-ns timestamp.
+  //
+  // KiwiSDR IQ frames carry (last_gps_solution, gpssec, gpsnsec). The
+  // GNSS subsystem only reports a new PVT solution ~1/sec; in between,
+  // the Kiwi repeats the last solution's timestamp across many frames
+  // (last_gps_solution counts "frames since fresh" and is 0 only on the
+  // frame where a new fix just landed). The repeat makes it unsafe to
+  // interpret every frame's timestamp as "this frame's sample 0".
+  //
+  // Strategy: treat a fresh frame (or the first change we see in gpssec/
+  // gpsnsec) as an anchor, and extrapolate to any later sample using the
+  // GPS-disciplined sample rate. Accurate to sub-microsecond over the
+  // ring's multi-second span.
+  _gpsAtAbsSample(absSample, sr) {
+    const frames = this.gpsFrames;
+    if (!frames.length) return null;
+    // Find the latest fresh or gps-changed frame at or before absSample.
+    let anchor = null;
+    let prevGps = null;
+    for (const f of frames) {
+      if (f.absSample > absSample) break;
+      if (!f.gpssec && !f.gpsnsec) continue;   // Kiwi never had a fix here
+      const key = `${f.gpssec}.${f.gpsnsec}`;
+      if (f.fresh || prevGps !== key) anchor = f;
+      prevGps = key;
+    }
+    if (!anchor) return null;
+    const offsetSamples = absSample - anchor.absSample;
+    const extraNs = Math.round(offsetSamples * 1e9 / sr);
+    const ns = BigInt(anchor.gpssec) * 1_000_000_000n
+             + BigInt(anchor.gpsnsec)
+             + BigInt(extraNs);
+    return { ns };
+  }
+
+  // Hand the detection off. In phase-1 wiring this is a no-op stub; the
+  // TDOA coordinator DO consumes these via the task-8 implementation.
+  _emitDetection(det) {
+    // Placeholder: serialise enough to log without exploding console for
+    // the audio snippet. Will be replaced by a fetch() to TDOADO.
+    if (!this.env.TDOA) return;
+    // Fire-and-forget; we never block the audio path on coordinator I/O.
+    const body = {
+      ...det,
+      packetGpsNs: det.packetGpsNs.toString(),
+      snippet: {
+        sampleRate: det.snippet.sampleRate,
+        startGpsNs: det.snippet.startGpsNs.toString(),
+        samples: Array.from(det.snippet.samples),
+      },
+    };
+    const id = this.env.TDOA.idFromName("singleton");
+    const stub = this.env.TDOA.get(id);
+    stub.fetch("https://tdoa/detect", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }).catch(() => {});
   }
 
   // -------------------------------------------------------------------

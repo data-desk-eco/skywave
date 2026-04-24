@@ -102,11 +102,57 @@ function drawReceiverLines(entry) {
   }
 }
 
+// TDOA fix marker: a hollow diamond at the solved lat/lon with a
+// translucent circle whose radius matches the solver's reported RMS
+// timing residual (converted to km). Distinct from the filled-disc
+// GFW track marker so both can coexist on the same mini-map when
+// available.
+export function setTdoaOnMiniMap(entry, tdoa) {
+  if (!entry._mapInited || !tdoa || !tdoa.position) return;
+  const L = window.L;
+  const { lat, lon, residualKm } = tdoa.position;
+  const radiusM = Math.max(500, (residualKm || 0) * 1000);
+
+  if (entry._tdoaCircle) entry._map.removeLayer(entry._tdoaCircle);
+  entry._tdoaCircle = L.circle([lat, lon], {
+    radius: radiusM,
+    color: "#fff",
+    weight: 1,
+    fillColor: "#fff",
+    fillOpacity: 0.08,
+    opacity: 0.5,
+    dashArray: "2 3",
+    interactive: false,
+  }).addTo(entry._map);
+
+  if (entry._tdoaMarker) {
+    entry._tdoaMarker.setLatLng([lat, lon]);
+  } else {
+    entry._tdoaMarker = L.marker([lat, lon], {
+      icon: L.divIcon({
+        className: "tdoa-marker",
+        html: '<div class="tdoa-diamond"></div>',
+        iconSize: [14, 14],
+        iconAnchor: [7, 7],
+      }),
+    }).bindTooltip(
+      `TDOA fix · ±${(residualKm || 0).toFixed(1)} km · q=${tdoa.quorum}`,
+      { direction: "top", offset: [0, -6] },
+    );
+    entry._tdoaMarker.addTo(entry._map);
+  }
+  fitMiniMap(entry);
+}
+
 function fitMiniMap(entry) {
   const pts = entry.receiverSlots.filter((s) => s.gps).map((s) => s.gps.slice());
   if (entry._vesselMarker) {
     const v = entry._vesselMarker.getLatLng();
     pts.push([v.lat, v.lng]);
+  }
+  if (entry._tdoaMarker) {
+    const t = entry._tdoaMarker.getLatLng();
+    pts.push([t.lat, t.lng]);
   }
   if (!pts.length) { entry._map.setView([0, 0], 2); return; }
   if (pts.length === 1) { entry._map.setView(pts[0], 5); return; }

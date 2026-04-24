@@ -90,7 +90,12 @@ export function coversBand(rx, khz) {
 //     · not proxy.kiwisdr.com (307-redirects on handshake, browsers
 //       can't follow — empirically blocks outbound in CF DOs too)
 //     · `ip_blacklist !== "yes"` — some operators exclude CF IPs
-//     · has a GPS fix we can parse
+//     · has the GPS hardware option (`sdr_hw` advertises "📡 GPS")
+//       AND is actively fixing (`fixes_hour` ≥ MIN_GPS_FIXES_HOUR).
+//       TDOA geolocation needs per-frame GNSS timestamps; a KiwiSDR
+//       without a sky-view GPS can't provide them. ~63% of the
+//       public fleet survives this cut.
+//     · has a site GPS fix we can parse (the `gps` string)
 //     · covers the DSC band's dial frequency (`bands` field)
 //     · lies within the region's bbox
 //     · has ≥ MIN_FREE_SLOTS_TO_JOIN free user slots (etiquette)
@@ -125,6 +130,8 @@ const MIN_SNR_DB = 15;         // noise-floor cut-off, per receiver's own report
 const UPDATE_RECENCY_SEC = 3600;
 const MIN_SEP_DEG = 3;         // per-band geographic spread
 const MAX_BANDS_PER_HOST = 2;
+const MIN_GPS_FIXES_HOUR = 100;  // GPS hardware must actually be fixing
+const GPS_HW_MARKER = "📡 GPS"; // substring in `sdr_hw` when the option is present
 export const DEFAULT_FANOUT = 48;  // also the hard ceiling — ?fanout= can only narrow the rack
 
 // Coast-station-style MMSIs and many public KiwiSDRs name-check their
@@ -162,6 +169,10 @@ function rankCandidates(receivers, khz, bbox) {
     if (/proxy\.kiwisdr\.com/i.test(r.url)) continue;
     if (!coversBand(r, khz)) continue;
     if (updatedSecondsAgo(r.updated) > UPDATE_RECENCY_SEC) continue;
+    // GPS-option + actively fixing. Required for TDOA geolocation:
+    // without per-frame GNSS timestamps there's no shared time base.
+    if (!String(r.sdr_hw || "").includes(GPS_HW_MARKER)) continue;
+    if ((parseInt(r.fixes_hour, 10) || 0) < MIN_GPS_FIXES_HOUR) continue;
     let host;
     try {
       const u = new URL(r.url);
