@@ -3,7 +3,7 @@
 // GFW has track data for the caller, the vessel's last known position
 // (filled white dot) with a decimated 14-day trail.
 
-import { Vessels } from "./vessels.js?v=21";
+import { Vessels } from "./vessels.js?v=22";
 
 const TILE_URL = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png";
 const TILE_ATTR = '&copy; <a href="https://carto.com/">carto</a> · OSM';
@@ -111,11 +111,34 @@ function drawReceiverLines(entry) {
 // timing residual (converted to km). Distinct from the filled-disc
 // GFW track marker so both can coexist on the same mini-map when
 // available.
+//
+// Also draws receiver rings for every cohort member in tdoa.receivers,
+// skipping any already on the map. The TDOA quorum is authoritative
+// about who heard the packet network-wide — the client's own WS fanout
+// may have missed some of them, and we want to show the full geometry
+// not just what this browser happened to decode locally.
 export function setTdoaOnMiniMap(entry, tdoa) {
   if (!entry._mapInited || !entry._map || !tdoa || !tdoa.position) return;
   const L = window.L;
   const { lat, lon, residualKm } = tdoa.position;
   const radiusM = Math.max(500, (residualKm || 0) * 1000);
+
+  // Draw rings for TDOA-only receivers (ones this browser isn't
+  // directly attached to). Dedupe by `host:port` against receivers
+  // already placed by the client-local feed.
+  if (Array.isArray(tdoa.receivers)) {
+    for (const r of tdoa.receivers) {
+      if (!r || !Array.isArray(r.gps) || typeof r.slot !== "string") continue;
+      const hostKey = r.slot.split("|")[0];
+      if (entry._rxMarkers.has(hostKey)) continue;
+      const label = r.slot.replace("|", " · ");
+      const m = L.circleMarker(r.gps, {
+        radius: 4, color: "#fff", weight: 1.5, fillColor: "#000", fillOpacity: 1,
+      }).bindTooltip(label, { direction: "top", offset: [0, -4] });
+      m.addTo(entry._map);
+      entry._rxMarkers.set(hostKey, m);
+    }
+  }
 
   if (entry._tdoaCircle) entry._map.removeLayer(entry._tdoaCircle);
   entry._tdoaCircle = L.circle([lat, lon], {
@@ -149,7 +172,14 @@ export function setTdoaOnMiniMap(entry, tdoa) {
 }
 
 function fitMiniMap(entry) {
-  const pts = entry.receiverSlots.filter((s) => s.gps).map((s) => s.gps.slice());
+  // Use every placed receiver marker, local or TDOA-contributed —
+  // that gives the map a bounds encompassing the full cohort, not
+  // just the subset this browser is attached to.
+  const pts = [];
+  for (const m of entry._rxMarkers.values()) {
+    const ll = m.getLatLng();
+    pts.push([ll.lat, ll.lng]);
+  }
   if (entry._vesselMarker) {
     const v = entry._vesselMarker.getLatLng();
     pts.push([v.lat, v.lng]);
