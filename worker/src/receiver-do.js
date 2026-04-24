@@ -191,6 +191,16 @@ export class ReceiverDO {
     if (!this.config) return;
     const { host, port, bandKHz } = this.config;
     this.upstreamAttempt++;
+    const reconnect = () => {
+      this.upstream = null;
+      if (this.state.getWebSockets().length === 0) return;
+      // Exponential-ish backoff capped at 30 s: a full or offline Kiwi
+      // might recover on a timescale of minutes, and we want to keep
+      // trying so the live-station count self-heals, but we don't want
+      // to hammer persistently-busy receivers every 4 s forever.
+      const delay = Math.min(30_000, 2_000 * Math.pow(1.5, Math.max(0, this.upstreamAttempt - 1)));
+      setTimeout(() => this._ensureUpstream(), delay);
+    };
     const up = new KiwiUpstream(host, port, {
       dialKHz: bandKHz - 1.7,
       ident: "skywave shared listener",
@@ -198,24 +208,29 @@ export class ReceiverDO {
         this._onAudio(samples, sr, rssi, pcmBytes, gps),
       onReady: (sr) => {
         this.sampleRate = sr;
+        // Reset the backoff once we've actually reached audio-rate —
+        // next failure resumes from a short delay, not a long one.
+        this.upstreamAttempt = 0;
         this._announce({ t: "status", state: "live", sr });
       },
       onClose: () => {
-        this.upstream = null;
         this._announce({ t: "status", state: "down" });
-        // Only reconnect if we still have subscribers; otherwise let
-        // the idle alarm take care of shutdown.
-        if (this.state.getWebSockets().length > 0) {
-          setTimeout(() => this._ensureUpstream(), 4000);
-        }
+        reconnect();
       },
+      // Previously this path had no retry — when a Kiwi 403'd at the
+      // WebSocket upgrade (server full), onError fired but onClose did
+      // not, so the slot stayed dead for the lifetime of the DO. Now
+      // both paths schedule a reconnect via `reconnect()` so temporary
+      // busy/offline states self-heal.
       onError: (e) => {
         this._announce({ t: "status", state: "err", msg: String(e) });
+        reconnect();
       },
     });
     this.upstream = up;
     up.connect().catch((e) => {
       this._announce({ t: "status", state: "err", msg: String(e) });
+      reconnect();
     });
   }
 
