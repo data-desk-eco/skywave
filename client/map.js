@@ -126,11 +126,17 @@ export function setTdoaOnMiniMap(entry, tdoa) {
     addRxRing(entry, hostKey, r.gps, r.slot.replace("|", " · "));
   }
 
+  const isPrelim = tdoa.tier === "preliminary";
+
+  // Preliminary fixes (q=3, no residual check) get a translucent ring at
+  // a fixed "nominal uncertainty" of 50 km so the visual doesn't imply a
+  // precision we can't verify. Confirmed fixes size the ring from the
+  // solver residual as before.
   if (entry._tdoaCircle) entry._map.removeLayer(entry._tdoaCircle);
   entry._tdoaCircle = L.circle([lat, lon], {
-    radius: Math.max(500, (residualKm || 0) * 1000),
-    color: "#fff", weight: 1, opacity: 0.5, dashArray: "2 3",
-    fillColor: "#fff", fillOpacity: 0.08,
+    radius: isPrelim ? 50_000 : Math.max(500, (residualKm || 0) * 1000),
+    color: "#fff", weight: 1, opacity: isPrelim ? 0.3 : 0.5, dashArray: "2 3",
+    fillColor: "#fff", fillOpacity: isPrelim ? 0.04 : 0.08,
     interactive: false,
   }).addTo(entry._map);
 
@@ -139,12 +145,14 @@ export function setTdoaOnMiniMap(entry, tdoa) {
   } else {
     entry._tdoaMarker = L.marker([lat, lon], {
       icon: L.divIcon({
-        className: "tdoa-marker",
+        className: isPrelim ? "tdoa-marker tdoa-prelim" : "tdoa-marker",
         html: '<div class="tdoa-diamond"></div>',
         iconSize: [14, 14], iconAnchor: [7, 7],
       }),
     }).bindTooltip(
-      `TDOA fix · ±${(residualKm || 0).toFixed(1)} km · q=${tdoa.quorum}`,
+      isPrelim
+        ? `TDOA fix · preliminary · q=${tdoa.quorum} · max-gap ${tdoa.geometry?.maxBearingGapDeg?.toFixed(0) ?? "?"}°`
+        : `TDOA fix · ±${(residualKm || 0).toFixed(1)} km · q=${tdoa.quorum}`,
       { direction: "top", offset: [0, -6] },
     );
     entry._tdoaMarker.addTo(entry._map);

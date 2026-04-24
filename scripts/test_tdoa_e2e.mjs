@@ -32,11 +32,19 @@ const SR = 12000;
 const OVERSAMPLE = 8;
 const HIGH_SR = SR * OVERSAMPLE;
 
+// Five receivers spanning NW Europe — enough to surround any TX in
+// the North Sea / Baltic area. The 5th (Gdansk) is essential for the
+// production path: TDOADO's reliability gates reject solves where the
+// cohort is all in one hemisphere from the solution (max bearing gap
+// > 180°), which is what the original four-receiver all-west geometry
+// would have triggered. With Gdansk to the east, TX positions in the
+// North Sea are properly surrounded.
 const receivers = [
-  { name: "Chichester UK", slot: "gb-chi:8073", gps: [50.846, -0.662] },
-  { name: "Dover UK",      slot: "gb-dov:8073", gps: [51.129,  1.316] },
-  { name: "Den Helder NL", slot: "nl-den:8073", gps: [52.958,  4.760] },
-  { name: "Bergen NO",     slot: "no-ber:8073", gps: [60.391,  5.322] },
+  { name: "Chichester UK", slot: "gb-chi:8073|MF", gps: [50.846, -0.662] },
+  { name: "Dover UK",      slot: "gb-dov:8073|MF", gps: [51.129,  1.316] },
+  { name: "Den Helder NL", slot: "nl-den:8073|MF", gps: [52.958,  4.760] },
+  { name: "Bergen NO",     slot: "no-ber:8073|MF", gps: [60.391,  5.322] },
+  { name: "Gdansk PL",     slot: "pl-gda:8073|MF", gps: [54.356, 18.646] },
 ];
 
 function mulberry32(seed) {
@@ -159,12 +167,17 @@ function runTrial(txGps, rng) {
 
 // ---- drive ------------------------------------------------------------
 const rng = mulberry32(SEED);
+// TX positions inside the receiver surround — bearing gap < 180° from
+// each. Locations outside the convex hull (e.g. [58, -2]: all receivers
+// to the east; or [51.5, -5]: all receivers to the east) are rejected
+// by the production gates and no longer part of this "golden path"
+// test.
 const txs = [
-  [52.0,  3.5],
-  [54.0,  6.0],
-  [58.0, -2.0],
-  [51.5, -5.0],
-  [57.0,  7.5],
+  [52.0,  3.5],    // inside surround — Dogger Bank
+  [54.0,  6.0],    // inside surround — German Bight
+  [57.0,  7.5],    // inside surround — Skagerrak
+  [55.5,  8.0],    // inside surround — Jutland coast
+  [58.0,  5.5],    // inside surround — Norwegian coast
 ];
 console.log(`# TDOA end-to-end (coordinator path) — jitter=${JITTER_SEC}s, seed=${SEED}`);
 console.log("tx_lat   tx_lon   err_km   resid_km   lags(samples)");

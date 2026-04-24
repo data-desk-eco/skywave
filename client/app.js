@@ -473,14 +473,18 @@ function connectTdoaFeed() {
 }
 
 function renderTdoaInCard(entry, tdoa) {
-  // Low-confidence fixes stay silent — no badge, no detail line, no
-  // pin. A subsequent re-solve with more receivers often tightens the
-  // residual and that broadcast will render as normal.
+  // Confirmed fixes (≥4 receivers, residual is meaningful): drop those
+  // whose residual exceeds the self-check threshold. Preliminary fixes
+  // (3 receivers, exactly determined, residual is always ~0) bypass
+  // that check — they're already gated server-side on stricter
+  // geometry and will render with a visible "preliminary" marker.
   const residKm = tdoa?.position?.residualKm;
-  if (!Number.isFinite(residKm) || residKm >= TDOA_MAX_RESIDUAL_KM) return;
+  const isPrelim = tdoa.tier === "preliminary";
+  if (!isPrelim && (!Number.isFinite(residKm) || residKm >= TDOA_MAX_RESIDUAL_KM)) return;
   entry.tdoa = tdoa;
   if (!entry.row) return;
   entry.row.classList.add("has-tdoa");
+  entry.row.classList.toggle("tdoa-prelim", isPrelim);
 
   // Summary reflects the coordinator's authoritative quorum, not the
   // local WS-feed count (which can be lower when this browser isn't
@@ -505,10 +509,17 @@ function renderTdoaInCard(entry, tdoa) {
     }
     const { lat, lon, residualKm } = tdoa.position;
     const when = new Date(tdoa.broadcastMs).toISOString().slice(11, 19) + "Z";
+    tdoaEl.classList.toggle("prelim", isPrelim);
+    const label = isPrelim ? "TDOA fix · preliminary" : "TDOA fix";
+    // Residual is meaningful only for confirmed fixes; for preliminary
+    // we show the geometry (bearing spread) instead as the quality cue.
+    const qualityMeta = isPrelim
+      ? `max-gap ${tdoa.geometry?.maxBearingGapDeg?.toFixed(0) ?? "?"}°`
+      : `±${residualKm.toFixed(1)} km`;
     tdoaEl.innerHTML =
-      `<span class="tdoa-label">TDOA fix</span>` +
+      `<span class="tdoa-label">${label}</span>` +
       `<span class="tdoa-coord">${lat.toFixed(3)}°, ${lon.toFixed(3)}°</span>` +
-      `<span class="tdoa-meta">±${residualKm.toFixed(1)} km · q=${tdoa.quorum} · ${when}</span>`;
+      `<span class="tdoa-meta">${qualityMeta} · q=${tdoa.quorum} · ${when}</span>`;
   }
   if (entry._mapInited) setTdoaOnMiniMap(entry, tdoa);
 }

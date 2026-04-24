@@ -15,7 +15,40 @@
 
 import { solveTdoa, xcorr } from "./tdoa.js";
 
+// Two-tier quorum: 3-receiver fixes are exactly-determined in 2D, so
+// `residualKm` is meaningless there — they can still be correct but
+// we can't verify. They're broadcast as `preliminary` and only if the
+// geometry is stricter (max bearing gap ≤ 120°). 4+ receivers have
+// one degree of overdetermination, so the residual is a real quality
+// signal and the broadcast tier is `confirmed`.
 const MIN_RECEIVERS  = 3;
+const CONFIRMED_MIN_RECEIVERS = 4;
+const PRELIM_MAX_BEARING_GAP_DEG = 120;
+// Maximum solver RMS time residual, converted to km (c·Δt). Solves
+// above this threshold mean the cross-correlated lags are not
+// self-consistent — usually a sign of ghost-basin solution or a bad
+// cross-correlation peak. We reject them rather than broadcast a
+// plausible-looking fix that's actually thousands of km wrong.
+const MAX_RESIDUAL_KM = 200;
+// Maximum permitted angular gap between consecutive receivers as seen
+// from the solved position. If the receivers are all in one hemisphere
+// (gap > 180°) the TDOA residual landscape has a mirror basin the
+// solver can fall into. This is the GDOP guard rail that would have
+// rejected the European-cohort-but-Asian-ship SUNNY KEROUANE fix.
+const MAX_BEARING_GAP_DEG = 180;
+// Per-band sanity ceiling on receiver-to-solution distance. A solve
+// placing the transmitter beyond the band's plausible propagation
+// range from even one receiver is mathematically possible (the
+// hyperbolas still intersect) but physically implausible. MF ground-
+// wave caps at ~1500 km; HF extends much further via F2 skip.
+const MAX_RANGE_KM_BY_BAND = {
+  MF:   2000,
+  HF4:  5000,
+  HF6:  7000,
+  HF8:  10000,
+  HF12: 15000,
+  HF16: 20000,
+};
 // Time window (on packetGpsNs) during which arrivals from different
 // receivers count as the same packet. Real MF-first-hop TDOA is ≲7 ms;
 // 2 s lets the coordinator absorb any ordinary decoder scheduling skew.
@@ -41,6 +74,9 @@ export class TDOADO {
     // Lightweight persisted rings so /recent survives eviction.
     this.recentDets = [];
     this.recentSolves = [];
+    // In-memory gate counters for observability. Not persisted — they
+    // reset when the DO evicts, which is fine for tuning sessions.
+    this.rejections = {};
     this.state.blockConcurrencyWhile(async () => {
       this.recentDets   = (await this.state.storage.get("recentDets"))   || [];
       this.recentSolves = (await this.state.storage.get("recentSolves")) || [];
@@ -83,6 +119,7 @@ export class TDOADO {
         recentDetections: this.recentDets.slice(-50),
         openBuckets,
         recentSolves: this.recentSolves.slice(-20),
+        rejections: this.rejections,
       });
     }
 
@@ -228,12 +265,61 @@ export class TDOADO {
 
     const sol = solveTdoa(solverDets);
     if (!sol) return null;
+
+    // Reliability gates — see constants at the top of the file for the
+    // rationale. A rejected solve returns null so _ingest() silently
+    // drops it rather than broadcasting a low-confidence fix. We also
+    // bump a counter per gate so /recent can show how many solves got
+    // dropped and by which gate, useful for threshold tuning.
+    const pos = [sol.lat, sol.lon];
+    const rej = (gate) => {
+      this.rejections[gate] = (this.rejections[gate] || 0) + 1;
+      console.log(`tdoa/reject: gate=${gate} mmsi=${bucket.mmsi} q=${dets.length} pos=${pos[0].toFixed(2)},${pos[1].toFixed(2)} resid=${sol.residualKm.toFixed(0)}km`);
+      return null;
+    };
+
+    // Tier: ≥4 receivers with a passing residual = `confirmed`; a
+    // 3-receiver fix = `preliminary` (no residual check possible) and
+    // must pass a stricter bearing gap.
+    const confirmed = dets.length >= CONFIRMED_MIN_RECEIVERS;
+    const tier = confirmed ? "confirmed" : "preliminary";
+
+    // 1. Residual (confirmed only — meaningless at q=3).
+    if (confirmed && sol.residualKm > MAX_RESIDUAL_KM) return rej("residual");
+
+    // 2. Bearing spread. Preliminary tier uses a stricter threshold
+    //    because there's no residual safety net.
+    const bearings = solverDets
+      .map((d) => bearingFromTo(pos, d.gps))
+      .sort((a, b) => a - b);
+    let maxGap = 360 - (bearings[bearings.length - 1] - bearings[0]);
+    for (let i = 1; i < bearings.length; i++) {
+      const g = bearings[i] - bearings[i - 1];
+      if (g > maxGap) maxGap = g;
+    }
+    const bearingLimit = confirmed ? MAX_BEARING_GAP_DEG : PRELIM_MAX_BEARING_GAP_DEG;
+    if (maxGap > bearingLimit) return rej(confirmed ? "bearing" : "bearing-prelim");
+
+    // 3. Band-range: each receiver must be within its band's plausible
+    //    propagation radius of the solve. Rejects SUNNY-KEROUANE-class
+    //    fixes where the solver put an Asian ship in Romania despite
+    //    one receiver being in SE Asia — the Asian receiver would have
+    //    been >10 000 km from the fake European fix.
+    for (let i = 0; i < dets.length; i++) {
+      const band = bandOf(dets[i].slotId);
+      const maxKm = MAX_RANGE_KM_BY_BAND[band];
+      if (maxKm == null) continue;                // unknown band → skip check
+      if (gcDistanceKm(pos, dets[i].gps) > maxKm) return rej("band-range");
+    }
+
     return {
       t: "tdoa",
+      tier,                                       // "confirmed" | "preliminary"
       mmsi: bucket.mmsi,
       call: ref.call,
       position: { lat: sol.lat, lon: sol.lon, residualKm: sol.residualKm },
       receivers: lagsReport,
+      geometry: { maxBearingGapDeg: +maxGap.toFixed(1) },
       packetGpsNs: ref.packetGpsNs.toString(),
       broadcastMs: Date.now(),
     };
@@ -295,4 +381,29 @@ function mmsiQuality(m) {
 function hostOf(slotId) {
   const bar = slotId.indexOf("|");
   return bar < 0 ? slotId : slotId.slice(0, bar);
+}
+
+function bandOf(slotId) {
+  const bar = slotId.indexOf("|");
+  return bar < 0 ? null : slotId.slice(bar + 1);
+}
+
+// Great-circle distance (km) between two [lat, lon] degree pairs.
+function gcDistanceKm(a, b) {
+  const R = 6371;
+  const la1 = a[0] * Math.PI / 180, la2 = b[0] * Math.PI / 180;
+  const dla = la2 - la1;
+  const dlo = (b[1] - a[1]) * Math.PI / 180;
+  const h = Math.sin(dla / 2) ** 2
+          + Math.cos(la1) * Math.cos(la2) * Math.sin(dlo / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+// Initial compass bearing from `from` to `to` in degrees, 0 = north.
+function bearingFromTo(from, to) {
+  const la1 = from[0] * Math.PI / 180, la2 = to[0] * Math.PI / 180;
+  const dlo = (to[1] - from[1]) * Math.PI / 180;
+  const y = Math.sin(dlo) * Math.cos(la2);
+  const x = Math.cos(la1) * Math.sin(la2) - Math.sin(la1) * Math.cos(la2) * Math.cos(dlo);
+  return ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
 }
