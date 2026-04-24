@@ -80,6 +80,45 @@ header {
 @media (min-width: 900px) {
   .csv { display: inline-block; }
 }
+
+.toggle {
+  display: none;                           /* desktop-only; shown in media query */
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  height: 28px;
+  padding: 0 12px;
+  cursor: pointer;
+  line-height: 1;
+  user-select: none;
+}
+.toggle:hover { color: var(--fg); border-color: var(--fg); }
+.toggle input {
+  appearance: none; -webkit-appearance: none;
+  margin: 0;
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--line);
+  background: transparent;
+  cursor: pointer;
+  display: inline-block;
+  position: relative;
+}
+.toggle:hover input { border-color: var(--fg); }
+.toggle input:checked { background: var(--fg); border-color: var(--fg); }
+.toggle input:focus-visible { outline: 1px solid var(--fg); outline-offset: 2px; }
+.toggle:has(input:checked) { color: var(--fg); border-color: var(--fg); }
+@media (min-width: 900px) {
+  .toggle { display: inline-flex; }
+}
+
+body.tdoa-only .call:not(.has-tdoa) { display: none; }
 .brand {
   color: var(--fg);
   font-weight: 700;

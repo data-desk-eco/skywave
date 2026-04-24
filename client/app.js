@@ -41,7 +41,8 @@ const GATEWAY = (() => {
 const $ = (id) => document.getElementById(id);
 const rxCountEl = $("rxcount"), playingEl = $("playing"),
       callsEl = $("calls"), emptyEl = $("empty"),
-      csvBtn = $("csv"), regionEl = $("region");
+      csvBtn = $("csv"), regionEl = $("region"),
+      tdoaOnlyEl = $("tdoa-only");
 
 // -------------------------------------------------------------------
 // State
@@ -479,6 +480,7 @@ function renderTdoaInCard(entry, tdoa) {
   if (!Number.isFinite(residKm) || residKm >= TDOA_MAX_RESIDUAL_KM) return;
   entry.tdoa = tdoa;
   if (!entry.row) return;
+  entry.row.classList.add("has-tdoa");
 
   // Summary reflects the coordinator's authoritative quorum, not the
   // local WS-feed count (which can be lower when this browser isn't
@@ -702,6 +704,12 @@ function downloadCsv() {
 // -------------------------------------------------------------------
 
 if (csvBtn) csvBtn.addEventListener("click", downloadCsv);
+
+if (tdoaOnlyEl) {
+  tdoaOnlyEl.addEventListener("change", () => {
+    document.body.classList.toggle("tdoa-only", tdoaOnlyEl.checked);
+  });
+}
 
 if (regionEl) {
   for (const r of REGIONS) {
