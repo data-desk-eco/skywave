@@ -38,9 +38,19 @@ the URL on first attach anyway.
 
 ## Why the rack looks the way it does
 
-Defensible: out of ~900 public KiwiSDRs, the picker (in
-`worker/src/regions.js`) selects 16 per DSC band (96 total; also the
-hard ceiling) that are **active**, **GPS-equipped and actively fixing**
+Two rack flavours live in `worker/src/regions.js`:
+
+- **bbox regions** — the default "show me a rack across this big area"
+  picker. Selects 16 per DSC band (96 total; also the hard ceiling)
+  with spatial diversity inside the region's bbox.
+- **target regions** — a tight 6-receiver cohort anchored on a single
+  point (currently only Black Sea, around the Russian ports). Same
+  cohort replicated across every band each host can cover, so the same
+  burst has up to 6× the chance of reaching the TDOA quorum. Scoring
+  favours close-in + angular spread + SNR, not coastal proximity.
+
+Defensible: out of ~900 public KiwiSDRs, the bbox picker selects
+receivers that are **active**, **GPS-equipped and actively fixing**
 (TDOA needs per-frame GNSS timestamps — this also cuts the pool by
 ~37%), **reasonably coastal** (≤20° of a major port anchor), **not
 deaf** (self-reported SNR ≥ 8 dB, list entry updated in the last hour,
@@ -160,6 +170,15 @@ Radio-ham tinker spirit served with Data Desk restraint.
   This is fine here — the DO is only alive while a viewer is
   attached; 5 minutes after the last WebSocketClose, the idle alarm
   fires and tears the DO down.
+- **`*.proxy.kiwisdr.com` hosts 307-redirect the WS handshake, and
+  neither browsers nor CF Worker WebSocket clients follow those.** The
+  Worker sidesteps this by pre-resolving the redirect chain with a
+  plain `fetch({ redirect: "follow" })` before the upgrade — the final
+  stable endpoint is some `*.proxy2.kiwisdr.com:8073` the WS can reach
+  directly. The resolved endpoint is cached per-host. Browsers still
+  never see the redirect because they only ever talk to the Worker,
+  not the KiwiSDR. Without this, ~35% of the public fleet (including
+  the only SE-of-Black-Sea receiver) is unreachable.
 - **CF DO costs scale with listener-hours, not listeners.** 96 slots
   in a region = 96 DOs active while anyone is watching, each handling
   ~100 audio frames/sec (each = 1 billable WS message). Nobody

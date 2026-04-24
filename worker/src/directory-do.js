@@ -8,7 +8,7 @@
 // ReceiverDO (via its own alarm), so this DO stays stateless beyond
 // a short in-memory cache of the receiver list.
 
-import { pickRack, regionById, DEFAULT_FANOUT } from "./regions.js";
+import { pickRack, pickTargetRack, regionById, DEFAULT_FANOUT } from "./regions.js";
 
 const RECEIVER_TTL_MS = 10 * 60 * 1000;
 
@@ -68,7 +68,9 @@ export class DirectoryDO {
     if (!region) {
       return Response.json({ error: "unknown region" }, { status: 400 });
     }
-    const picks = pickRack(this.receivers, region.bbox, fanout);
+    const picks = region.target
+      ? pickTargetRack(this.receivers, region.target, fanout)
+      : pickRack(this.receivers, region.bbox, fanout);
     // The Worker router smuggles the real public origin through on each
     // inbound call so the WS URLs we hand the client are addressable.
     const origin = url.searchParams.get("__origin") || `${url.protocol}//${url.host}`;

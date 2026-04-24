@@ -13,6 +13,22 @@ export const BANDS = [
 export const bandLabelFor = (khz) =>
   (BANDS.find((b) => b.khz === khz) || {}).short || "?";
 
+// Regions come in two flavours:
+//
+//   · bbox region  — "show me a rack across this big area" (NW Europe,
+//     Mediterranean, etc.). pickRack greedily packs 16 slots per band
+//     with spatial diversity inside the bbox. Normal rack scoring.
+//
+//   · target region  — "monitor this specific patch of sea". A tight
+//     cohort of receivers inside `radiusKm` of `gps`, scored to favour
+//     proximity + bearing spread around the target. Same cohort is
+//     replicated across all 6 DSC bands so the same burst has up to 6×
+//     the chance of being heard by ≥3 receivers (TDOA quorum).
+//
+// The Black Sea is the inaugural target region: few public KiwiSDRs
+// surround it, but the ones that do (Bucharest, Moscow, Edessa, plus
+// proxy-fronted Baghdad/Sobikow/Hungary) give <1 km simulated p50
+// error from synthetic bursts at every major Russian port.
 export const REGIONS = [
   { id: "global",    name: "Global",         bbox: null                  },
   { id: "nw-europe", name: "NW Europe",      bbox: [42, -12,  62,  15]   },
@@ -23,6 +39,8 @@ export const REGIONS = [
   { id: "baltic",    name: "Baltic / N Sea", bbox: [50,  -2,  66,  32]   },
   { id: "east-asia", name: "East Asia",      bbox: [18, 115,  45, 150]   },
   { id: "oceania",   name: "Australia / NZ", bbox: [-48, 110, -8, 180]   },
+  { id: "black-sea", name: "Black Sea",      bbox: null,
+    target: { gps: [45.5, 36.5], radiusKm: 2000, cohortSize: 6 } },
 ];
 
 export const regionById = (id) => REGIONS.find((r) => r.id === id) || REGIONS[0];
@@ -180,7 +198,11 @@ function rankCandidates(receivers, khz, bbox) {
   for (const r of receivers) {
     if (r.status !== "active" || r.offline === "yes" || !r.url) continue;
     if (r.ip_blacklist === "yes") continue;
-    if (/proxy\.kiwisdr\.com/i.test(r.url)) continue;
+    // Hosts behind *.proxy.kiwisdr.com return a 307-redirect chain on
+    // the WS handshake. The Worker pre-resolves the chain in
+    // kiwi-upstream.js before upgrading, so they're usable now. (The
+    // browser never sees the redirect — it talks to our Worker, which
+    // talks to the KiwiSDR.) Historically this filter excluded them.
     if (!coversBand(r, khz)) continue;
     if (updatedSecondsAgo(r.updated) > UPDATE_RECENCY_SEC) continue;
     // GPS-option + actively fixing. Required for TDOA geolocation:
@@ -205,6 +227,139 @@ function rankCandidates(receivers, khz, bbox) {
   }
   out.sort((a, b) => b.score - a.score);
   return out;
+}
+
+// ---- Target-region picker ----------------------------------------------
+//
+// When the region carries a `target: { gps, radiusKm, cohortSize }`
+// we pick a tight cohort of ~cohortSize receivers and replicate it
+// across every DSC band each receiver covers. The cohort is selected
+// greedily:
+//
+//   · filter: within radiusKm of the target, passing the same health
+//     gates as bbox picks (active, GPS-fixing, free slots, recent).
+//   · seed:   closest receiver with usable SNR.
+//   · subsequent picks: maximise (min-bearing-gap-from-existing-picks)
+//     × (1 + range-ratio-bonus) × snrBonus ÷ (1 + dist/2000km). Closer
+//     + different bearing + different distance shell = highest score.
+//
+// Distinct *host* per cohort member (host may still appear on multiple
+// bands, just not twice on the same band).
+
+function bearingDegFrom(from, to) {
+  const la1 = from[0] * Math.PI / 180, la2 = to[0] * Math.PI / 180;
+  const dlo = (to[1] - from[1]) * Math.PI / 180;
+  const y = Math.sin(dlo) * Math.cos(la2);
+  const x = Math.cos(la1) * Math.sin(la2) - Math.sin(la1) * Math.cos(la2) * Math.cos(dlo);
+  return ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+}
+
+function kmDistance(a, b) {
+  const EARTH_KM = 6371;
+  const la1 = a[0] * Math.PI / 180, la2 = b[0] * Math.PI / 180;
+  const dla = la2 - la1, dlo = (b[1] - a[1]) * Math.PI / 180;
+  return 2 * EARTH_KM * Math.asin(Math.sqrt(
+    Math.sin(dla / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dlo / 2) ** 2,
+  ));
+}
+
+// Returns an array of viable candidates for a target region, per (host,
+// band). Each entry is {host, port, bandKHz, gps, distKm, bearing, ...}.
+function targetCandidates(receivers, target) {
+  const { gps: center, radiusKm } = target;
+  const out = [];
+  for (const r of receivers) {
+    if (r.status !== "active" || r.offline === "yes" || !r.url) continue;
+    if (r.ip_blacklist === "yes") continue;
+    if (updatedSecondsAgo(r.updated) > UPDATE_RECENCY_SEC) continue;
+    if (!String(r.sdr_hw || "").includes(GPS_HW_MARKER)) continue;
+    if ((parseInt(r.fixes_hour, 10) || 0) < MIN_GPS_FIXES_HOUR) continue;
+    const gps = parseGps(r.gps);
+    if (!gps) continue;
+    const distKm = kmDistance(gps, center);
+    if (distKm > radiusKm) continue;
+    let host, port;
+    try {
+      const u = new URL(r.url);
+      host = u.hostname;
+      port = parseInt(u.port || "8073", 10);
+    } catch (_) { continue; }
+    const free = Math.max(0, (parseInt(r.users_max, 10) || 0) - (parseInt(r.users, 10) || 0));
+    if (free < MIN_FREE_SLOTS_TO_JOIN) continue;
+    const snr = snrDb(r.snr);
+    if (snr != null && snr < MIN_SNR_DB) continue;
+    const bearing = bearingDegFrom(center, gps);
+    out.push({
+      host, port, gps, distKm, bearing, free, snr,
+      label: (r.loc || "").slice(0, 34) || r.name || "unknown",
+      bandsRaw: r.bands,
+    });
+  }
+  return out;
+}
+
+function pickTargetCohort(candidates, size) {
+  if (!candidates.length) return [];
+  // Seed: closest receiver with decent SNR (fall back to closest overall).
+  const bySnrThenDist = [...candidates].sort((a, b) => a.distKm - b.distKm);
+  const seed = bySnrThenDist.find(c => (c.snr ?? 0) >= MIN_SNR_DB + 2) || bySnrThenDist[0];
+  const picks = [seed];
+  const usedHosts = new Set([seed.host]);
+  while (picks.length < size) {
+    let best = null, bestScore = -Infinity;
+    for (const c of candidates) {
+      if (usedHosts.has(c.host)) continue;
+      let minAng = 360;
+      for (const p of picks) {
+        let d = Math.abs(c.bearing - p.bearing);
+        if (d > 180) d = 360 - d;
+        if (d < minAng) minAng = d;
+      }
+      let minRangeRatio = Infinity;
+      for (const p of picks) {
+        const r = Math.abs(Math.log((c.distKm + 1) / (p.distKm + 1)));
+        if (r < minRangeRatio) minRangeRatio = r;
+      }
+      const snrBonus = c.snr != null ? Math.min(2, c.snr / 20) : 1;
+      const distPenalty = 1 + c.distKm / 2000;
+      const score = minAng * (1 + minRangeRatio) * snrBonus / distPenalty;
+      if (score > bestScore) { bestScore = score; best = c; }
+    }
+    if (!best) break;
+    picks.push(best);
+    usedHosts.add(best.host);
+  }
+  return picks;
+}
+
+// Pick a target rack: same small cohort replicated across every DSC
+// band each receiver physically covers. Output shape matches the bbox
+// rack — one entry per (host, band) — so the Worker can hand it to
+// DirectoryDO's renderer unchanged.
+export function pickTargetRack(receivers, target, requested = DEFAULT_FANOUT) {
+  const candidates = targetCandidates(receivers, target);
+  const size = Math.max(3, target.cohortSize ?? 6);
+  const cohort = pickTargetCohort(candidates, size);
+  const cap = Math.min(DEFAULT_FANOUT, Math.max(1, requested | 0));
+  const picks = [];
+  for (const khz of BANDS.map(b => b.khz)) {
+    for (const c of cohort) {
+      if (!coversBand({ bands: c.bandsRaw }, khz)) continue;
+      picks.push({
+        host: c.host,
+        port: c.port,
+        bandKHz: khz,
+        bandLabel: bandLabelFor(khz),
+        label: c.label,
+        gps: c.gps,
+        snr: c.snr,
+        coast: +c.distKm.toFixed(1),    // distance-to-target, repurposed
+      });
+      if (picks.length >= cap) break;
+    }
+    if (picks.length >= cap) break;
+  }
+  return picks;
 }
 
 export function pickRack(receivers, bbox, requested = DEFAULT_FANOUT) {

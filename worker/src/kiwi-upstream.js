@@ -10,6 +10,45 @@
 // header per block (last_gps_solution / gpssec / gpsnsec) which the
 // mono USB path drops. That per-frame GNSS timestamp is the shared
 // time base TDOA geolocation needs.
+//
+// Redirect handling: public KiwiSDRs behind *.proxy.kiwisdr.com reply
+// with a 307-redirect chain on the WS upgrade, which CF Worker (and
+// browser) WebSocket clients can't follow transparently. We pre-resolve
+// the endpoint with a plain HTTP GET+redirect-follow and open the WS
+// against the final host:port. Module-level cache so we only pay the
+// resolution once per (host, port), not once per ReceiverDO.
+
+const resolvedEndpointCache = new Map();  // "host:port" → {host, port}
+const RESOLVE_TIMEOUT_MS = 5000;
+
+async function resolveEndpoint(host, port) {
+  // Only *.proxy.kiwisdr.com actually 307s; direct IPs/hostnames answer
+  // WS upgrades on the given port. Skip the round-trip for them.
+  if (!/\.proxy\.kiwisdr\.com$/i.test(host)) return { host, port };
+  const key = `${host}:${port}`;
+  const cached = resolvedEndpointCache.get(key);
+  if (cached) return cached;
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), RESOLVE_TIMEOUT_MS);
+    const probe = await fetch(`http://${host}:${port}/`, {
+      redirect: "follow",
+      signal: ctl.signal,
+    });
+    clearTimeout(timer);
+    const u = new URL(probe.url);
+    const resolved = {
+      host: u.hostname,
+      port: parseInt(u.port || (u.protocol === "https:" ? "443" : "80"), 10),
+    };
+    resolvedEndpointCache.set(key, resolved);
+    return resolved;
+  } catch (_) {
+    // Fall back to the original — the WS upgrade itself will surface a
+    // clearer error path (onError → reconnect).
+    return { host, port };
+  }
+}
 
 export class KiwiUpstream {
   constructor(host, port, opts = {}) {
@@ -30,15 +69,16 @@ export class KiwiUpstream {
   }
 
   async connect() {
+    const { host, port } = await resolveEndpoint(this.host, this.port);
     const ts = Math.floor(Date.now() / 1000);
-    const target = `http://${this.host}:${this.port}/${ts}/SND`;
+    const target = `http://${host}:${port}/${ts}/SND`;
     let resp;
     try {
       resp = await fetch(target, {
         headers: {
           upgrade: "websocket",
           connection: "upgrade",
-          origin: `http://${this.host}:${this.port}`,
+          origin: `http://${host}:${port}`,
         },
       });
     } catch (e) {

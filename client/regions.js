@@ -7,21 +7,14 @@
 
 export const REGION_STORAGE_KEY = "skywave.region";
 
-// Names are shipping-industry voyage abbreviations so the dropdown can
-// stay narrow in the mobile header. NWE = Northwest Europe, MED =
-// Mediterranean, USEC/USWC = US East/West Coast, CBS = Caribbean Basin
-// (loosely includes the Gulf of Mexico in tanker usage), BAL = Baltic,
-// FE = Far East, AUS = Australia.
+// The dropdown is deliberately short: "ALL" scans the bbox picker's
+// global rack, while the target-focused regions (currently just Black
+// Sea / Russian ports) each pin a hand-tuned cohort of receivers
+// positioned for solid TDOA geometry around a specific patch of sea.
+// Add future presets here as they prove out.
 export const REGIONS = [
   { id: "global",    name: "ALL",  bbox: null                  },
-  { id: "nw-europe", name: "NWE",  bbox: [42, -12,  62,  15]   },
-  { id: "med",       name: "MED",  bbox: [30,  -7,  46,  36]   },
-  { id: "us-east",   name: "USEC", bbox: [24, -82,  46, -62]   },
-  { id: "us-west",   name: "USWC", bbox: [30, -130, 50, -115]  },
-  { id: "gulf-carib",name: "CBS",  bbox: [ 8, -100, 31,  -58]  },
-  { id: "baltic",    name: "BAL",  bbox: [50,  -2,  66,  32]   },
-  { id: "east-asia", name: "FE",   bbox: [18, 115,  45, 150]   },
-  { id: "oceania",   name: "AUS",  bbox: [-48, 110, -8, 180]   },
+  { id: "black-sea", name: "BSK",  bbox: [40,  25,  48,  42]   },
 ];
 
 export function currentRegion() {
