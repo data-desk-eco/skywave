@@ -99,10 +99,11 @@ export function coversBand(rx, khz) {
 //     · covers the DSC band's dial frequency (`bands` field)
 //     · lies within the region's bbox
 //     · has ≥ MIN_FREE_SLOTS_TO_JOIN free user slots (etiquette)
-//     · is coastal — within MAX_COAST_DEG of a major port anchor.
-//       DSC is a maritime service; inland KiwiSDRs rarely hear calls
-//     · `snr` field reports ≥ MIN_SNR_DB. Below that the noise floor
-//       leaves nothing for our decoder to work with
+//     · within MAX_COAST_DEG of a major port anchor. Inland KiwiSDRs
+//       with good longwires sometimes pull in maritime DSC too, so
+//       we only exclude obviously-landlocked-with-poor-antennas
+//     · `snr` field reports ≥ MIN_SNR_DB. A marginal receiver that
+//       occasionally catches a burst is still a useful 3rd point
 //     · list entry `updated` within UPDATE_RECENCY_SEC. Stale rows
 //       are often dead receivers the public list hasn't GC'd yet
 //
@@ -125,10 +126,23 @@ export function coversBand(rx, khz) {
 //       station on MF + HF4 + HF6 is fine, six is silly
 
 export const MIN_FREE_SLOTS_TO_JOIN = 2;
-const MAX_COAST_DEG = 8;       // receiver must be within 8° of a coastal anchor
-const MIN_SNR_DB = 15;         // noise-floor cut-off, per receiver's own report
+// Filters below were originally tuned for "show the user a clean
+// geographically diverse rack". TDOA wants the opposite: maximum
+// coverage so any DSC burst has the most possible chances of being
+// heard at ≥3 GPS-synced sites. We relax the propagation-assumption
+// filters accordingly — the coordinator can always reject a cohort
+// later if the residual is bad.
+const MAX_COAST_DEG = 20;      // was 8 — inland longwires sometimes pull in
+                               // maritime DSC as well as coastal loops
+const MIN_SNR_DB = 8;          // was 15 — a weak receiver that happens to
+                               // hear a burst is still a useful 3rd point
 const UPDATE_RECENCY_SEC = 3600;
-const MIN_SEP_DEG = 3;         // per-band geographic spread
+const MIN_SEP_DEG = 1.5;       // was 3 — two receivers on the same stretch
+                               // of UK east coast both being picked is
+                               // exactly what we want for dense same-packet
+                               // cohorts; enforce only a very short
+                               // exclusion radius (≈165 km) to avoid two
+                               // stations on the same street
 const MAX_BANDS_PER_HOST = 2;
 const MIN_GPS_FIXES_HOUR = 100;  // GPS hardware must actually be fixing
 const GPS_HW_MARKER = "📡 GPS"; // substring in `sdr_hw` when the option is present
