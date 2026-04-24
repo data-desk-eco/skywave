@@ -37,6 +37,10 @@ export function initMiniMap(entry) {
     const info = Vessels.get(entry.call.caller);
     if (info && info.lastPos) setVesselOnMiniMap(entry, info);
     else if (info && info.vesselId) container.classList.add("no-track");
+    // Draw TDOA last so the diamond paints above the GFW disc. Users
+    // are watching this app for the passive radio-triangulation result,
+    // not the GFW track — TDOA wins the z-order contest.
+    if (entry.tdoa) setTdoaOnMiniMap(entry, entry.tdoa);
     fitMiniMap(entry);
     setTimeout(() => entry._map && entry._map.invalidateSize(), 120);
   });
@@ -108,7 +112,7 @@ function drawReceiverLines(entry) {
 // GFW track marker so both can coexist on the same mini-map when
 // available.
 export function setTdoaOnMiniMap(entry, tdoa) {
-  if (!entry._mapInited || !tdoa || !tdoa.position) return;
+  if (!entry._mapInited || !entry._map || !tdoa || !tdoa.position) return;
   const L = window.L;
   const { lat, lon, residualKm } = tdoa.position;
   const radiusM = Math.max(500, (residualKm || 0) * 1000);

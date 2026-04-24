@@ -436,9 +436,17 @@ function connectTdoaFeed() {
 function renderTdoaInCard(entry, tdoa) {
   entry.tdoa = tdoa;
   if (!entry.row) return;
+  // A TDOA broadcast is authoritative about receiver count: the
+  // coordinator saw the same packet at `quorum` GPS-disciplined
+  // stations, which by definition is ≥3. The client-local count
+  // may be lower (we may not be attached to all those slots, or
+  // only one beat us to the call frame) so override the summary
+  // to reflect the network-wide quorum instead.
   const summary = entry.row.querySelector(".c-heard");
-  if (summary && !summary.classList.contains("has-tdoa")) {
+  if (summary) {
     summary.classList.add("has-tdoa");
+    const bands = new Set(entry.receivers.values());
+    summary.textContent = `${tdoa.quorum} RX · ${Array.from(bands).join("/")}`;
   }
   const detail = entry.row.querySelector(".detail-text");
   if (detail) {
@@ -465,7 +473,12 @@ function renderTdoaInCard(entry, tdoa) {
 function updateHeard(entry) {
   const bands = new Set(entry.receivers.values());
   const heardEl = entry.row.querySelector(".c-heard");
-  if (heardEl) heardEl.textContent = `${entry.receivers.size} RX · ${Array.from(bands).join("/")}`;
+  if (heardEl) {
+    // A TDOA broadcast takes precedence — it counts network-wide
+    // receivers, not just the ones this client is attached to.
+    const n = entry.tdoa ? entry.tdoa.quorum : entry.receivers.size;
+    heardEl.textContent = `${n} RX · ${Array.from(bands).join("/")}`;
+  }
   const list = entry.row.querySelector(".heard-list");
   if (list) list.innerHTML = "heard by: " + Array.from(entry.receivers).map(
     ([rx, band]) => `<span>${escapeHtml(rx)}</span> <em>${band}</em>`
@@ -517,10 +530,10 @@ function addCallRow(call, entry) {
   row.addEventListener("click", (e) => {
     if (e.target.closest(".mini-map, a")) return;
     row.classList.toggle("open");
-    if (row.classList.contains("open")) {
-      initMiniMap(entry);
-      if (entry.tdoa) setTdoaOnMiniMap(entry, entry.tdoa);
-    }
+    // initMiniMap itself picks up entry.tdoa inside its RAF, so we
+    // don't re-invoke setTdoaOnMiniMap here — the map object doesn't
+    // exist yet at this synchronous moment.
+    if (row.classList.contains("open")) initMiniMap(entry);
   });
   callsEl.prepend(row);
   while (callsEl.children.length > 200) callsEl.lastChild.remove();
