@@ -13,7 +13,7 @@
 //   GET  /subscribe   — WS upgrade for clients
 //   GET  /recent      — debug snapshot (persisted across eviction)
 
-import { solveTdoa, xcorr } from "./tdoa.js";
+import { solveTdoa, xcorr, C } from "./tdoa.js";
 
 // Two-tier quorum: 3-receiver fixes are exactly-determined in 2D, so
 // `residualKm` is meaningless there — they can still be correct but
@@ -214,8 +214,13 @@ export class TDOADO {
       let result;
       try { result = this._solveBucket(b); } catch (_) { return; }
       if (result) {
-        result.quorum = b.dets.length;
-        console.log(`tdoa/solve: mmsi=${b.mmsi} pos=${result.position.lat.toFixed(3)},${result.position.lon.toFixed(3)} resid=${result.position.residualKm.toFixed(1)}km q=${b.dets.length}`);
+        // Quorum reported to clients reflects the POST-TRIM cohort (the
+        // receivers that actually contributed to the final solve).
+        // `geometry.originalQuorum` preserves the pre-trim count so
+        // operators can see how much outlier rejection happened.
+        result.quorum = result.receivers.length;
+        const trimmed = result.geometry?.trimmedReceivers || 0;
+        console.log(`tdoa/solve: mmsi=${b.mmsi} pos=${result.position.lat.toFixed(3)},${result.position.lon.toFixed(3)} resid=${result.position.residualKm.toFixed(1)}km q=${result.quorum}${trimmed ? `/${b.dets.length}` : ""}`);
         this._broadcast(result);
       }
     }
@@ -293,7 +298,60 @@ export class TDOADO {
       lagsReport.push({ slot: d.slotId, label: d.label, band: d.band, gps: d.gps, lagSamples: lag, dtSec });
     }
 
-    const sol = solveTdoa(solverDets);
+    // Robust iteratively-reweighted solve. Do the main solve, compute
+    // per-receiver arrival-time residuals, and if one receiver's
+    // contribution dominates (>3× median) drop it and re-solve. Repeat
+    // up to TRIM_ITERS rounds. One bad xcorr lag in an 8-receiver
+    // cohort can wrench the least-squares solution by hundreds of km;
+    // this iteratively walks the solver toward the set of receivers
+    // whose timing is mutually consistent. Keeps minCohortSize of 4
+    // so we don't trim past the confirmed-tier threshold.
+    const TRIM_ITERS = 3, TRIM_MIN_COHORT = 4, TRIM_MEDIAN_MULTIPLE = 3;
+    let workingDets = solverDets;
+    let workingLags = lagsReport;
+    let sol = solveTdoa(workingDets);
+    if (!sol) return null;
+    let trimmedReceivers = [];
+    for (let iter = 0; iter < TRIM_ITERS && workingDets.length > TRIM_MIN_COHORT; iter++) {
+      const refGps = workingDets[0].gps;
+      const posRef = [sol.lat, sol.lon];
+      const d0 = gcDistanceKm(posRef, refGps) * 1000;
+      const perDetResid = workingDets.map((d, i) => {
+        if (i === 0) return 0;
+        const di = gcDistanceKm(posRef, d.gps) * 1000;
+        const predDt = (di - d0) / C;
+        return Math.abs(d.t - predDt);
+      });
+      // Median over the non-zero entries (i=0 is reference, always 0).
+      const nonRef = perDetResid.slice(1).sort((a, b) => a - b);
+      const med = nonRef[Math.floor(nonRef.length / 2)] || 1e-9;
+      let worstIdx = 0, worst = 0;
+      for (let i = 1; i < perDetResid.length; i++) {
+        if (perDetResid[i] > worst) { worst = perDetResid[i]; worstIdx = i; }
+      }
+      // Only drop when the worst pair's residual is a clear outlier.
+      if (worst < TRIM_MEDIAN_MULTIPLE * med) break;
+      const droppedLag = workingLags[worstIdx];
+      const nextDets = workingDets.filter((_, i) => i !== worstIdx);
+      const nextLags = workingLags.filter((_, i) => i !== worstIdx);
+      const nextSol = solveTdoa(nextDets);
+      // Only accept the trim if residual actually improves — a worst-
+      // pair outlier that happens to be geometrically load-bearing can
+      // leave the remaining receivers degenerate.
+      if (!nextSol || nextSol.residualKm >= sol.residualKm) break;
+      workingDets = nextDets;
+      workingLags = nextLags;
+      sol = nextSol;
+      trimmedReceivers.push(droppedLag.slot);
+    }
+    // Use the trimmed cohort for the rest of the gates + broadcast.
+    // `dets` is the original KiwiSDR detections list; we only need the
+    // indices that survived to check band-range, so keep that mapping.
+    const trimmedSet = new Set(trimmedReceivers);
+    const keptDets = dets.filter((d, i) => !trimmedSet.has(lagsReport[i].slot));
+    // Expose the trimmed count in the broadcast payload so operators
+    // can see how much outlier-rejection work happened.
+    const lagsReportOut = workingLags;
     if (!sol) return null;
 
     // Note: minProminence is a candidate reliability signal (the
@@ -317,7 +375,12 @@ export class TDOADO {
     // Tier: ≥4 receivers with a passing residual = `confirmed`; a
     // 3-receiver fix = `preliminary` (no residual check possible) and
     // must pass a stricter bearing gap.
-    const confirmed = dets.length >= CONFIRMED_MIN_RECEIVERS;
+    // The "dets" used below for gates is the POST-TRIM cohort
+    // (`keptDets`) — after the robust solver discarded outlier
+    // receivers. Geometry and range checks apply to the cohort that
+    // actually contributed to the final solve, not the raw detections.
+    const effectiveDets = keptDets;
+    const confirmed = effectiveDets.length >= CONFIRMED_MIN_RECEIVERS;
     const tier = confirmed ? "confirmed" : "preliminary";
 
     // Note: xcorr peak prominence (`minProminence`) is reported in the
@@ -335,7 +398,7 @@ export class TDOADO {
 
     // 2. Bearing spread. Preliminary tier uses a stricter threshold
     //    because there's no residual safety net.
-    const bearings = solverDets
+    const bearings = workingDets
       .map((d) => bearingFromTo(pos, d.gps))
       .sort((a, b) => a - b);
     let maxGap = 360 - (bearings[bearings.length - 1] - bearings[0]);
@@ -351,11 +414,11 @@ export class TDOADO {
     //    fixes where the solver put an Asian ship in Romania despite
     //    one receiver being in SE Asia — the Asian receiver would have
     //    been >10 000 km from the fake European fix.
-    for (let i = 0; i < dets.length; i++) {
-      const band = bandOf(dets[i].slotId);
+    for (let i = 0; i < effectiveDets.length; i++) {
+      const band = bandOf(effectiveDets[i].slotId);
       const maxKm = MAX_RANGE_KM_BY_BAND[band];
       if (maxKm == null) continue;                // unknown band → skip check
-      if (gcDistanceKm(pos, dets[i].gps) > maxKm) return rej("band-range");
+      if (gcDistanceKm(pos, effectiveDets[i].gps) > maxKm) return rej("band-range");
     }
 
     // 4. Leave-one-out cross-validation. Re-solve N times with each
@@ -367,10 +430,10 @@ export class TDOADO {
     //    looked. Only meaningful at q≥5 (need ≥4 in each LOO solve to
     //    keep some overdetermination).
     let looScatter = null;
-    if (confirmed && solverDets.length >= 5) {
+    if (confirmed && workingDets.length >= 5) {
       const looPositions = [];
-      for (let drop = 0; drop < solverDets.length; drop++) {
-        const subset = solverDets.filter((_, i) => i !== drop);
+      for (let drop = 0; drop < workingDets.length; drop++) {
+        const subset = workingDets.filter((_, i) => i !== drop);
         const sub = solveTdoa(subset);
         if (sub) looPositions.push([sub.lat, sub.lon]);
       }
@@ -394,11 +457,13 @@ export class TDOADO {
       mmsi: bucket.mmsi,
       call: ref.call,
       position: { lat: sol.lat, lon: sol.lon, residualKm: sol.residualKm },
-      receivers: lagsReport,
+      receivers: lagsReportOut,       // post-trim receivers only
       geometry: {
         maxBearingGapDeg: +maxGap.toFixed(1),
         minXcorrProminence: Number.isFinite(minProminence) ? +minProminence.toFixed(2) : null,
         looScatterKm: looScatter != null ? +looScatter.toFixed(1) : null,
+        trimmedReceivers: trimmedReceivers.length,
+        originalQuorum: dets.length,
       },
       packetGpsNs: ref.packetGpsNs.toString(),
       broadcastMs: Date.now(),

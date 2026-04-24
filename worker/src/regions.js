@@ -65,6 +65,15 @@ export const REGIONS = [
   // produce ~20 km fixes.
   { id: "sea-pac", name: "SE Asia / W Pacific", bbox: null,
     target: { gps: [10.0, 125.0], radiusKm: 10000, cohortSize: 8 } },
+  // Tight Europe / North Sea — the methodology's best-case geometry
+  // on the public KiwiSDR fleet. Dense coverage surrounding a 2500 km
+  // circle centred on the North Sea (max bearing gap 95°, avg baseline
+  // 869 km). Not a shipping hotspot in its own right, but the shortest
+  // baselines in the world for TDOA testing: if we can't pin a burst
+  // under 100 km here, the floor is genuinely a timing-precision issue
+  // rather than a geometry one.
+  { id: "n-sea", name: "N Sea (tight)", bbox: null,
+    target: { gps: [55.0, 5.0], radiusKm: 2500, cohortSize: 8 } },
 ];
 
 export const regionById = (id) => REGIONS.find((r) => r.id === id) || REGIONS[0];
