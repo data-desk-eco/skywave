@@ -52,11 +52,13 @@ export function xcorr(a, b, maxLag) {
     }
   }
   // Peak prominence: ratio of the main peak to the highest correlation
-  // outside a narrow window around the peak. A clean, unambiguous
-  // alignment has prominence ≫ 1; a noisy or multi-peaked cross-
-  // correlation has prominence ~1 and its `lag` can't be trusted.
-  // Used downstream as a quality gate before feeding lags to solveTdoa.
-  const exclude = 20;               // samples either side of the peak to skip
+  // OUTSIDE the symbol-period sidelobes around the peak. DSC FSK runs
+  // at 100 baud — at SR 12 kHz that's 120 samples per symbol, so
+  // adjacent lags within ±1 symbol period are inherently strongly
+  // correlated due to symbol-aligned overlap, regardless of true
+  // alignment quality. We exclude ±150 samples so prominence reflects
+  // genuine off-peak noise floor, not the local sidelobe structure.
+  const exclude = 150;
   let offPeakMax = 0;
   for (let i = 0; i < corrs.length; i++) {
     if (Math.abs(i - idx) <= exclude) continue;

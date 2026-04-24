@@ -232,6 +232,12 @@ async function checkSolveAgainstAIS(solve) {
     tdoa: [solve.position.lat, solve.position.lon],
     tdoa_resid_km: solve.position.residualKm,
     heard_by: (solve.receivers || []).map((r) => r.slot || r),
+    // Persist full receiver records (slot, gps, lagSamples, dtSec) so
+    // we can re-run leave-one-out / per-pair residual analyses
+    // offline without a fresh capture.
+    receivers: solve.receivers || [],
+    geometry: solve.geometry,
+    tier: solve.tier,
   };
   if (NO_AIS || /\?/.test(mmsi)) {   // skip if MMSI has wildcards
     jlog({ kind: "solve", ...rec });
@@ -329,6 +335,9 @@ function connectTdoaSubscribe() {
   tdoaWs.onmessage = (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.t !== "tdoa") return;
+    const key = `${msg.mmsi}@${msg.broadcastMs}`;
+    if (seenSolves.has(key)) return;       // already processed via /recent poll
+    seenSolves.add(key);
     stats.solves++;
     if (msg.tier === "preliminary") stats.prelimSolves++;
     else stats.confirmedSolves++;
@@ -344,7 +353,42 @@ function connectTdoaSubscribe() {
     tdoaBackoff = Math.min(tdoaBackoff * 2, 30_000);
   };
 }
+// Belt-and-suspenders: poll /v2/tdoa/recent every 20s and process any
+// solves we haven't seen via the subscribe WS. CF WebSockets sometimes
+// half-close silently; the polling backup ensures we don't lose data.
+const seenSolves = new Set();   // dedup by mmsi+broadcastMs
 connectTdoaSubscribe();
+
+async function pollRecent() {
+  try {
+    const r = await fetch(`${GATEWAY}/v2/tdoa/recent`);
+    if (!r.ok) return;
+    const j = await r.json();
+    for (const s of j.recentSolves || []) {
+      const key = `${s.mmsi}@${s.broadcastMs}`;
+      if (seenSolves.has(key)) continue;
+      seenSolves.add(key);
+      // Convert /recent format (no `t` field, no `call`) to subscribe shape
+      const msg = { t: "tdoa", tier: s.tier, mmsi: s.mmsi, position: s.position,
+                    receivers: (s.receivers || []).map(slot => ({ slot })),
+                    quorum: s.quorum, geometry: s.geometry, broadcastMs: s.broadcastMs };
+      stats.solves++;
+      if (msg.tier === "preliminary") stats.prelimSolves++;
+      else stats.confirmedSolves++;
+      const band = (msg.receivers?.[0]?.slot || "").split("|").pop();
+      stats.perBandSolves.set(band, (stats.perBandSolves.get(band) || 0) + 1);
+      checkSolveAgainstAIS(msg).catch(() => {});
+    }
+    // Cap memory: trim seenSolves to last ~500
+    if (seenSolves.size > 1000) {
+      const arr = [...seenSolves];
+      seenSolves.clear();
+      for (const k of arr.slice(-500)) seenSolves.add(k);
+    }
+  } catch {}
+}
+setInterval(pollRecent, 20_000);
+pollRecent();
 
 // Attach to every slot in the rack, with auto-reconnect. Worker
 // redeploys kick all the slot WSs; without reconnect we go silent.
