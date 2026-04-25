@@ -41,30 +41,32 @@ the URL on first attach anyway.
 Two rack flavours live in `worker/src/regions.js`:
 
 - **bbox regions** — the default "show me a rack across this big area"
-  picker. Selects 16 per DSC band (96 total; also the hard ceiling)
-  with spatial diversity inside the region's bbox.
-- **target regions** — a tight 6-receiver cohort anchored on a single
-  point (currently only Black Sea, around the Russian ports). Same
-  cohort replicated across every band each host can cover, so the same
-  burst has up to 6× the chance of reaching the TDOA quorum. Scoring
-  favours close-in + angular spread + SNR, not coastal proximity.
+  picker. Band-weighted slot allocation (HF8/HF12 get more, HF4 fewer)
+  reflects which bands actually produce co-hearings. Cluster-gate on
+  MF/HF4 only (short-range bands); HF6+ skip-zone receivers stay in.
+- **target regions** — a small surround cohort (typically 5-8 hosts)
+  picked by an octant-surround scorer (`pickSurroundCohort`): divides
+  the compass around the target centroid into wedges, takes the best
+  receiver in each occupied wedge. The cohort gets replicated across
+  every DSC band each host covers. Five regions defined: Black Sea,
+  Persian Gulf, N Atlantic, SE Asia / W Pacific, North Sea (tight
+  Europe). Each carries an area-of-interest centroid + monitoring
+  radius used by the TDOA trust gate.
 
-Defensible: out of ~900 public KiwiSDRs, the bbox picker selects
-receivers that are **active**, **GPS-equipped and actively fixing**
-(TDOA needs per-frame GNSS timestamps — this also cuts the pool by
-~37%), **reasonably coastal** (≤20° of a major port anchor), **not
-deaf** (self-reported SNR ≥ 8 dB, list entry updated in the last hour,
-not IP-blacklisting us), and **considerate** (≥ 2 free user slots so a
-human listener always has one). Same-band picks are ≥ 1.5° apart
-(just enough to prevent two Kiwis on the same street from both being
-picked); any one (host, port) is capped at 2 bands so the rack
-doesn't over-index on a single operator. The "Global" view and
-per-region views share the same 96-slot ceiling.
+All picks pass the same hard health filters: **active**, **GPS-equipped
+and actively fixing** (TDOA needs per-frame GNSS timestamps — this also
+cuts the pool by ~37%), **list entry updated in the last hour, not IP-
+blacklisting us**, and **considerate** (≥ 2 free user slots so a human
+listener always has one). Any one (host, port) is capped at 2 bands
+in the bbox picker so the rack doesn't over-index on a single operator;
+target picks replicate across all 6 bands deliberately. The "Global"
+view and per-region bbox views share a 96-slot ceiling; target views
+typically run 30-48 slots.
 
-Scoring: `freeSlots × coastalProximity × snrBonus × antennaBonus`,
-with `antennaBonus = 1.5` when the antenna free-text mentions a
-broadband design (loop / dipole / T2FD / Beverage / folded /
-longwire).
+Scoring (bbox): `freeSlots × coastalProximity × snrBonus × antennaBonus`.
+Scoring (target octants): SNR weighted, distance penalty, equal weight
+across wedges. `antennaBonus = 1.5` when the antenna free-text mentions
+a broadband design (loop / dipole / T2FD / Beverage / folded / longwire).
 
 ## Tone & design
 
@@ -115,16 +117,70 @@ Radio-ham tinker spirit served with Data Desk restraint.
 - `regions.js` — BANDS + regional bboxes + coastal anchors + `pickRack`.
 - `location-hint.js` — GPS → CF region string.
 
-### `scripts/` — offline validation
+### `scripts/` — offline validation + live testing
 
 - `test_tdoa.mjs` — synthetic geometry against `tdoa.js` solver,
   p50 ≈ 1.6 km on 50 trials.
 - `test_tdoa_e2e.mjs` — synthetic multi-receiver cohorts through
   `TDOADO._solveBucket` with realistic sample-rate + snippet-start
-  jitter, p50 ≈ 2.8 km.
+  jitter + skywave propagation, p50 ≈ 1.4 km.
 - `attach_nwe.mjs`, `inject_tdoa.mjs`, `inject_tdoa_real.mjs` —
   live-operations tools: attach to a whole region's rack, or inject
   a known cohort against production to sanity-check the live path.
+- `tdoa_watch.mjs` — the live ground-truth harness. Subscribes to
+  `/v2/tdoa/subscribe` and the `/v2/tdoa/recent` poll, attaches to
+  every slot in a region's rack with auto-reconnect, and for each
+  solved MMSI cross-checks against fresh AIS via LSEG (MMSI → GFW
+  search → IMO → LSEG SymbologySearch → RIC → LSEG TR.AssetLocation*).
+  GFW lookup filters strictly on `ssvid == query MMSI` because GFW's
+  fuzzy search returns entries for *different* vessels too (e.g.
+  005030001 returns ssvid=503177000 entries that are a different
+  Australian warship). LSEG is for OFFLINE TESTING only — the UI
+  still uses GFW exclusively.
+- `tdoa_summary.mjs` — post-processes a `tdoa_watch.mjs` JSONL into
+  per-MMSI accuracy stats, multi-broadcast convergence, tier
+  distribution.
+
+### TDOA methodology (current state)
+
+The solver + gates are calibrated for one defensible regime:
+**a tight cohort that surrounds an area of interest**. Outside that
+regime — long-haul HF skip, ghost basins, mixed propagation — fixes
+are still emitted but tagged tier=`tentative` so they don't claim
+accuracy. The trust criterion is mechanistic, not statistical:
+
+1. **Skywave-aware propagation model** (`tdoa.js:slantDistance`).
+   Signals travel via F2 reflection at ~250 km, in ~2000 km hops; the
+   solver computes slant rather than straight-line distance.
+2. **Octant surround picker** (`pickSurroundCohort`). Divides compass
+   into 6 wedges around the target centroid; one best receiver per
+   wedge. Naturally produces good GDOP when the receiver pool allows.
+3. **Wide solver search** (60° pad, 161×161 coarse grid). Lets the
+   refiner discover basins outside the receiver bbox — without it,
+   one-sided cohorts find only the local ghost.
+4. **Robust trim** (`_solveBucket` iterative reweighting at q≥5).
+   Drops the worst-residual receiver and re-solves up to 3 rounds.
+5. **Multi-burst per-MMSI history** (`mmsiHistory` Map). 60-min window
+   of past fixes for the same MMSI; pairwise scatter exposed in the
+   broadcast `history` field. Ghost basins shift between cohorts; a
+   real ship's position stays consistent.
+6. **Tier classification**:
+   - `trusted` — q≥4 AND every receiver within band's single-hop
+     range (MF 1500 km, HF4 2500, HF6 3500, HF8 4000, HF12/16 4500)
+     AND every receiver above 500 km (no near-field bias) AND the
+     fix lands inside a defined **area-of-interest** (every region
+     with `target.monitoringRadiusKm` contributes one).
+   - `tentative` — q≥4 but at least one trust condition fails. The
+     position is suggestive (a vessel is broadcasting somewhere) but
+     coordinates can't be claimed because the timing-to-distance
+     map is degenerate (multi-hop) or the fix is outside what we're
+     monitoring (likely a ghost basin).
+   - `preliminary` — q=3, exactly determined; activity hint only.
+
+Constants and threshold rationale live as long-form comments at the
+top of `worker/src/tdoa-do.js`. None of these are hand-tuned to AIS
+ground truth; each derives from physics or from publicly-described
+KiwiSDR TDoA practitioner consensus (see HF Underground topic 117872).
 
 ## Do
 

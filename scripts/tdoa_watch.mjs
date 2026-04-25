@@ -155,14 +155,40 @@ async function gfwImoForMmsi(mmsi) {
     const r = await fetch(url, { headers: GFW_HEADERS });
     if (!r.ok) { mmsiToImoCache.set(mmsi, null); return null; }
     const j = await r.json();
-    // Prefer the entry with an IMO populated.
-    let imo = null, name = null;
+    // GFW search is fuzzy: it can return entries whose ssvid does NOT
+    // equal the query MMSI (e.g. for 005030001 we get entries with
+    // ssvid=503177000, a completely different vessel). Filter strictly:
+    // only entries whose ssvid matches the query exactly. Compare as
+    // integers to absorb leading-zero asymmetry between GFW (5030001)
+    // and our DSC decode (005030001).
+    const mmsiInt = parseInt(mmsi, 10);
+    const candidates = [];
     for (const e of j.entries || []) {
-      const si = (e.selfReportedInfo || [])[0] || {};
-      if (si.imo) { imo = si.imo; name = si.shipname; break; }
-      if (!name && si.shipname) name = si.shipname;
+      for (const si of e.selfReportedInfo || []) {
+        if (parseInt(si.ssvid, 10) !== mmsiInt) continue;
+        if (!si.imo) continue;
+        candidates.push({
+          imo: si.imo,
+          name: si.shipname,
+          flag: si.flag,
+          to: Date.parse(si.transmissionDateTo || "") || 0,
+        });
+      }
     }
-    const result = imo ? { imo, name } : null;
+    if (!candidates.length) { mmsiToImoCache.set(mmsi, null); return null; }
+    // Most recently active vessel wins. If multiple vessels have used
+    // this MMSI we tag `ambiguous: true` so downstream can flag the
+    // AIS comparison as low-confidence (we might be comparing the
+    // wrong ship's position).
+    candidates.sort((a, b) => b.to - a.to);
+    const result = {
+      imo: candidates[0].imo,
+      name: candidates[0].name,
+      flag: candidates[0].flag,
+      ambiguous: candidates.length > 1
+        && new Set(candidates.map((c) => c.imo)).size > 1,
+      candidateCount: candidates.length,
+    };
     mmsiToImoCache.set(mmsi, result);
     return result;
   } catch { mmsiToImoCache.set(mmsi, null); return null; }
