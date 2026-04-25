@@ -149,3 +149,69 @@ export function solveTdoa(dets, opts = {}) {
   const rmsTimeErr = Math.sqrt(best.r / Math.max(1, dets.length - 1));
   return { lat: best.la, lon: best.lo, residualKm: rmsTimeErr * C / 1000 };
 }
+
+// Position uncertainty from cohort geometry. Linearises the TDOA
+// system at the solved point: each receiver pair (i, j) constrains
+// distance-difference along the unit vector u_i - u_j (where u_i is
+// the unit vector from solution to receiver i in a local east/north
+// frame). The Fisher information H^T H then gives the position
+// covariance C = (H^T H)^-1 · σ²_t · c², whose 2x2 eigendecomposition
+// yields a 1-σ error ellipse with semi-axes and orientation.
+//
+// Returns null when geometry is too degenerate to be meaningful
+// (singular/near-singular H^T H).
+//
+// `timingSigmaMs` is the per-receiver arrival-time RMS noise.
+// KiwiSDR realistic: ~1 ms.
+export function tdoaUncertainty(dets, position, timingSigmaMs = 1.0) {
+  if (dets.length < 3) return null;
+  const [pLat, pLon] = position;
+  // Local ENU unit vectors from solution to each receiver. ~scale-
+  // accurate for sub-1000-km cohorts; for larger ones the spherical
+  // approximation degrades but the broad shape (elongation, axes
+  // ratio) remains informative.
+  const cosLat = Math.cos(pLat * Math.PI / 180);
+  const KM_PER_DEG = 111.32;
+  const u = dets.map(d => {
+    const dN = (d.gps[0] - pLat) * KM_PER_DEG;
+    const dE = (d.gps[1] - pLon) * KM_PER_DEG * cosLat;
+    const r = Math.hypot(dN, dE);
+    return r > 0 ? [dE / r, dN / r] : [0, 0];   // [east, north] unit
+  });
+  // Build H (rows = pairs, cols = [E, N] derivative of (r_i - r_0)).
+  // Reference is dets[0], so each pair (0, k) row is u_k - u_0.
+  let HtH00 = 0, HtH01 = 0, HtH11 = 0;
+  for (let k = 1; k < u.length; k++) {
+    const e = u[k][0] - u[0][0];
+    const n = u[k][1] - u[0][1];
+    HtH00 += e * e;
+    HtH01 += e * n;
+    HtH11 += n * n;
+  }
+  // Invert 2x2: det = HtH00*HtH11 - HtH01², cov = (1/det) * [[HtH11,-HtH01],[-HtH01,HtH00]] · σ²·c²
+  const det = HtH00 * HtH11 - HtH01 * HtH01;
+  if (!isFinite(det) || det <= 1e-9) return null;        // degenerate
+  const sigmaKm = (timingSigmaMs / 1000) * C / 1000;     // 1 ms ≈ 300 km
+  const sigma2 = sigmaKm * sigmaKm;
+  const Cee = (HtH11 / det) * sigma2;
+  const Cnn = (HtH00 / det) * sigma2;
+  const Cen = (-HtH01 / det) * sigma2;
+  // Eigenvalues of the 2x2 covariance.
+  const tr = Cee + Cnn;
+  const D = Math.sqrt(Math.max(0, (Cee - Cnn) ** 2 + 4 * Cen * Cen));
+  const lam1 = (tr + D) / 2;     // bigger eigenvalue
+  const lam2 = (tr - D) / 2;
+  const semiMajorKm = Math.sqrt(Math.max(0, lam1));
+  const semiMinorKm = Math.sqrt(Math.max(0, lam2));
+  // Orientation: angle (deg, 0=east, 90=north) of the major axis.
+  const orientDeg = (Math.atan2(2 * Cen, Cee - Cnn) * 90 / Math.PI);
+  return {
+    semiMajorKm,
+    semiMinorKm,
+    // Axis ratio gives a quick scalar quality cue: 1.0 = perfectly
+    // round (well-determined), >5 = strongly elongated (one direction
+    // poorly constrained, e.g. one-sided cohort).
+    axisRatio: semiMinorKm > 0 ? semiMajorKm / semiMinorKm : Infinity,
+    orientationDeg: orientDeg,
+  };
+}

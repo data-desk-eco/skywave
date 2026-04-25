@@ -13,7 +13,7 @@
 //   GET  /subscribe   — WS upgrade for clients
 //   GET  /recent      — debug snapshot (persisted across eviction)
 
-import { solveTdoa, xcorr, C } from "./tdoa.js";
+import { solveTdoa, xcorr, tdoaUncertainty, C } from "./tdoa.js";
 
 // Two-tier quorum: 3-receiver fixes are exactly-determined in 2D, so
 // `residualKm` is meaningless there — they can still be correct but
@@ -45,6 +45,16 @@ const MAX_RESIDUAL_KM = 250;
 // class cohorts where every receiver is on one side of the world from
 // the solved position.
 const MAX_BEARING_GAP_DEG = 220;
+// Maximum semi-major axis of the 1-σ position uncertainty ellipse
+// derived from cohort geometry + 1 ms timing noise. Replaces the
+// bearing-gap heuristic with a principled measure: the ellipse is
+// the right answer for "how well constrained is this fix in any
+// direction". Anything above 1000 km along the major axis means the
+// geometry can't pin the position to better than continent-scale —
+// reject regardless of how clean the residual happens to be.
+// FJELD-class surround geometry gives ~250 km semi-major; SUNNY-
+// class one-sided gives ~6500 km; collinear gives ~1200 km.
+const MAX_ELLIPSE_SEMIMAJOR_KM = 1000;
 // Per-band sanity ceiling on receiver-to-solution distance. A solve
 // placing the transmitter beyond the band's plausible propagation
 // range from even one receiver is mathematically possible (the
@@ -426,7 +436,18 @@ export class TDOADO {
       if (gcDistanceKm(pos, effectiveDets[i].gps) > maxKm) return rej("band-range");
     }
 
-    // 4. Leave-one-out scatter — kept as a TELEMETRY metric (reported
+    // 4. Position uncertainty ellipse from cohort geometry + 1 ms
+    //    timing noise. Reject fixes whose semi-major axis exceeds
+    //    MAX_ELLIPSE_SEMIMAJOR_KM — those positions are not
+    //    constrained well enough to be trusted, even if every other
+    //    metric looks clean. This is the principled GDOP gate that
+    //    replaces the rule-of-thumb bearing-gap heuristic.
+    const ellipse = tdoaUncertainty(workingDets, pos, 1.0);
+    if (ellipse && ellipse.semiMajorKm > MAX_ELLIPSE_SEMIMAJOR_KM) {
+      return rej("geometry-uncertainty");
+    }
+
+    // 5. Leave-one-out scatter — kept as a TELEMETRY metric (reported
     //    in the geometry payload) but no longer a hard gate. In
     //    practice ghost-basin solves where every receiver's timing
     //    fits the same wrong location pass LOO with low scatter, so
@@ -465,6 +486,10 @@ export class TDOADO {
         looScatterKm: looScatter != null ? +looScatter.toFixed(1) : null,
         trimmedReceivers: trimmedReceivers.length,
         originalQuorum: dets.length,
+        ellipseSemiMajorKm: ellipse ? +ellipse.semiMajorKm.toFixed(0) : null,
+        ellipseSemiMinorKm: ellipse ? +ellipse.semiMinorKm.toFixed(0) : null,
+        ellipseOrientationDeg: ellipse ? +ellipse.orientationDeg.toFixed(0) : null,
+        ellipseAxisRatio: ellipse ? +ellipse.axisRatio.toFixed(1) : null,
       },
       packetGpsNs: ref.packetGpsNs.toString(),
       broadcastMs: Date.now(),
