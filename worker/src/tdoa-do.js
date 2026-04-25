@@ -4,9 +4,15 @@
 // call. The record carries the receiver's GPS, a GPS-ns anchor at the
 // packet start, and a ~2 s audio snippet aligned to that anchor. We
 // bucket incoming detections by fuzzy MMSI + proximity on packetGpsNs;
-// when three distinct hosts land in one bucket we cross-correlate their
+// when 3+ distinct hosts land in one bucket we cross-correlate their
 // snippets, feed the refined arrival times to solveTdoa, and broadcast
 // the position to every client on /subscribe.
+//
+// Operating regime: ground-wave only. Cohort selection (regions.js,
+// `target.bands` restriction + tight `radiusKm`) keeps every receiver
+// inside MF ground-wave range of the area we're monitoring. Multi-hop
+// skywave is explicitly out of scope here — those fixes are dominated
+// by ionospheric path bias the solver isn't modelling.
 //
 // Routes:
 //   POST /detect      — from ReceiverDO (fire-and-forget)
@@ -14,134 +20,30 @@
 //   GET  /recent      — debug snapshot (persisted across eviction)
 
 import { solveTdoa, xcorr, tdoaUncertainty, C } from "./tdoa.js";
-import { REGIONS } from "./regions.js";
 
-// Pre-flatten the target areas so the trust check is a quick loop
-// over (centroid, radius) pairs. Every region with a `target` block
-// counts as an area-of-interest — ports/chokepoints we're actively
-// monitoring. A fix inside ANY such area can be trusted (provided
-// the propagation regime checks also pass); a fix outside ALL of
-// them is by construction either a ghost basin or a vessel we
-// weren't targeting, neither of which we want to claim accuracy for.
-//
-// `target.radiusKm` is the COHORT pick radius (where receivers can
-// live, often big — sea-pac is 10000 km). For the trust area we use
-// `target.monitoringRadiusKm` if set, else min(target.radiusKm, 3000)
-// — the actual scale of the area we're claiming to localise vessels in.
-const AREAS_OF_INTEREST = REGIONS
-  .filter((r) => r.target)
-  .map((r) => ({
-    id: r.id,
-    gps: r.target.gps,
-    radiusKm: r.target.monitoringRadiusKm ?? Math.min(r.target.radiusKm, 3000),
-  }));
-
-// Two-tier quorum: 3-receiver fixes are exactly-determined in 2D, so
-// `residualKm` is meaningless there — they can still be correct but
-// we can't verify. They're broadcast as `preliminary` and only if the
-// geometry is stricter (max bearing gap ≤ 120°). 4+ receivers have
-// one degree of overdetermination, so the residual is a real quality
-// signal and the broadcast tier is `confirmed`.
-const MIN_RECEIVERS  = 3;
-const CONFIRMED_MIN_RECEIVERS = 4;
-// (Previously we used a stricter bearing-gap threshold for the
-// preliminary / q=3 tier because there's no residual safety net
-// at exactly-determined dimensionality. Live data showed this was
-// rejecting real n-sea surround fixes where bearings span 160°
-// naturally. With the residual gate now applied at all quorums,
-// the bearing threshold collapses to a single value.)
-// Maximum solver RMS time residual, converted to km (c·Δt). The
-// physical floor with realistic 1 ms KiwiSDR clock jitter on good
-// geometry (e.g. FJELD SVEA cohort, ~150° max bearing gap) is 100-
-// 200 km — verified by simulation. 250 km admits all reasonable
-// fixes given that floor while still catching the ghost-basin /
-// bad-xcorr cases that produce 1000+ km residuals.
-const MAX_RESIDUAL_KM = 250;
-// Maximum permitted angular gap between consecutive receivers as seen
-// from the solved position. The hard limit is 360° (degenerate). 180°
-// is the textbook surround threshold but live data showed the
-// realistic floor for valid cohorts is ~150-180°; clipping at exactly
-// 180° was rejecting edge-of-cluster fixes that were actually correct.
-// 220° is calibrated to admit those while still catching SUNNY-KEROUANE-
-// class cohorts where every receiver is on one side of the world from
-// the solved position.
-const MAX_BEARING_GAP_DEG = 220;
-// Maximum semi-major axis of the 1-σ position uncertainty ellipse
-// derived from cohort geometry + 1 ms timing noise. Replaces the
-// bearing-gap heuristic with a principled measure: the ellipse is
-// the right answer for "how well constrained is this fix in any
-// direction". Anything above 1000 km along the major axis means the
-// geometry can't pin the position to better than continent-scale —
-// reject regardless of how clean the residual happens to be.
-// FJELD-class surround geometry gives ~250 km semi-major; SUNNY-
-// class one-sided gives ~6500 km; collinear gives ~1200 km.
-const MAX_ELLIPSE_SEMIMAJOR_KM = 1000;
-// Per-band sanity ceiling on receiver-to-solution distance. A solve
-// placing the transmitter beyond the band's plausible propagation
-// range from even one receiver is mathematically possible (the
-// hyperbolas still intersect) but physically implausible. MF ground-
-// wave caps at ~1500 km; HF extends much further via F2 skip.
-const MAX_RANGE_KM_BY_BAND = {
-  MF:   2000,
-  HF4:  5000,
-  HF6:  7000,
-  HF8:  10000,
-  HF12: 15000,
-  HF16: 20000,
-};
-// Single-hop propagation distance. The regime where ionospheric
-// path bias is bounded (one F2 reflection at known geometry) and
-// ghost basins are far from the truth — the math we're using
-// converges on the right answer with 100-200 km accuracy. Multi-hop
-// (signal bouncing twice or more) introduces additional unknowns:
-// reflection height varies, residual landscape gains symmetric
-// minima, ghost basins can sit near the truth. Fixes where ALL
-// contributing receivers are inside their band's single-hop range
-// from the solution earn the "trusted" tier; otherwise the broadcast
-// is "tentative" — useful as a hint of vessel presence but not a
-// position claim.
-const SINGLE_HOP_KM_BY_BAND = {
-  MF:   1500,
-  HF4:  2500,
-  HF6:  3500,
-  HF8:  4000,
-  HF12: 4500,
-  HF16: 4500,
-};
-// Minimum receiver-to-solution distance for HF skywave geometry.
-// Practitioner consensus (HF Underground TDoA thread Sept 2023): when
-// a receiver is closer than ~500 km to the transmitter, ground-wave
-// dominates the skywave model the solver assumes and the per-pair
-// timing develops a near-field bias that pulls the fix off-target.
-// Receivers below this floor still contribute (they can hear the
-// burst!) but mark the tier as "tentative" rather than "trusted".
-const MIN_BASELINE_KM = 500;
-// Leave-one-out cross-validation: at q≥5 we re-solve N times, each
-// excluding one receiver. If the resulting positions agree (median
-// pairwise distance below this threshold), the cohort is internally
-// consistent. If they scatter, one or more receivers' timing is
-// suspect — even when the residual happens to look reasonable. This
-// is the gate intended to separate "224 km off truth" from "2171 km
-// off truth" cases that have indistinguishable residuals.
-const LOO_MAX_SCATTER_KM = 250;
-// Minimum cross-correlation peak prominence (peak / max-off-peak) on
-// the weakest receiver pair. Below this the lag the solver got is
-// not just noisy but indistinguishable from random correlation.
-// Calibrated against live data: every implausible fix observed had
-// prominence in the 1.04-1.15 band, while clean DSC bursts in the
-// synthetic e2e test produce values >5. 1.8 admits marginal-but-real
-// peaks while rejecting the noise-floor matches that are responsible
-// for most of the "good residual but wildly wrong position" cases.
-const MIN_XCORR_PROMINENCE = 1.8;
+// Quorum tiers reflect overdetermination, not propagation regime:
+//   · q=3 → "preliminary": exactly-determined in 2D, residual is by
+//     construction zero — useful as presence info only.
+//   · q≥4 → "trusted":     residual is a real quality signal; broadcast
+//     unless it's above MAX_RESIDUAL_KM.
+const MIN_RECEIVERS = 3;
+const TRUSTED_MIN_RECEIVERS = 4;
+// Maximum solver RMS time residual, converted to km (c·Δt). With ~1 ms
+// KiwiSDR clock jitter and good ground-wave geometry the floor is
+// 100-200 km; 300 km admits all reasonable fixes while catching the
+// ghost-basin / bad-xcorr cases that produce 1000+ km residuals.
+const MAX_RESIDUAL_KM = 300;
 // Time window (on packetGpsNs) during which arrivals from different
-// receivers count as the same packet. Real MF-first-hop TDOA is ≲7 ms;
-// 2 s lets the coordinator absorb any ordinary decoder scheduling skew.
-const MAX_SPREAD_MS  = 2_000;
+// receivers count as the same packet. Real MF-ground-wave TDOA is ≲4 ms
+// even for the longest baselines we'd consider; 2 s lets the
+// coordinator absorb any ordinary decoder scheduling skew.
+const MAX_SPREAD_MS = 2_000;
 // Bucket lifetime; after this we give up waiting for stragglers.
 const PAIR_WINDOW_MS = 30_000;
-// Cross-correlation slack above the wall-clock startGpsNs delta. Covers
-// skywave propagation within a first hop, no more.
-const SKYWAVE_SLACK_SEC = 0.015;
+// Cross-correlation slack above the wall-clock startGpsNs delta.
+// Ground-wave on MF is at c, so any pair across our cohort
+// (≤1500 km baseline) arrives within 5 ms of the snippet anchor.
+const PROPAGATION_SLACK_SEC = 0.010;
 // Keepalive alarm: CF DOs stay resident while an alarm is pending, so
 // refresh one on every ingest to keep buckets alive across a cohort.
 const KEEPALIVE_MS = 60_000;
@@ -150,30 +52,13 @@ export class TDOADO {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    // mmsi → [ { mmsi, firstSeenMs, dets: [...] }, ... ].
-    // Buckets are in-memory only: audio snippets are too heavy to
-    // persist, and same-packet cohorts arrive within seconds so the
-    // keepalive alarm keeps the DO warm across them.
-    this.buckets = new Map();
-    // Lightweight persisted rings so /recent survives eviction.
+    this.buckets = new Map();        // mmsi → [{mmsi, firstSeenMs, dets[]}]
     this.recentDets = [];
     this.recentSolves = [];
-    // In-memory gate counters for observability. Not persisted — they
-    // reset when the DO evicts, which is fine for tuning sessions.
-    this.rejections = {};
-    // Per-MMSI history of recent fix positions, last 60 minutes.
-    // Used to compute "consistency" — does this MMSI's TDOA solve
-    // cluster at the same location across multiple INDEPENDENT
-    // bursts? A real ship (or static coast station) gives consistent
-    // positions, while ghost-basin solves jump around as different
-    // cohorts hear different bursts. Persisted so consistency
-    // signal survives DO eviction.
-    this.mmsiHistory = new Map();   // mmsi → [{ts, lat, lon, q}, ...]
+    this.rejections = {};            // gate → count, observability only
     this.state.blockConcurrencyWhile(async () => {
       this.recentDets   = (await this.state.storage.get("recentDets"))   || [];
       this.recentSolves = (await this.state.storage.get("recentSolves")) || [];
-      const persistedHistory = (await this.state.storage.get("mmsiHistory")) || {};
-      this.mmsiHistory = new Map(Object.entries(persistedHistory));
     });
   }
 
@@ -258,7 +143,6 @@ export class TDOADO {
 
   _ingest(det) {
     this._reap();
-    // Keepalive: pin the DO in memory across the cohort window.
     this.state.storage.setAlarm(Date.now() + KEEPALIVE_MS).catch(() => {});
     const mmsi = det.call.caller ?? "?";
     let b = this._findMatchingBucket(mmsi, det.packetGpsNs);
@@ -282,13 +166,8 @@ export class TDOADO {
       let result;
       try { result = this._solveBucket(b); } catch (_) { return; }
       if (result) {
-        // Quorum reported to clients reflects the POST-TRIM cohort (the
-        // receivers that actually contributed to the final solve).
-        // `geometry.originalQuorum` preserves the pre-trim count so
-        // operators can see how much outlier rejection happened.
         result.quorum = result.receivers.length;
-        const trimmed = result.geometry?.trimmedReceivers || 0;
-        console.log(`tdoa/solve: mmsi=${b.mmsi} pos=${result.position.lat.toFixed(3)},${result.position.lon.toFixed(3)} resid=${result.position.residualKm.toFixed(1)}km q=${result.quorum}${trimmed ? `/${b.dets.length}` : ""}`);
+        console.log(`tdoa/solve: mmsi=${b.mmsi} pos=${result.position.lat.toFixed(3)},${result.position.lon.toFixed(3)} resid=${result.position.residualKm.toFixed(1)}km q=${result.quorum} tier=${result.tier}`);
         this._broadcast(result);
       }
     }
@@ -296,15 +175,10 @@ export class TDOADO {
 
   _findMatchingBucket(mmsi, packetGpsNs) {
     const spreadNs = BigInt(MAX_SPREAD_MS) * 1_000_000n;
-    // Scan all buckets: fuzzy-match lets noise-garbled MMSI variants
-    // (e.g. "563250300" and "5632??300") join the same cohort. N is
-    // small (tens of live buckets at once) so O(N) is fine.
     for (const list of this.buckets.values()) {
       for (let i = list.length - 1; i >= 0; i--) {
         const b = list[i];
         if (!mmsiCompatible(mmsi, b.mmsi)) continue;
-        // Bucket match requires every detection's anchor — existing +
-        // the new one — to lie within MAX_SPREAD_MS end-to-end.
         let minNs = b.dets[0].packetGpsNs, maxNs = minNs;
         for (const d of b.dets) {
           if (d.packetGpsNs < minNs) minNs = d.packetGpsNs;
@@ -342,8 +216,8 @@ export class TDOADO {
     const ref = dets[0];
     const refSR = ref.snippet.sampleRate;
 
-    // Real KiwiSDRs run at 12 000 ± a few Hz depending on each board's
-    // clock calibration. Accept anything within 1 % of the reference.
+    // KiwiSDRs run at 12 000 ± a few Hz. Accept anything within 1 % of
+    // the reference; reject pairs whose snippet anchors are wildly out.
     for (const d of dets) {
       const ratio = d.snippet.sampleRate / refSR;
       if (!(ratio > 0.99 && ratio < 1.01)) return null;
@@ -353,86 +227,20 @@ export class TDOADO {
 
     const solverDets = [{ gps: ref.gps, t: 0 }];
     const lagsReport = [{ slot: ref.slotId, label: ref.label, band: ref.band, gps: ref.gps, lagSamples: 0, dtSec: 0 }];
-    let minProminence = Infinity;
     for (let k = 1; k < dets.length; k++) {
       const d = dets[k];
       const startDtSec = Number(d.snippet.startGpsNs - ref.snippet.startGpsNs) / 1e9;
-      const maxLag = Math.ceil((Math.abs(startDtSec) + SKYWAVE_SLACK_SEC) * refSR);
-      const { lag, peak, prominence } = xcorr(ref.snippet.samples, d.snippet.samples, maxLag);
+      const maxLag = Math.ceil((Math.abs(startDtSec) + PROPAGATION_SLACK_SEC) * refSR);
+      const { lag, peak } = xcorr(ref.snippet.samples, d.snippet.samples, maxLag);
       if (!Number.isFinite(lag) || !(peak > 0)) return null;
-      if (prominence < minProminence) minProminence = prominence;
       const dtSec = startDtSec + lag / refSR;
       solverDets.push({ gps: d.gps, t: dtSec });
       lagsReport.push({ slot: d.slotId, label: d.label, band: d.band, gps: d.gps, lagSamples: lag, dtSec });
     }
 
-    // Robust iteratively-reweighted solve. Do the main solve, compute
-    // per-receiver arrival-time residuals, and if one receiver's
-    // contribution dominates (>3× median) drop it and re-solve. Repeat
-    // up to TRIM_ITERS rounds. One bad xcorr lag in an 8-receiver
-    // cohort can wrench the least-squares solution by hundreds of km;
-    // this iteratively walks the solver toward the set of receivers
-    // whose timing is mutually consistent. Keeps minCohortSize of 4
-    // so we don't trim past the confirmed-tier threshold.
-    const TRIM_ITERS = 3, TRIM_MIN_COHORT = 4, TRIM_MEDIAN_MULTIPLE = 3;
-    let workingDets = solverDets;
-    let workingLags = lagsReport;
-    let sol = solveTdoa(workingDets, { skywave: true });
-    if (!sol) return null;
-    let trimmedReceivers = [];
-    for (let iter = 0; iter < TRIM_ITERS && workingDets.length > TRIM_MIN_COHORT; iter++) {
-      const refGps = workingDets[0].gps;
-      const posRef = [sol.lat, sol.lon];
-      const d0 = gcDistanceKm(posRef, refGps) * 1000;
-      const perDetResid = workingDets.map((d, i) => {
-        if (i === 0) return 0;
-        const di = gcDistanceKm(posRef, d.gps) * 1000;
-        const predDt = (di - d0) / C;
-        return Math.abs(d.t - predDt);
-      });
-      // Median over the non-zero entries (i=0 is reference, always 0).
-      const nonRef = perDetResid.slice(1).sort((a, b) => a - b);
-      const med = nonRef[Math.floor(nonRef.length / 2)] || 1e-9;
-      let worstIdx = 0, worst = 0;
-      for (let i = 1; i < perDetResid.length; i++) {
-        if (perDetResid[i] > worst) { worst = perDetResid[i]; worstIdx = i; }
-      }
-      // Only drop when the worst pair's residual is a clear outlier.
-      if (worst < TRIM_MEDIAN_MULTIPLE * med) break;
-      const droppedLag = workingLags[worstIdx];
-      const nextDets = workingDets.filter((_, i) => i !== worstIdx);
-      const nextLags = workingLags.filter((_, i) => i !== worstIdx);
-      const nextSol = solveTdoa(nextDets, { skywave: true });
-      // Only accept the trim if residual actually improves — a worst-
-      // pair outlier that happens to be geometrically load-bearing can
-      // leave the remaining receivers degenerate.
-      if (!nextSol || nextSol.residualKm >= sol.residualKm) break;
-      workingDets = nextDets;
-      workingLags = nextLags;
-      sol = nextSol;
-      trimmedReceivers.push(droppedLag.slot);
-    }
-    // Use the trimmed cohort for the rest of the gates + broadcast.
-    // `dets` is the original KiwiSDR detections list; we only need the
-    // indices that survived to check band-range, so keep that mapping.
-    const trimmedSet = new Set(trimmedReceivers);
-    const keptDets = dets.filter((d, i) => !trimmedSet.has(lagsReport[i].slot));
-    // Expose the trimmed count in the broadcast payload so operators
-    // can see how much outlier-rejection work happened.
-    const lagsReportOut = workingLags;
+    const sol = solveTdoa(solverDets);
     if (!sol) return null;
 
-    // Note: minProminence is a candidate reliability signal (the
-    // weakest pair's xcorr peak-over-noise ratio). We report it on
-    // every solve via the geometry payload so we can observe the
-    // real-world distribution before committing to a threshold —
-    // gating on a blind guess would just rediscover bearing-prelim.
-
-    // Reliability gates — see constants at the top of the file for the
-    // rationale. A rejected solve returns null so _ingest() silently
-    // drops it rather than broadcasting a low-confidence fix. We also
-    // bump a counter per gate so /recent can show how many solves got
-    // dropped and by which gate, useful for threshold tuning.
     const pos = [sol.lat, sol.lon];
     const rej = (gate) => {
       this.rejections[gate] = (this.rejections[gate] || 0) + 1;
@@ -440,86 +248,18 @@ export class TDOADO {
       return null;
     };
 
-    // Tier — three levels reflecting the propagation regime we're in
-    // and therefore how trustworthy the position is:
-    //
-    //   "trusted"    — q≥4 AND every receiver-to-solution distance is
-    //                   within the band's single-hop range. This is
-    //                   the regime where the maths actually works:
-    //                   100-200 km accuracy, ghost basins physically
-    //                   distant from the truth.
-    //   "tentative"  — gates pass but at least one receiver is out
-    //                   to multi-hop. Position is suggestive (a
-    //                   vessel exists, broadcasting somewhere near
-    //                   here) but absolute coordinates can't be
-    //                   trusted because the timing-to-distance map
-    //                   is degenerate at multi-hop.
-    //   "preliminary"— q=3, exactly-determined, residual is by
-    //                   construction zero. Useful as presence info
-    //                   only.
-    //
-    // The "dets" used below for gates is the POST-TRIM cohort
-    // (`keptDets`) — after the robust solver discarded outlier
-    // receivers. Geometry and range checks apply to the cohort that
-    // actually contributed to the final solve, not the raw detections.
-    const effectiveDets = keptDets;
-    const confirmed = effectiveDets.length >= CONFIRMED_MIN_RECEIVERS;
-    let allSingleHop = confirmed;
-    let allAboveFloor = confirmed;
-    let furthestRxKm = 0;
-    let nearestRxKm = Infinity;
-    for (let i = 0; i < effectiveDets.length; i++) {
-      const band = bandOf(effectiveDets[i].slotId);
-      const dKm = gcDistanceKm(pos, effectiveDets[i].gps);
-      if (dKm > furthestRxKm) furthestRxKm = dKm;
-      if (dKm < nearestRxKm) nearestRxKm = dKm;
-      const limit = SINGLE_HOP_KM_BY_BAND[band];
-      if (limit != null && dKm > limit) allSingleHop = false;
-      if (dKm < MIN_BASELINE_KM) allAboveFloor = false;
-    }
-    // Area-of-interest match — does the fix land inside any of the
-    // monitored target regions? A fix ANYWHERE ELSE is either a
-    // ghost basin (the local single-hop check would falsely pass it)
-    // or a vessel outside our scope. Either way we shouldn't claim
-    // a trustworthy position.
-    let inArea = null;
-    for (const a of AREAS_OF_INTEREST) {
-      if (gcDistanceKm(pos, a.gps) <= a.radiusKm) { inArea = a.id; break; }
-    }
-    // "trusted" requires:
-    //   · q ≥ 4 (residual is meaningful)
-    //   · all receivers within band's single-hop range (no multi-hop
-    //     timing ambiguity)
-    //   · all receivers above the 500 km near-field floor
-    //   · solved position falls inside a defined area-of-interest
-    //     (forces ghost-basin solves outside the monitored zone to
-    //      be tier="tentative")
-    const tier = !confirmed ? "preliminary"
-              : (allSingleHop && allAboveFloor && inArea) ? "trusted"
-              : "tentative";
-
-    // Note: xcorr peak prominence (`minProminence`) is reported in the
-    // geometry payload but is NOT gated. DSC FSK with two tones (1615 /
-    // 1785 Hz) at 100 baud has strong correlation sidelobes everywhere
-    // due to the periodic symbol structure: even a wide exclusion
-    // window around the main peak finds substantial off-peak energy in
-    // real captures (observed range 1.01-1.36 for both consistent and
-    // inconsistent fixes). It's still useful telemetry for tuning
-    // experiments but doesn't separate good from bad in the way it
-    // would for a noise-like waveform.
-
-    // 1. Residual. At q=3 the solver is exactly-determined so the
-    //    residual should be ~0 in the cleanly-solvable case — but when
-    //    the cohort's measured arrival times can't satisfy any triplet
-    //    of hyperbolas, the coarse search lands somewhere with a
-    //    notable residual. That's a real quality signal even at q=3
-    //    (we see 1000+ km residuals when the geometry's degenerate),
-    //    so the gate applies at all quorums.
+    // Single quality gate: residual must be plausible. 300 km admits
+    // any fix consistent with ~1 ms KiwiSDR clock jitter on tight
+    // ground-wave geometry; rejects the bad-xcorr / ghost-basin cases.
     if (sol.residualKm > MAX_RESIDUAL_KM) return rej("residual");
 
-    // 2. Bearing spread. Uniform threshold across tiers now — the
-    //    residual gate handles the "unsolvable" cases at q=3.
-    const bearings = workingDets
+    const tier = dets.length >= TRUSTED_MIN_RECEIVERS ? "trusted" : "preliminary";
+
+    // Telemetry only — uncertainty ellipse and bearing spread reported
+    // for observability but no longer hard gates. Cohort selection
+    // (regions.js) is responsible for ensuring usable geometry.
+    const ellipse = tdoaUncertainty(solverDets, pos, 1.0);
+    const bearings = solverDets
       .map((d) => bearingFromTo(pos, d.gps))
       .sort((a, b) => a - b);
     let maxGap = 360 - (bearings[bearings.length - 1] - bearings[0]);
@@ -527,87 +267,27 @@ export class TDOADO {
       const g = bearings[i] - bearings[i - 1];
       if (g > maxGap) maxGap = g;
     }
-    if (maxGap > MAX_BEARING_GAP_DEG) return rej("bearing");
-
-    // 3. Band-range: each receiver must be within its band's plausible
-    //    propagation radius of the solve. Rejects SUNNY-KEROUANE-class
-    //    fixes where the solver put an Asian ship in Romania despite
-    //    one receiver being in SE Asia — the Asian receiver would have
-    //    been >10 000 km from the fake European fix.
-    for (let i = 0; i < effectiveDets.length; i++) {
-      const band = bandOf(effectiveDets[i].slotId);
-      const maxKm = MAX_RANGE_KM_BY_BAND[band];
-      if (maxKm == null) continue;                // unknown band → skip check
-      if (gcDistanceKm(pos, effectiveDets[i].gps) > maxKm) return rej("band-range");
-    }
-
-    // 4. Position uncertainty ellipse from cohort geometry + 1 ms
-    //    timing noise. Reject fixes whose semi-major axis exceeds
-    //    MAX_ELLIPSE_SEMIMAJOR_KM — those positions are not
-    //    constrained well enough to be trusted, even if every other
-    //    metric looks clean. This is the principled GDOP gate that
-    //    replaces the rule-of-thumb bearing-gap heuristic.
-    const ellipse = tdoaUncertainty(workingDets, pos, 1.0);
-    if (ellipse && ellipse.semiMajorKm > MAX_ELLIPSE_SEMIMAJOR_KM) {
-      return rej("geometry-uncertainty");
-    }
-
-    // 5. Leave-one-out scatter — kept as a TELEMETRY metric (reported
-    //    in the geometry payload) but no longer a hard gate. In
-    //    practice ghost-basin solves where every receiver's timing
-    //    fits the same wrong location pass LOO with low scatter, so
-    //    the gate didn't reject what it was meant to. Computed only
-    //    at q≥5 where it has meaning.
-    let looScatter = null;
-    if (workingDets.length >= 5) {
-      const looPositions = [];
-      for (let drop = 0; drop < workingDets.length; drop++) {
-        const subset = workingDets.filter((_, i) => i !== drop);
-        const sub = solveTdoa(subset, { skywave: true });
-        if (sub) looPositions.push([sub.lat, sub.lon]);
-      }
-      if (looPositions.length >= 3) {
-        const dists = [];
-        for (let i = 0; i < looPositions.length; i++) {
-          for (let j = i + 1; j < looPositions.length; j++) {
-            dists.push(gcDistanceKm(looPositions[i], looPositions[j]));
-          }
-        }
-        dists.sort((a, b) => a - b);
-        looScatter = dists[Math.floor(dists.length / 2)];
-      }
+    let furthestRxKm = 0, nearestRxKm = Infinity;
+    for (const d of dets) {
+      const dKm = gcDistanceKm(pos, d.gps);
+      if (dKm > furthestRxKm) furthestRxKm = dKm;
+      if (dKm < nearestRxKm) nearestRxKm = dKm;
     }
 
     return {
       t: "tdoa",
-      tier,                                       // "confirmed" | "preliminary"
+      tier,
       mmsi: bucket.mmsi,
       call: ref.call,
       position: { lat: sol.lat, lon: sol.lon, residualKm: sol.residualKm },
-      receivers: lagsReportOut,       // post-trim receivers only
+      receivers: lagsReport,
       geometry: {
         maxBearingGapDeg: +maxGap.toFixed(1),
-        minXcorrProminence: Number.isFinite(minProminence) ? +minProminence.toFixed(2) : null,
-        looScatterKm: looScatter != null ? +looScatter.toFixed(1) : null,
-        trimmedReceivers: trimmedReceivers.length,
-        originalQuorum: dets.length,
+        furthestReceiverKm: +furthestRxKm.toFixed(0),
+        nearestReceiverKm: Number.isFinite(nearestRxKm) ? +nearestRxKm.toFixed(0) : null,
         ellipseSemiMajorKm: ellipse ? +ellipse.semiMajorKm.toFixed(0) : null,
         ellipseSemiMinorKm: ellipse ? +ellipse.semiMinorKm.toFixed(0) : null,
         ellipseOrientationDeg: ellipse ? +ellipse.orientationDeg.toFixed(0) : null,
-        ellipseAxisRatio: ellipse ? +ellipse.axisRatio.toFixed(1) : null,
-        // basinAmbiguity: ratio of 2nd-best to best basin residual.
-        // <1.5 means a ghost basin is roughly equally plausible.
-        basinAmbiguity: sol.basinAmbiguity != null
-          ? +sol.basinAmbiguity.toFixed(2) : null,
-        // Furthest receiver from the solution — the propagation hop
-        // length the solver implicitly assumed. <single-hop limit =
-        // trusted regime; > = multi-hop, position less trustworthy.
-        furthestReceiverKm: +furthestRxKm.toFixed(0),
-        nearestReceiverKm: Number.isFinite(nearestRxKm) ? +nearestRxKm.toFixed(0) : null,
-        allReceiversSingleHop: allSingleHop,
-        allReceiversAboveFloor: allAboveFloor,
-        // Which area-of-interest contains the fix (if any).
-        inAreaOfInterest: inArea,
       },
       packetGpsNs: ref.packetGpsNs.toString(),
       broadcastMs: Date.now(),
@@ -615,9 +295,6 @@ export class TDOADO {
   }
 
   _broadcast(msg) {
-    // Append to per-MMSI history before broadcasting so the
-    // consistency metric reflects the current solve too.
-    this._updateMmsiHistory(msg);
     const payload = JSON.stringify(msg);
     for (const ws of this.state.getWebSockets()) {
       try { ws.send(payload); } catch (_) {}
@@ -635,55 +312,6 @@ export class TDOADO {
       this.recentSolves.splice(0, this.recentSolves.length - 100);
     }
     this.state.storage.put("recentSolves", this.recentSolves).catch(() => {});
-  }
-
-  // Track per-MMSI fix history and compute multi-burst consistency.
-  // We keep one entry per packetGpsNs (so multiple broadcasts from
-  // the same burst, as receivers arrive, count as one independent
-  // observation). 60-minute window, max 20 entries per MMSI.
-  _updateMmsiHistory(msg) {
-    const mmsi = msg.mmsi;
-    if (!mmsi) return;
-    const cutoff = Date.now() - 60 * 60 * 1000;
-    let history = this.mmsiHistory.get(mmsi) || [];
-    history = history.filter((h) => h.ts >= cutoff);
-    // Replace existing entry for this packet (re-solves of the same
-    // burst at higher q tighten the position and overwrite).
-    const packetGpsNs = msg.packetGpsNs;
-    history = history.filter((h) => h.packetGpsNs !== packetGpsNs);
-    history.push({
-      ts: msg.broadcastMs,
-      packetGpsNs,
-      lat: msg.position.lat,
-      lon: msg.position.lon,
-      quorum: msg.quorum,
-    });
-    if (history.length > 20) history = history.slice(-20);
-    this.mmsiHistory.set(mmsi, history);
-    // Compute consistency: median pairwise distance between *distinct
-    // bursts* in history. Single-burst MMSIs get null — there's no
-    // multi-burst signal yet.
-    const distinctBursts = history.length;
-    if (distinctBursts >= 2) {
-      const dists = [];
-      for (let i = 0; i < history.length; i++) {
-        for (let j = i + 1; j < history.length; j++) {
-          dists.push(gcDistanceKm([history[i].lat, history[i].lon],
-                                  [history[j].lat, history[j].lon]));
-        }
-      }
-      dists.sort((a, b) => a - b);
-      const medianKm = dists[Math.floor(dists.length / 2)];
-      msg.history = {
-        bursts: distinctBursts,
-        medianPairwiseKm: +medianKm.toFixed(0),
-      };
-    } else {
-      msg.history = { bursts: 1, medianPairwiseKm: null };
-    }
-    // Persist (best-effort).
-    this.state.storage.put("mmsiHistory",
-      Object.fromEntries(this.mmsiHistory)).catch(() => {});
   }
 
   _logDetection(det) {
@@ -724,11 +352,6 @@ function mmsiQuality(m) {
 function hostOf(slotId) {
   const bar = slotId.indexOf("|");
   return bar < 0 ? slotId : slotId.slice(0, bar);
-}
-
-function bandOf(slotId) {
-  const bar = slotId.indexOf("|");
-  return bar < 0 ? null : slotId.slice(bar + 1);
 }
 
 // Great-circle distance (km) between two [lat, lon] degree pairs.

@@ -75,6 +75,25 @@ export const REGIONS = [
   // rather than a geometry one.
   { id: "n-sea", name: "N Sea (tight)", bbox: null,
     target: { gps: [55.0, 5.0], radiusKm: 2500, cohortSize: 8 } },
+  // English Channel — proving ground for ground-wave-only MF TDoA.
+  // Centroid (50, 0) sits between the English south coast and Le Havre;
+  // the 600 km cohort radius pulls in 6-8 MF receivers (Canterbury UK,
+  // Le Havre FR, Bergen-op-Zoom NL, Bristol UK, Woking UK, Paris FR,
+  // Brittany FR), max bearing gap ~70°. Every receiver-to-cohort-edge
+  // distance stays inside MF ground-wave range over salt water (~600
+  // km), so the propagation regime is uniform — no F2 hops, no iono
+  // bias, no per-pair path-length unknown. `bands: [2187.5]` restricts
+  // the rack to MF only (HF in the same area would mix in 1-3 hop
+  // skywave from non-cohort regions of the world). Busiest shipping
+  // lane on Earth → abundant DSC traffic + AIS ground truth.
+  { id: "english-channel", name: "English Channel (MF test)", bbox: null,
+    target: {
+      gps: [50.0, 0.0],
+      radiusKm: 400,
+      cohortSize: 10,
+      bands: [2187.5],
+      monitoringRadiusKm: 600,
+    } },
 ];
 
 export const regionById = (id) => REGIONS.find((r) => r.id === id) || REGIONS[0];
@@ -363,7 +382,7 @@ function kmDistance(a, b) {
 // Returns an array of viable candidates for a target region, per (host,
 // band). Each entry is {host, port, bandKHz, gps, distKm, bearing, ...}.
 function targetCandidates(receivers, target) {
-  const { gps: center, radiusKm } = target;
+  const { gps: center, radiusKm, bands: allowedBands } = target;
   const out = [];
   for (const r of receivers) {
     if (r.status !== "active" || r.offline === "yes" || !r.url) continue;
@@ -375,6 +394,9 @@ function targetCandidates(receivers, target) {
     if (!gps) continue;
     const distKm = kmDistance(gps, center);
     if (distKm > radiusKm) continue;
+    // Band-restricted target: skip receivers that don't cover any of the
+    // allowed bands (e.g. HF-only antennas in an MF-only region).
+    if (allowedBands && !allowedBands.some((khz) => coversBand(r, khz))) continue;
     let host, port;
     try {
       const u = new URL(r.url);
@@ -435,8 +457,47 @@ function pickSurroundCohort(candidates, octants = 6, maxPerOctant = 1) {
   return picks;
 }
 
-function pickTargetCohort(candidates, size) {
+// Ground-wave cohort: closest-first with octant-balanced spread, plus
+// site-deduplication to avoid burning slots on near-collocated KiwiSDRs
+// (e.g. two boxes at the same operator, 9 km apart) — they provide
+// essentially the same geometric constraint but each takes a separate
+// upstream WS connection. SNR self-report on the public list is a
+// noise-floor estimate, not a guarantee that the receiver actually
+// decodes weak MF DSC bursts; for ground-wave reception probability
+// the only thing that matters is proximity to the transmitter. Within
+// the closest 3× pool we pick one receiver per compass octant (round
+// 1) and then top up with the next-closest unpicked (round 2). Result:
+// a tight cohort (~50-300 km from centroid) with reasonable bearing
+// spread when the receiver distribution allows it.
+const SITE_DEDUP_KM = 30;   // collapse multi-Kiwi sites within 30 km
+
+function pickGroundWaveCohort(candidates, size) {
   if (!candidates.length) return [];
+  const pool = [...candidates].sort((a, b) => a.distKm - b.distKm).slice(0, size * 4);
+  const wedges = Array(8).fill(null).map(() => []);
+  for (const c of pool) wedges[Math.floor(c.bearing / 45) % 8].push(c);
+  for (const w of wedges) w.sort((a, b) => a.distKm - b.distKm);
+  const picks = [];
+  const usedHosts = new Set();
+  const siteCovered = (c) => picks.some((p) => kmDistance(p.gps, c.gps) < SITE_DEDUP_KM);
+  for (const w of wedges) {
+    for (const c of w) {
+      if (usedHosts.has(c.host) || siteCovered(c)) continue;
+      picks.push(c); usedHosts.add(c.host); break;
+    }
+  }
+  for (const c of pool) {
+    if (picks.length >= size) break;
+    if (usedHosts.has(c.host) || siteCovered(c)) continue;
+    picks.push(c); usedHosts.add(c.host);
+  }
+  return picks.slice(0, size);
+}
+
+function pickTargetCohort(candidates, size, target) {
+  if (!candidates.length) return [];
+  // Ground-wave-restricted target: SNR is unreliable, proximity is king.
+  if (target.bands) return pickGroundWaveCohort(candidates, size);
   // Strategy 1 — octant surround. If we get ≥ 3 occupied octants, use
   // them: compass surround is worth more than a same-side pile-on.
   const surround = pickSurroundCohort(candidates, 6, 1);
@@ -490,13 +551,19 @@ function pickTargetCohort(candidates, size) {
 // band each receiver physically covers. Output shape matches the bbox
 // rack — one entry per (host, band) — so the Worker can hand it to
 // DirectoryDO's renderer unchanged.
+//
+// `target.bands` (optional) restricts the rack to specific DSC bands —
+// useful for ground-wave-only operation (MF: 2187.5 kHz) where mixing
+// in HF would pull in 1-3 hop skywave from outside the cohort area
+// and break the uniform-propagation assumption.
 export function pickTargetRack(receivers, target, requested = DEFAULT_FANOUT) {
   const candidates = targetCandidates(receivers, target);
   const size = Math.max(3, target.cohortSize ?? 6);
-  const cohort = pickTargetCohort(candidates, size);
+  const cohort = pickTargetCohort(candidates, size, target);
   const cap = Math.min(DEFAULT_FANOUT, Math.max(1, requested | 0));
+  const allowedBands = target.bands ?? BANDS.map(b => b.khz);
   const picks = [];
-  for (const khz of BANDS.map(b => b.khz)) {
+  for (const khz of allowedBands) {
     for (const c of cohort) {
       if (!coversBand({ bands: c.bandsRaw }, khz)) continue;
       picks.push({

@@ -1,32 +1,18 @@
 // Pure TDOA math. Kept free of I/O so the same module can run in the
 // Worker and in a Node test script.
 //
-// Propagation model — skywave-aware. The signal doesn't travel along
-// a great-circle arc at c; it bounces off the F2 layer at h ≈ 250 km
-// in roughly 2000 km hops. The slant distance per hop is therefore
-// 2·sqrt((d_hop/2)² + h²), so for a 1000 km surface path the actual
-// signal travels 1118 km — 118 km of "iono bias". Long paths (e.g.
-// 6000 km via 3 hops) accumulate ~700 km of extra slant. Modelling
-// this correction is what lets the residual landscape distinguish
-// the true TX from the ghost-basin mirror; without it the solver
-// finds positions where the *straight-line* distances are consistent,
-// which doesn't match the bounce-path arrival times.
+// Operating regime: this solver assumes ground-wave propagation —
+// signals travel along the great-circle surface path at c. That holds
+// when every cohort receiver is within MF/HF ground-wave range of the
+// transmitter (~600 km on MF over salt water; less on HF). Multi-hop
+// skywave is explicitly out of scope: F2 reflection adds path bias
+// that varies with ionospheric conditions, time of day, and per-pair
+// hop count, and the residual landscape gains symmetric ghost minima
+// the solver can't disambiguate. Cohort selection (regions.js) is
+// responsible for keeping the receivers inside the ground-wave regime.
 
 export const C = 299792458;   // m/s
 export const EARTH_R = 6371000;
-const IONO_REFLECT_HEIGHT_M = 250000;   // F2 layer, mid-band HF average
-const IONO_HOP_LENGTH_M = 2000000;      // ~2000 km surface arc per hop
-
-// Slant (signal-path) distance for a great-circle surface distance d_m,
-// assuming multi-hop F2 reflection. Reduces to d_m + iono-bias for
-// d_m << HOP_LEN, and grows with the per-hop slant for long paths.
-export function slantDistance(d_m, h_m = IONO_REFLECT_HEIGHT_M) {
-  if (d_m <= 0) return 0;
-  const nHops = Math.max(1, Math.ceil(d_m / IONO_HOP_LENGTH_M));
-  const dPerHop = d_m / nHops;
-  const slantPerHop = 2 * Math.sqrt((dPerHop / 2) ** 2 + h_m * h_m);
-  return nHops * slantPerHop;
-}
 
 // Great-circle distance (m) between two [lat, lon] points in degrees.
 export function geodist(a, b) {
@@ -69,80 +55,51 @@ export function xcorr(a, b, maxLag) {
       refined = bestLag + 0.5 * (y0 - y2) / denom;
     }
   }
-  // Peak prominence: ratio of the main peak to the highest correlation
-  // OUTSIDE the symbol-period sidelobes around the peak. DSC FSK runs
-  // at 100 baud — at SR 12 kHz that's 120 samples per symbol, so
-  // adjacent lags within ±1 symbol period are inherently strongly
-  // correlated due to symbol-aligned overlap, regardless of true
-  // alignment quality. We exclude ±150 samples so prominence reflects
-  // genuine off-peak noise floor, not the local sidelobe structure.
-  const exclude = 150;
-  let offPeakMax = 0;
-  for (let i = 0; i < corrs.length; i++) {
-    if (Math.abs(i - idx) <= exclude) continue;
-    if (corrs[i] > offPeakMax) offPeakMax = corrs[i];
-  }
-  const prominence = offPeakMax > 0 ? best / offPeakMax : Infinity;
-  return { lag: refined, peak: best, prominence };
+  return { lag: refined, peak: best };
 }
 
 // Solve TDOA. Input: array of {gps:[lat,lon], t:<seconds>} (t on any
 // shared clock; only differences matter). Returns {lat, lon, residualKm}.
 //
-// Method: two-phase search. Phase 1 sweeps a coarse global grid across
-// the plausible search area and keeps the top few candidate basins (the
-// TDOA residual landscape has multiple saddle-y minima when receivers
-// are unevenly distributed, so a single local refinement can land in a
-// ghost basin). Phase 2 refines each candidate by nested grid and picks
-// the global best. Still root-finder-free and cheap for N≤8 receivers.
+// Method: coarse grid sweep over the receiver bbox + small pad, then
+// nested-grid refinement on the global minimum. Single basin — works
+// because the cohort is tight and inside the ground-wave regime, so
+// the residual landscape has one well-defined minimum near the truth.
 export function solveTdoa(dets, opts = {}) {
   if (dets.length < 3) return null;
   const ref = dets[0];
   const obsDts = dets.map(d => d.t - ref.t);  // shared clock; diffs only
 
-  // Search area: bbox of receivers expanded by `pad` degrees. The
-  // 15° default works for surround geometries where the TX is inside
-  // the receiver hull, but one-sided cohorts (all receivers in Europe,
-  // ship in Asia) need a much wider search to even discover the true
-  // basin — otherwise the solver finds only the "European ghost" of
-  // an Asian transmitter. 60° gives ~6500 km of pad which covers all
-  // practical HF skip distances. Cost is quadratic in nCoarse, so we
-  // also bump nCoarse to keep grid cells reasonable (~70 km).
+  // Search area: receiver bbox expanded by `padDeg`. 10° (~1100 km) is
+  // enough overflow for tight cohorts: the truth is inside the convex
+  // hull of receivers in the surround case, and within ~one cohort
+  // diameter outside it in the offset case. Wider padding invites
+  // ghost basins from the periodic xcorr-sidelobe structure.
   const lats = dets.map(d => d.gps[0]);
   const lons = dets.map(d => d.gps[1]);
-  const pad = opts.padDeg ?? 60;
+  const pad = opts.padDeg ?? 10;
   const latMin = Math.min(...lats) - pad, latMax = Math.max(...lats) + pad;
   const lonMin = Math.min(...lons) - pad, lonMax = Math.max(...lons) + pad;
 
-  // Skywave-aware residual: convert each great-circle distance into
-  // its multi-hop slant distance via slantDistance() before computing
-  // expected arrival-time differences. Without this correction the
-  // solver finds positions whose straight-line distances satisfy the
-  // observed arrival times — which is *not* the same set as the
-  // true positions when signals are propagating via F2 hops. Opt-in
-  // (`opts.skywave: true`) so synthetic tests that generate timings
-  // from straight-line propagation continue to validate the geometry
-  // independent of the propagation model.
-  const dist = opts.skywave ? (a, b) => slantDistance(geodist(a, b)) : geodist;
   const resid = (la, lo) => {
-    const d0 = dist([la, lo], ref.gps);
+    const d0 = geodist([la, lo], ref.gps);
     let s = 0;
     for (let k = 1; k < dets.length; k++) {
-      const dk = dist([la, lo], dets[k].gps);
+      const dk = geodist([la, lo], dets[k].gps);
       const err = (dk - d0) / C - obsDts[k];
       s += err * err;
     }
     return s;
   };
 
-  // Phase 1: coarse sweep. Keep top-K candidates. Grid cell ≈
-  // (latMax-latMin)/(nCoarse-1). With pad=60 the bbox can span 200°
-  // so 161 cells gives ~140 km cells in the worst case — still well
-  // below the 250 km timing-noise floor and tight enough to discover
-  // distinct basins.
-  const nCoarse = opts.coarseN ?? 161;
-  const topK = opts.topK ?? 8;
-  const top = [];   // [{r, la, lo}, ...] sorted ascending by r
+  // Phase 1: coarse sweep. Keep the top-K cells so refinement can rescue
+  // cases where the global coarse minimum is one or two cells off truth
+  // due to grid-discretisation noise — the refine box is bounded, so
+  // refining only the best coarse cell can converge on a slightly-wrong
+  // local minimum. K=3 is enough in practice for tight cohorts.
+  const nCoarse = opts.coarseN ?? 81;
+  const topK = opts.topK ?? 3;
+  const top = [];
   for (let i = 0; i < nCoarse; i++) {
     const la = latMin + (latMax - latMin) * i / (nCoarse - 1);
     for (let j = 0; j < nCoarse; j++) {
@@ -156,67 +113,39 @@ export function solveTdoa(dets, opts = {}) {
     }
   }
 
-  // Phase 2: refine each candidate basin and return the best.
+  // Phase 2: nested-grid refinement around each coarse candidate; take
+  // the global best after refining.
   const coarseCellDeg = Math.max(
     (latMax - latMin) / (nCoarse - 1),
     (lonMax - lonMin) / (nCoarse - 1),
   );
-  let best = { r: Infinity, la: top[0].la, lo: top[0].lo };
-  // Track ALL refined basins so we can report the runner-up for
-  // ghost-basin detection. If basin #2 has a residual close to the
-  // best one but at a very different location, the cohort has a real
-  // ambiguity — even a low best-residual fix can't be trusted.
-  const refinedBasins = [];
   const refineN = opts.refineN ?? 21;
   const refineSteps = opts.refineSteps ?? 6;
   const shrink = opts.shrink ?? 0.3;
-
+  let best = { r: Infinity, la: 0, lo: 0 };
   for (const cand of top) {
     let la = cand.la, lo = cand.lo, range = coarseCellDeg * 2;
-    let localBest = { r: cand.r, la, lo };
+    let local = { r: cand.r, la, lo };
     for (let iter = 0; iter < refineSteps; iter++) {
       for (let i = 0; i < refineN; i++) {
         const la2 = la + (i - (refineN - 1) / 2) * range / (refineN - 1);
         for (let j = 0; j < refineN; j++) {
           const lo2 = lo + (j - (refineN - 1) / 2) * range / (refineN - 1);
           const r = resid(la2, lo2);
-          if (r < localBest.r) localBest = { r, la: la2, lo: lo2 };
+          if (r < local.r) local = { r, la: la2, lo: lo2 };
         }
       }
-      la = localBest.la; lo = localBest.lo;
+      la = local.la; lo = local.lo;
       range *= shrink;
     }
-    refinedBasins.push(localBest);
-    if (localBest.r < best.r) best = localBest;
+    if (local.r < best.r) best = local;
   }
-
-  // Find the second-best DISTINCT basin (>500 km from `best`, so we're
-  // not just measuring two refinements of the same minimum). Its
-  // residual relative to the best gives an ambiguity score: 1.0 means
-  // "two equally-good basins exist — fix is fundamentally ambiguous";
-  // ≫1 means "best basin is uniquely the lowest — trustworthy".
-  let runnerUpResid = null;
-  for (const cand of refinedBasins.sort((a, b) => a.r - b.r)) {
-    if (cand === best) continue;
-    const dKm = 2 * EARTH_R / 1000 * Math.asin(Math.min(1, Math.sqrt(
-      Math.sin((cand.la - best.la) * Math.PI / 360) ** 2
-        + Math.cos(best.la * Math.PI / 180) * Math.cos(cand.la * Math.PI / 180)
-        * Math.sin((cand.lo - best.lo) * Math.PI / 360) ** 2,
-    )));
-    if (dKm > 500) { runnerUpResid = cand.r; break; }
-  }
-  const ambiguity = runnerUpResid != null && best.r > 0
-    ? Math.sqrt(runnerUpResid / best.r)
-    : null;
 
   const rmsTimeErr = Math.sqrt(best.r / Math.max(1, dets.length - 1));
   return {
     lat: best.la,
     lon: best.lo,
     residualKm: rmsTimeErr * C / 1000,
-    // ratio of runner-up to best basin residual (in time-rms units).
-    // 1.0 = ambiguous (ghost basin equally plausible), ≥2 = clear winner.
-    basinAmbiguity: ambiguity,
   };
 }
 
@@ -236,20 +165,14 @@ export function solveTdoa(dets, opts = {}) {
 export function tdoaUncertainty(dets, position, timingSigmaMs = 1.0) {
   if (dets.length < 3) return null;
   const [pLat, pLon] = position;
-  // Local ENU unit vectors from solution to each receiver. ~scale-
-  // accurate for sub-1000-km cohorts; for larger ones the spherical
-  // approximation degrades but the broad shape (elongation, axes
-  // ratio) remains informative.
   const cosLat = Math.cos(pLat * Math.PI / 180);
   const KM_PER_DEG = 111.32;
   const u = dets.map(d => {
     const dN = (d.gps[0] - pLat) * KM_PER_DEG;
     const dE = (d.gps[1] - pLon) * KM_PER_DEG * cosLat;
     const r = Math.hypot(dN, dE);
-    return r > 0 ? [dE / r, dN / r] : [0, 0];   // [east, north] unit
+    return r > 0 ? [dE / r, dN / r] : [0, 0];
   });
-  // Build H (rows = pairs, cols = [E, N] derivative of (r_i - r_0)).
-  // Reference is dets[0], so each pair (0, k) row is u_k - u_0.
   let HtH00 = 0, HtH01 = 0, HtH11 = 0;
   for (let k = 1; k < u.length; k++) {
     const e = u[k][0] - u[0][0];
@@ -258,30 +181,20 @@ export function tdoaUncertainty(dets, position, timingSigmaMs = 1.0) {
     HtH01 += e * n;
     HtH11 += n * n;
   }
-  // Invert 2x2: det = HtH00*HtH11 - HtH01², cov = (1/det) * [[HtH11,-HtH01],[-HtH01,HtH00]] · σ²·c²
   const det = HtH00 * HtH11 - HtH01 * HtH01;
-  if (!isFinite(det) || det <= 1e-9) return null;        // degenerate
-  const sigmaKm = (timingSigmaMs / 1000) * C / 1000;     // 1 ms ≈ 300 km
+  if (!isFinite(det) || det <= 1e-9) return null;
+  const sigmaKm = (timingSigmaMs / 1000) * C / 1000;
   const sigma2 = sigmaKm * sigmaKm;
   const Cee = (HtH11 / det) * sigma2;
   const Cnn = (HtH00 / det) * sigma2;
   const Cen = (-HtH01 / det) * sigma2;
-  // Eigenvalues of the 2x2 covariance.
   const tr = Cee + Cnn;
   const D = Math.sqrt(Math.max(0, (Cee - Cnn) ** 2 + 4 * Cen * Cen));
-  const lam1 = (tr + D) / 2;     // bigger eigenvalue
+  const lam1 = (tr + D) / 2;
   const lam2 = (tr - D) / 2;
-  const semiMajorKm = Math.sqrt(Math.max(0, lam1));
-  const semiMinorKm = Math.sqrt(Math.max(0, lam2));
-  // Orientation: angle (deg, 0=east, 90=north) of the major axis.
-  const orientDeg = (Math.atan2(2 * Cen, Cee - Cnn) * 90 / Math.PI);
   return {
-    semiMajorKm,
-    semiMinorKm,
-    // Axis ratio gives a quick scalar quality cue: 1.0 = perfectly
-    // round (well-determined), >5 = strongly elongated (one direction
-    // poorly constrained, e.g. one-sided cohort).
-    axisRatio: semiMinorKm > 0 ? semiMajorKm / semiMinorKm : Infinity,
-    orientationDeg: orientDeg,
+    semiMajorKm: Math.sqrt(Math.max(0, lam1)),
+    semiMinorKm: Math.sqrt(Math.max(0, lam2)),
+    orientationDeg: Math.atan2(2 * Cen, Cee - Cnn) * 90 / Math.PI,
   };
 }
