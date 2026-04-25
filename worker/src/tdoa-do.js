@@ -23,28 +23,28 @@ import { solveTdoa, xcorr, C } from "./tdoa.js";
 // signal and the broadcast tier is `confirmed`.
 const MIN_RECEIVERS  = 3;
 const CONFIRMED_MIN_RECEIVERS = 4;
-// Preliminary-tier bearing gap — how tightly must the three receivers
-// surround the solution. 120° was rejecting 20 of 20 3-receiver
-// cohorts in live test (most global co-hearings span two continents,
-// so bearings cluster). 150° still demands the receivers be spread
-// around more than just one hemisphere but admits the common pattern
-// of Europe + one Asian/Pacific vertex heard via long-path HF.
-const PRELIM_MAX_BEARING_GAP_DEG = 150;
-// Maximum solver RMS time residual, converted to km (c·Δt). Above
-// this threshold the cross-correlated lags are not self-consistent —
-// usually a sign of ghost-basin solution or a bad xcorr peak.
-// Calibrated against live rejections: 200 km was biting ~50% of real
-// q=5+ solves where one noisy pair inflated the RMS; 500 km still
-// catches obvious ghosts (>1000 km residuals are real failures) while
-// admitting normal multi-hop F2 fixes where ionospheric path bias
-// legitimately lifts the residual into the low hundreds.
-const MAX_RESIDUAL_KM = 500;
+// (Previously we used a stricter bearing-gap threshold for the
+// preliminary / q=3 tier because there's no residual safety net
+// at exactly-determined dimensionality. Live data showed this was
+// rejecting real n-sea surround fixes where bearings span 160°
+// naturally. With the residual gate now applied at all quorums,
+// the bearing threshold collapses to a single value.)
+// Maximum solver RMS time residual, converted to km (c·Δt). The
+// physical floor with realistic 1 ms KiwiSDR clock jitter on good
+// geometry (e.g. FJELD SVEA cohort, ~150° max bearing gap) is 100-
+// 200 km — verified by simulation. 250 km admits all reasonable
+// fixes given that floor while still catching the ghost-basin /
+// bad-xcorr cases that produce 1000+ km residuals.
+const MAX_RESIDUAL_KM = 250;
 // Maximum permitted angular gap between consecutive receivers as seen
-// from the solved position. If the receivers are all in one hemisphere
-// (gap > 180°) the TDOA residual landscape has a mirror basin the
-// solver can fall into. This is the GDOP guard rail that would have
-// rejected the European-cohort-but-Asian-ship SUNNY KEROUANE fix.
-const MAX_BEARING_GAP_DEG = 180;
+// from the solved position. The hard limit is 360° (degenerate). 180°
+// is the textbook surround threshold but live data showed the
+// realistic floor for valid cohorts is ~150-180°; clipping at exactly
+// 180° was rejecting edge-of-cluster fixes that were actually correct.
+// 220° is calibrated to admit those while still catching SUNNY-KEROUANE-
+// class cohorts where every receiver is on one side of the world from
+// the solved position.
+const MAX_BEARING_GAP_DEG = 220;
 // Per-band sanity ceiling on receiver-to-solution distance. A solve
 // placing the transmitter beyond the band's plausible propagation
 // range from even one receiver is mathematically possible (the
@@ -393,11 +393,17 @@ export class TDOADO {
     // experiments but doesn't separate good from bad in the way it
     // would for a noise-like waveform.
 
-    // 1. Residual (confirmed only — meaningless at q=3).
-    if (confirmed && sol.residualKm > MAX_RESIDUAL_KM) return rej("residual");
+    // 1. Residual. At q=3 the solver is exactly-determined so the
+    //    residual should be ~0 in the cleanly-solvable case — but when
+    //    the cohort's measured arrival times can't satisfy any triplet
+    //    of hyperbolas, the coarse search lands somewhere with a
+    //    notable residual. That's a real quality signal even at q=3
+    //    (we see 1000+ km residuals when the geometry's degenerate),
+    //    so the gate applies at all quorums.
+    if (sol.residualKm > MAX_RESIDUAL_KM) return rej("residual");
 
-    // 2. Bearing spread. Preliminary tier uses a stricter threshold
-    //    because there's no residual safety net.
+    // 2. Bearing spread. Uniform threshold across tiers now — the
+    //    residual gate handles the "unsolvable" cases at q=3.
     const bearings = workingDets
       .map((d) => bearingFromTo(pos, d.gps))
       .sort((a, b) => a - b);
@@ -406,8 +412,7 @@ export class TDOADO {
       const g = bearings[i] - bearings[i - 1];
       if (g > maxGap) maxGap = g;
     }
-    const bearingLimit = confirmed ? MAX_BEARING_GAP_DEG : PRELIM_MAX_BEARING_GAP_DEG;
-    if (maxGap > bearingLimit) return rej(confirmed ? "bearing" : "bearing-prelim");
+    if (maxGap > MAX_BEARING_GAP_DEG) return rej("bearing");
 
     // 3. Band-range: each receiver must be within its band's plausible
     //    propagation radius of the solve. Rejects SUNNY-KEROUANE-class
@@ -421,16 +426,14 @@ export class TDOADO {
       if (gcDistanceKm(pos, effectiveDets[i].gps) > maxKm) return rej("band-range");
     }
 
-    // 4. Leave-one-out cross-validation. Re-solve N times with each
-    //    receiver removed in turn; if the resulting positions agree
-    //    (median pairwise great-circle distance ≤ LOO_MAX_SCATTER_KM),
-    //    the cohort is internally consistent and the main solve is
-    //    trustworthy. If they scatter, one or more receivers' timing
-    //    is unreliable — reject regardless of how clean the residual
-    //    looked. Only meaningful at q≥5 (need ≥4 in each LOO solve to
-    //    keep some overdetermination).
+    // 4. Leave-one-out scatter — kept as a TELEMETRY metric (reported
+    //    in the geometry payload) but no longer a hard gate. In
+    //    practice ghost-basin solves where every receiver's timing
+    //    fits the same wrong location pass LOO with low scatter, so
+    //    the gate didn't reject what it was meant to. Computed only
+    //    at q≥5 where it has meaning.
     let looScatter = null;
-    if (confirmed && workingDets.length >= 5) {
+    if (workingDets.length >= 5) {
       const looPositions = [];
       for (let drop = 0; drop < workingDets.length; drop++) {
         const subset = workingDets.filter((_, i) => i !== drop);
@@ -438,7 +441,6 @@ export class TDOADO {
         if (sub) looPositions.push([sub.lat, sub.lon]);
       }
       if (looPositions.length >= 3) {
-        // Median pairwise distance — robust against a single outlier.
         const dists = [];
         for (let i = 0; i < looPositions.length; i++) {
           for (let j = i + 1; j < looPositions.length; j++) {
@@ -447,7 +449,6 @@ export class TDOADO {
         }
         dists.sort((a, b) => a - b);
         looScatter = dists[Math.floor(dists.length / 2)];
-        if (looScatter > LOO_MAX_SCATTER_KM) return rej("loo-scatter");
       }
     }
 

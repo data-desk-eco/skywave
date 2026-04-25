@@ -11,9 +11,9 @@
 //      un-follow the others so the server doesn't waste bandwidth
 //      streaming PCM we'd never play.
 
-import { Vessels } from "./vessels.js?v=27";
-import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=27";
-import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=27";
+import { Vessels } from "./vessels.js?v=28";
+import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=28";
+import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=28";
 
 const DEBUG = /(\?|&)debug=1\b/.test(location.search);
 const AUDIO_LEAD_SEC = 0.25;
@@ -25,7 +25,14 @@ const RACK_REFRESH_MS = 60_000;
 // some receivers via an extra skywave hop the solver models as
 // straight-line c. Silent is better than misleading; a later re-solve
 // with more receivers often tightens the fix and it'll appear then.
-const TDOA_MAX_RESIDUAL_KM = 100;
+//
+// Calibrated against simulation: with realistic 1 ms KiwiSDR timing
+// jitter and good (≤180°) geometry, the inherent residual floor is
+// 100-200 km. The previous 100 km cutoff was rejecting genuinely-
+// good fixes whose underlying timing precision simply couldn't beat
+// the ms-level GPS jitter — same reason the server-side gate sits at
+// 250 km. The UI shows residual prominently so the human can judge.
+const TDOA_MAX_RESIDUAL_KM = 250;
 
 const GATEWAY = (() => {
   const meta = document.querySelector('meta[name="skywave-gateway"]');
