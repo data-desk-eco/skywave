@@ -33,6 +33,12 @@ const TRUSTED_MIN_RECEIVERS = 4;
 // 100-200 km; 300 km admits all reasonable fixes while catching the
 // ghost-basin / bad-xcorr cases that produce 1000+ km residuals.
 const MAX_RESIDUAL_KM = 300;
+// Maximum bearing gap from the solved position to consecutive receivers
+// around the compass. >270° means all receivers are bunched in <90° of
+// the compass — degenerate geometry where any timing-noise pull
+// produces wildly different positions. The fix is fundamentally
+// unconstrained in the away-from-receivers direction.
+const MAX_BEARING_GAP_DEG = 270;
 // Time window (on packetGpsNs) during which arrivals from different
 // receivers count as the same packet. Real MF-ground-wave TDOA is ≲4 ms
 // even for the longest baselines we'd consider; 2 s lets the
@@ -248,17 +254,18 @@ export class TDOADO {
       return null;
     };
 
-    // Single quality gate: residual must be plausible. 300 km admits
-    // any fix consistent with ~1 ms KiwiSDR clock jitter on tight
-    // ground-wave geometry; rejects the bad-xcorr / ghost-basin cases.
+    // 1. Residual gate. 300 km admits any fix consistent with ~1 ms
+    //    KiwiSDR clock jitter on tight ground-wave geometry; rejects
+    //    the bad-xcorr / ghost-basin cases that produce 1000+ km
+    //    residuals.
     if (sol.residualKm > MAX_RESIDUAL_KM) return rej("residual");
 
-    const tier = dets.length >= TRUSTED_MIN_RECEIVERS ? "trusted" : "preliminary";
-
-    // Telemetry only — uncertainty ellipse and bearing spread reported
-    // for observability but no longer hard gates. Cohort selection
-    // (regions.js) is responsible for ensuring usable geometry.
-    const ellipse = tdoaUncertainty(solverDets, pos, 1.0);
+    // 2. Bearing-gap gate. Compute max angular gap between consecutive
+    //    receivers as seen from the solved position. Above 270° means
+    //    every receiver is bunched inside a 90° wedge of the compass —
+    //    degenerate geometry where any timing pull yields wildly
+    //    different positions in the away-from-receivers direction.
+    //    Cheapest-to-compute gate that actually catches ghost basins.
     const bearings = solverDets
       .map((d) => bearingFromTo(pos, d.gps))
       .sort((a, b) => a - b);
@@ -267,6 +274,13 @@ export class TDOADO {
       const g = bearings[i] - bearings[i - 1];
       if (g > maxGap) maxGap = g;
     }
+    if (maxGap > MAX_BEARING_GAP_DEG) return rej("bearing");
+
+    const tier = dets.length >= TRUSTED_MIN_RECEIVERS ? "trusted" : "preliminary";
+
+    // Telemetry: uncertainty ellipse, reported but not gated. Cohort
+    // selection (regions.js) is responsible for ensuring usable geometry.
+    const ellipse = tdoaUncertainty(solverDets, pos, 1.0);
     let furthestRxKm = 0, nearestRxKm = Infinity;
     for (const d of dets) {
       const dKm = gcDistanceKm(pos, d.gps);
