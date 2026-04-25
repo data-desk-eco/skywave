@@ -68,6 +68,25 @@ const MAX_RANGE_KM_BY_BAND = {
   HF12: 15000,
   HF16: 20000,
 };
+// Single-hop propagation distance. The regime where ionospheric
+// path bias is bounded (one F2 reflection at known geometry) and
+// ghost basins are far from the truth — the math we're using
+// converges on the right answer with 100-200 km accuracy. Multi-hop
+// (signal bouncing twice or more) introduces additional unknowns:
+// reflection height varies, residual landscape gains symmetric
+// minima, ghost basins can sit near the truth. Fixes where ALL
+// contributing receivers are inside their band's single-hop range
+// from the solution earn the "trusted" tier; otherwise the broadcast
+// is "tentative" — useful as a hint of vessel presence but not a
+// position claim.
+const SINGLE_HOP_KM_BY_BAND = {
+  MF:   1500,
+  HF4:  2500,
+  HF6:  3500,
+  HF8:  4000,
+  HF12: 4500,
+  HF16: 4500,
+};
 // Leave-one-out cross-validation: at q≥5 we re-solve N times, each
 // excluding one receiver. If the resulting positions agree (median
 // pairwise distance below this threshold), the cohort is internally
@@ -392,16 +411,42 @@ export class TDOADO {
       return null;
     };
 
-    // Tier: ≥4 receivers with a passing residual = `confirmed`; a
-    // 3-receiver fix = `preliminary` (no residual check possible) and
-    // must pass a stricter bearing gap.
+    // Tier — three levels reflecting the propagation regime we're in
+    // and therefore how trustworthy the position is:
+    //
+    //   "trusted"    — q≥4 AND every receiver-to-solution distance is
+    //                   within the band's single-hop range. This is
+    //                   the regime where the maths actually works:
+    //                   100-200 km accuracy, ghost basins physically
+    //                   distant from the truth.
+    //   "tentative"  — gates pass but at least one receiver is out
+    //                   to multi-hop. Position is suggestive (a
+    //                   vessel exists, broadcasting somewhere near
+    //                   here) but absolute coordinates can't be
+    //                   trusted because the timing-to-distance map
+    //                   is degenerate at multi-hop.
+    //   "preliminary"— q=3, exactly-determined, residual is by
+    //                   construction zero. Useful as presence info
+    //                   only.
+    //
     // The "dets" used below for gates is the POST-TRIM cohort
     // (`keptDets`) — after the robust solver discarded outlier
     // receivers. Geometry and range checks apply to the cohort that
     // actually contributed to the final solve, not the raw detections.
     const effectiveDets = keptDets;
     const confirmed = effectiveDets.length >= CONFIRMED_MIN_RECEIVERS;
-    const tier = confirmed ? "confirmed" : "preliminary";
+    let allSingleHop = confirmed;
+    let furthestRxKm = 0;
+    for (let i = 0; i < effectiveDets.length; i++) {
+      const band = bandOf(effectiveDets[i].slotId);
+      const dKm = gcDistanceKm(pos, effectiveDets[i].gps);
+      if (dKm > furthestRxKm) furthestRxKm = dKm;
+      const limit = SINGLE_HOP_KM_BY_BAND[band];
+      if (limit != null && dKm > limit) allSingleHop = false;
+    }
+    const tier = !confirmed ? "preliminary"
+              : allSingleHop ? "trusted"
+              : "tentative";
 
     // Note: xcorr peak prominence (`minProminence`) is reported in the
     // geometry payload but is NOT gated. DSC FSK with two tones (1615 /
@@ -504,6 +549,11 @@ export class TDOADO {
         // <1.5 means a ghost basin is roughly equally plausible.
         basinAmbiguity: sol.basinAmbiguity != null
           ? +sol.basinAmbiguity.toFixed(2) : null,
+        // Furthest receiver from the solution — the propagation hop
+        // length the solver implicitly assumed. <single-hop limit =
+        // trusted regime; > = multi-hop, position less trustworthy.
+        furthestReceiverKm: +furthestRxKm.toFixed(0),
+        allReceiversSingleHop: allSingleHop,
       },
       packetGpsNs: ref.packetGpsNs.toString(),
       broadcastMs: Date.now(),
