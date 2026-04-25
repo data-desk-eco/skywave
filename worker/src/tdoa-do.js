@@ -14,6 +14,18 @@
 //   GET  /recent      — debug snapshot (persisted across eviction)
 
 import { solveTdoa, xcorr, tdoaUncertainty, C } from "./tdoa.js";
+import { REGIONS } from "./regions.js";
+
+// Pre-flatten the target areas so the trust check is a quick loop
+// over (centroid, radius) pairs. Every region with a `target` block
+// counts as an area-of-interest — ports/chokepoints we're actively
+// monitoring. A fix inside ANY such area can be trusted (provided
+// the propagation regime checks also pass); a fix outside ALL of
+// them is by construction either a ghost basin or a vessel we
+// weren't targeting, neither of which we want to claim accuracy for.
+const AREAS_OF_INTEREST = REGIONS
+  .filter((r) => r.target)
+  .map((r) => ({ id: r.id, gps: r.target.gps, radiusKm: r.target.radiusKm }));
 
 // Two-tier quorum: 3-receiver fixes are exactly-determined in 2D, so
 // `residualKm` is meaningless there — they can still be correct but
@@ -456,11 +468,25 @@ export class TDOADO {
       if (limit != null && dKm > limit) allSingleHop = false;
       if (dKm < MIN_BASELINE_KM) allAboveFloor = false;
     }
-    // "trusted" requires both the upper bound (single-hop) AND the
-    // lower bound (no near-field receivers): the propagation geometry
-    // we're modelling is bounded on both ends.
+    // Area-of-interest match — does the fix land inside any of the
+    // monitored target regions? A fix ANYWHERE ELSE is either a
+    // ghost basin (the local single-hop check would falsely pass it)
+    // or a vessel outside our scope. Either way we shouldn't claim
+    // a trustworthy position.
+    let inArea = null;
+    for (const a of AREAS_OF_INTEREST) {
+      if (gcDistanceKm(pos, a.gps) <= a.radiusKm) { inArea = a.id; break; }
+    }
+    // "trusted" requires:
+    //   · q ≥ 4 (residual is meaningful)
+    //   · all receivers within band's single-hop range (no multi-hop
+    //     timing ambiguity)
+    //   · all receivers above the 500 km near-field floor
+    //   · solved position falls inside a defined area-of-interest
+    //     (forces ghost-basin solves outside the monitored zone to
+    //      be tier="tentative")
     const tier = !confirmed ? "preliminary"
-              : (allSingleHop && allAboveFloor) ? "trusted"
+              : (allSingleHop && allAboveFloor && inArea) ? "trusted"
               : "tentative";
 
     // Note: xcorr peak prominence (`minProminence`) is reported in the
@@ -571,6 +597,8 @@ export class TDOADO {
         nearestReceiverKm: Number.isFinite(nearestRxKm) ? +nearestRxKm.toFixed(0) : null,
         allReceiversSingleHop: allSingleHop,
         allReceiversAboveFloor: allAboveFloor,
+        // Which area-of-interest contains the fix (if any).
+        inAreaOfInterest: inArea,
       },
       packetGpsNs: ref.packetGpsNs.toString(),
       broadcastMs: Date.now(),
