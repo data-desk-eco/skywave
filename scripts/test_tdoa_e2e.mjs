@@ -14,7 +14,7 @@
 //
 // Run:  node scripts/test_tdoa_e2e.mjs [--trials N] [--jitter 0.3]
 
-import { geodist, C } from "../worker/src/tdoa.js";
+import { geodist, slantDistance, C } from "../worker/src/tdoa.js";
 import { TDOADO } from "../worker/src/tdoa-do.js";
 
 const args = process.argv.slice(2);
@@ -111,7 +111,10 @@ function mockState() {
 
 function runTrial(txGps, rng) {
   const base = makeBurst(200, mulberry32(0xD5C));
-  const arrivals = receivers.map(r => geodist(r.gps, txGps) / C);
+  // Use the same skywave propagation model the production solver uses,
+  // so the synthetic test exercises the production path end-to-end
+  // (timing model + solver, not just geometry).
+  const arrivals = receivers.map(r => slantDistance(geodist(r.gps, txGps)) / C);
 
   // Assume the TX emitted the burst at absolute t = 0. Each receiver
   // picks a recording window starting ~0.5 s before its arrival, with

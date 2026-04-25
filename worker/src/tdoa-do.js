@@ -319,7 +319,7 @@ export class TDOADO {
     const TRIM_ITERS = 3, TRIM_MIN_COHORT = 4, TRIM_MEDIAN_MULTIPLE = 3;
     let workingDets = solverDets;
     let workingLags = lagsReport;
-    let sol = solveTdoa(workingDets);
+    let sol = solveTdoa(workingDets, { skywave: true });
     if (!sol) return null;
     let trimmedReceivers = [];
     for (let iter = 0; iter < TRIM_ITERS && workingDets.length > TRIM_MIN_COHORT; iter++) {
@@ -344,7 +344,7 @@ export class TDOADO {
       const droppedLag = workingLags[worstIdx];
       const nextDets = workingDets.filter((_, i) => i !== worstIdx);
       const nextLags = workingLags.filter((_, i) => i !== worstIdx);
-      const nextSol = solveTdoa(nextDets);
+      const nextSol = solveTdoa(nextDets, { skywave: true });
       // Only accept the trim if residual actually improves — a worst-
       // pair outlier that happens to be geometrically load-bearing can
       // leave the remaining receivers degenerate.
@@ -458,7 +458,7 @@ export class TDOADO {
       const looPositions = [];
       for (let drop = 0; drop < workingDets.length; drop++) {
         const subset = workingDets.filter((_, i) => i !== drop);
-        const sub = solveTdoa(subset);
+        const sub = solveTdoa(subset, { skywave: true });
         if (sub) looPositions.push([sub.lat, sub.lon]);
       }
       if (looPositions.length >= 3) {

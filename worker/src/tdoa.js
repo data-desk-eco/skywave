@@ -1,14 +1,32 @@
 // Pure TDOA math. Kept free of I/O so the same module can run in the
 // Worker and in a Node test script.
 //
-// Model: great-circle propagation at c. Real MF first-hop skywave adds
-// a path-length bias of tens of kilometres due to ionospheric reflection
-// height (~100 km ± 10 km at night). We accept that as a residual — this
-// file validates the pairing/correlation/solve geometry; ionospheric
-// correction is a follow-up.
+// Propagation model — skywave-aware. The signal doesn't travel along
+// a great-circle arc at c; it bounces off the F2 layer at h ≈ 250 km
+// in roughly 2000 km hops. The slant distance per hop is therefore
+// 2·sqrt((d_hop/2)² + h²), so for a 1000 km surface path the actual
+// signal travels 1118 km — 118 km of "iono bias". Long paths (e.g.
+// 6000 km via 3 hops) accumulate ~700 km of extra slant. Modelling
+// this correction is what lets the residual landscape distinguish
+// the true TX from the ghost-basin mirror; without it the solver
+// finds positions where the *straight-line* distances are consistent,
+// which doesn't match the bounce-path arrival times.
 
 export const C = 299792458;   // m/s
 export const EARTH_R = 6371000;
+const IONO_REFLECT_HEIGHT_M = 250000;   // F2 layer, mid-band HF average
+const IONO_HOP_LENGTH_M = 2000000;      // ~2000 km surface arc per hop
+
+// Slant (signal-path) distance for a great-circle surface distance d_m,
+// assuming multi-hop F2 reflection. Reduces to d_m + iono-bias for
+// d_m << HOP_LEN, and grows with the per-hop slant for long paths.
+export function slantDistance(d_m, h_m = IONO_REFLECT_HEIGHT_M) {
+  if (d_m <= 0) return 0;
+  const nHops = Math.max(1, Math.ceil(d_m / IONO_HOP_LENGTH_M));
+  const dPerHop = d_m / nHops;
+  const slantPerHop = 2 * Math.sqrt((dPerHop / 2) ** 2 + h_m * h_m);
+  return nHops * slantPerHop;
+}
 
 // Great-circle distance (m) between two [lat, lon] points in degrees.
 export function geodist(a, b) {
@@ -90,11 +108,21 @@ export function solveTdoa(dets, opts = {}) {
   const latMin = Math.min(...lats) - pad, latMax = Math.max(...lats) + pad;
   const lonMin = Math.min(...lons) - pad, lonMax = Math.max(...lons) + pad;
 
+  // Skywave-aware residual: convert each great-circle distance into
+  // its multi-hop slant distance via slantDistance() before computing
+  // expected arrival-time differences. Without this correction the
+  // solver finds positions whose straight-line distances satisfy the
+  // observed arrival times — which is *not* the same set as the
+  // true positions when signals are propagating via F2 hops. Opt-in
+  // (`opts.skywave: true`) so synthetic tests that generate timings
+  // from straight-line propagation continue to validate the geometry
+  // independent of the propagation model.
+  const dist = opts.skywave ? (a, b) => slantDistance(geodist(a, b)) : geodist;
   const resid = (la, lo) => {
-    const d0 = geodist([la, lo], ref.gps);
+    const d0 = dist([la, lo], ref.gps);
     let s = 0;
     for (let k = 1; k < dets.length; k++) {
-      const dk = geodist([la, lo], dets[k].gps);
+      const dk = dist([la, lo], dets[k].gps);
       const err = (dk - d0) / C - obsDts[k];
       s += err * err;
     }
