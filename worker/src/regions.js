@@ -64,7 +64,8 @@ export const REGIONS = [
   // and the FJELD SVEA-class long-path HF that we've already seen
   // produce ~20 km fixes.
   { id: "sea-pac", name: "SE Asia / W Pacific", bbox: null,
-    target: { gps: [10.0, 125.0], radiusKm: 10000, cohortSize: 8 } },
+    target: { gps: [10.0, 125.0], radiusKm: 10000, cohortSize: 8,
+              monitoringRadiusKm: 3000 } },
   // Tight Europe / North Sea — the methodology's best-case geometry
   // on the public KiwiSDR fleet. Dense coverage surrounding a 2500 km
   // circle centred on the North Sea (max bearing gap 95°, avg baseline

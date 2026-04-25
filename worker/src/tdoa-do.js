@@ -23,9 +23,18 @@ import { REGIONS } from "./regions.js";
 // the propagation regime checks also pass); a fix outside ALL of
 // them is by construction either a ghost basin or a vessel we
 // weren't targeting, neither of which we want to claim accuracy for.
+//
+// `target.radiusKm` is the COHORT pick radius (where receivers can
+// live, often big — sea-pac is 10000 km). For the trust area we use
+// `target.monitoringRadiusKm` if set, else min(target.radiusKm, 3000)
+// — the actual scale of the area we're claiming to localise vessels in.
 const AREAS_OF_INTEREST = REGIONS
   .filter((r) => r.target)
-  .map((r) => ({ id: r.id, gps: r.target.gps, radiusKm: r.target.radiusKm }));
+  .map((r) => ({
+    id: r.id,
+    gps: r.target.gps,
+    radiusKm: r.target.monitoringRadiusKm ?? Math.min(r.target.radiusKm, 3000),
+  }));
 
 // Two-tier quorum: 3-receiver fixes are exactly-determined in 2D, so
 // `residualKm` is meaningless there — they can still be correct but
