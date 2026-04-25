@@ -113,9 +113,19 @@ export class TDOADO {
     // In-memory gate counters for observability. Not persisted — they
     // reset when the DO evicts, which is fine for tuning sessions.
     this.rejections = {};
+    // Per-MMSI history of recent fix positions, last 60 minutes.
+    // Used to compute "consistency" — does this MMSI's TDOA solve
+    // cluster at the same location across multiple INDEPENDENT
+    // bursts? A real ship (or static coast station) gives consistent
+    // positions, while ghost-basin solves jump around as different
+    // cohorts hear different bursts. Persisted so consistency
+    // signal survives DO eviction.
+    this.mmsiHistory = new Map();   // mmsi → [{ts, lat, lon, q}, ...]
     this.state.blockConcurrencyWhile(async () => {
       this.recentDets   = (await this.state.storage.get("recentDets"))   || [];
       this.recentSolves = (await this.state.storage.get("recentSolves")) || [];
+      const persistedHistory = (await this.state.storage.get("mmsiHistory")) || {};
+      this.mmsiHistory = new Map(Object.entries(persistedHistory));
     });
   }
 
@@ -490,6 +500,10 @@ export class TDOADO {
         ellipseSemiMinorKm: ellipse ? +ellipse.semiMinorKm.toFixed(0) : null,
         ellipseOrientationDeg: ellipse ? +ellipse.orientationDeg.toFixed(0) : null,
         ellipseAxisRatio: ellipse ? +ellipse.axisRatio.toFixed(1) : null,
+        // basinAmbiguity: ratio of 2nd-best to best basin residual.
+        // <1.5 means a ghost basin is roughly equally plausible.
+        basinAmbiguity: sol.basinAmbiguity != null
+          ? +sol.basinAmbiguity.toFixed(2) : null,
       },
       packetGpsNs: ref.packetGpsNs.toString(),
       broadcastMs: Date.now(),
@@ -497,6 +511,9 @@ export class TDOADO {
   }
 
   _broadcast(msg) {
+    // Append to per-MMSI history before broadcasting so the
+    // consistency metric reflects the current solve too.
+    this._updateMmsiHistory(msg);
     const payload = JSON.stringify(msg);
     for (const ws of this.state.getWebSockets()) {
       try { ws.send(payload); } catch (_) {}
@@ -514,6 +531,55 @@ export class TDOADO {
       this.recentSolves.splice(0, this.recentSolves.length - 100);
     }
     this.state.storage.put("recentSolves", this.recentSolves).catch(() => {});
+  }
+
+  // Track per-MMSI fix history and compute multi-burst consistency.
+  // We keep one entry per packetGpsNs (so multiple broadcasts from
+  // the same burst, as receivers arrive, count as one independent
+  // observation). 60-minute window, max 20 entries per MMSI.
+  _updateMmsiHistory(msg) {
+    const mmsi = msg.mmsi;
+    if (!mmsi) return;
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    let history = this.mmsiHistory.get(mmsi) || [];
+    history = history.filter((h) => h.ts >= cutoff);
+    // Replace existing entry for this packet (re-solves of the same
+    // burst at higher q tighten the position and overwrite).
+    const packetGpsNs = msg.packetGpsNs;
+    history = history.filter((h) => h.packetGpsNs !== packetGpsNs);
+    history.push({
+      ts: msg.broadcastMs,
+      packetGpsNs,
+      lat: msg.position.lat,
+      lon: msg.position.lon,
+      quorum: msg.quorum,
+    });
+    if (history.length > 20) history = history.slice(-20);
+    this.mmsiHistory.set(mmsi, history);
+    // Compute consistency: median pairwise distance between *distinct
+    // bursts* in history. Single-burst MMSIs get null — there's no
+    // multi-burst signal yet.
+    const distinctBursts = history.length;
+    if (distinctBursts >= 2) {
+      const dists = [];
+      for (let i = 0; i < history.length; i++) {
+        for (let j = i + 1; j < history.length; j++) {
+          dists.push(gcDistanceKm([history[i].lat, history[i].lon],
+                                  [history[j].lat, history[j].lon]));
+        }
+      }
+      dists.sort((a, b) => a - b);
+      const medianKm = dists[Math.floor(dists.length / 2)];
+      msg.history = {
+        bursts: distinctBursts,
+        medianPairwiseKm: +medianKm.toFixed(0),
+      };
+    } else {
+      msg.history = { bursts: 1, medianPairwiseKm: null };
+    }
+    // Persist (best-effort).
+    this.state.storage.put("mmsiHistory",
+      Object.fromEntries(this.mmsiHistory)).catch(() => {});
   }
 
   _logDetection(det) {

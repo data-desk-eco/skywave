@@ -15,6 +15,37 @@ const start = rows.find(r => r.kind === "start");
 const end = rows.find(r => r.kind === "end");
 const solves = rows.filter(r => r.kind === "solve");
 
+// Group broadcasts by MMSI. Multiple broadcasts of the same MMSI within
+// ~5 s are re-solves of the same burst as more receivers arrive — their
+// trajectory convergence is a strong self-validation signal: a real
+// solve tightens monotonically; a ghost-basin solve wanders.
+const broadcasts = new Map();   // mmsi → [solve, ...] sorted by quorum
+for (const s of solves) {
+  if (!broadcasts.has(s.mmsi)) broadcasts.set(s.mmsi, []);
+  broadcasts.get(s.mmsi).push(s);
+}
+for (const arr of broadcasts.values()) arr.sort((a, b) => a.quorum - b.quorum);
+
+const gcKm = (a, b) => {
+  const R = 6371, la1 = a[0]*Math.PI/180, la2 = b[0]*Math.PI/180;
+  const dla = la2 - la1, dlo = (b[1]-a[1])*Math.PI/180;
+  return 2*R*Math.asin(Math.sqrt(Math.sin(dla/2)**2 + Math.cos(la1)*Math.cos(la2)*Math.sin(dlo/2)**2));
+};
+
+// Convergence metric: max distance between any two consecutive-q
+// broadcasts of the same MMSI. Low = stable solve as receivers
+// arrived. High = wandering, suggests the solver is finding different
+// basins as the cohort grows.
+function convergenceKm(arr) {
+  if (arr.length < 2) return null;
+  let maxJump = 0;
+  for (let i = 1; i < arr.length; i++) {
+    const d = gcKm(arr[i-1].tdoa, arr[i].tdoa);
+    if (d > maxJump) maxJump = d;
+  }
+  return maxJump;
+}
+
 // Deduplicate by MMSI — keep the broadcast with the highest quorum
 // (later re-solves typically tighten the answer).
 const byMmsi = new Map();
@@ -23,6 +54,12 @@ for (const s of solves) {
   if (!cur || (s.quorum || 0) > (cur.quorum || 0)) byMmsi.set(s.mmsi, s);
 }
 const distinct = [...byMmsi.values()];
+// Attach the convergence metric to each MMSI's chosen broadcast.
+for (const s of distinct) {
+  const arr = broadcasts.get(s.mmsi) || [];
+  s._conv_km = convergenceKm(arr);
+  s._n_broadcasts = arr.length;
+}
 
 console.log(`# Source: ${path}`);
 if (start) console.log(`# Started: ${start.startedAt}, region=${start.region}`);
@@ -78,10 +115,29 @@ if (residSorted.length) {
   console.log(`# Solver residual_km  p50=${f(0.5)}  p90=${f(0.9)}  max=${f(0.99)}`);
 }
 
+// Convergence breakdown across all multi-broadcast MMSIs
+const multi = distinct.filter(s => s._n_broadcasts >= 2);
+if (multi.length) {
+  const convs = multi.map(s => s._conv_km).filter(Number.isFinite).sort((a, b) => a - b);
+  const f = q => convs[Math.floor(convs.length * q)]?.toFixed(0);
+  console.log();
+  console.log(`# Multi-broadcast MMSIs: ${multi.length}/${distinct.length}.  q-trajectory jump km  p50=${f(0.5)} p90=${f(0.9)} max=${f(0.99)}`);
+  // Cross-tab: convergence vs AIS-truth
+  const stableAccurate = multi.filter(s => s._conv_km < 50 && s.delta_km < 200 && (s.implied_kn ?? 0) < 60).length;
+  const stableWrong = multi.filter(s => s._conv_km < 50 && (s.implied_kn ?? 0) > 60).length;
+  const wanderingAccurate = multi.filter(s => s._conv_km > 200 && s.delta_km < 200 && (s.implied_kn ?? 0) < 60).length;
+  const wanderingWrong = multi.filter(s => s._conv_km > 200 && (s.implied_kn ?? 0) > 60).length;
+  console.log(`# Convergence vs AIS truth (multi-broadcast subset):`);
+  console.log(`#   stable convergence (<50 km jump) + accurate AIS:    ${stableAccurate}`);
+  console.log(`#   stable convergence (<50 km jump) + wrong AIS:       ${stableWrong}`);
+  console.log(`#   wandering (>200 km jump) + accurate AIS:            ${wanderingAccurate}`);
+  console.log(`#   wandering (>200 km jump) + wrong AIS:               ${wanderingWrong}`);
+}
+
 // Detail table
 console.log();
 console.log("# Per-MMSI detail (highest-q broadcast):");
-console.log("  q  resid_km  Δkm     Δh   speed_kn  mmsi        vessel              tdoa_pos");
+console.log("  q  n  conv_km  resid_km  Δkm     Δh   speed_kn  mmsi        vessel              tdoa_pos");
 for (const s of distinct.sort((a, b) => (a.delta_km ?? 1e9) - (b.delta_km ?? 1e9))) {
   // Only mark as OK when both close-in km AND a plausible implied speed
   // given AIS staleness. A 200 km delta over 30s of stale AIS implies
@@ -92,7 +148,9 @@ for (const s of distinct.sort((a, b) => (a.delta_km ?? 1e9) - (b.delta_km ?? 1e9
              : s.delta_km < 500 ? "  ~ ok "
              : "  …    ";   // far but stale enough to be plausible movement
   console.log(
-    `${flag}${String(s.quorum).padStart(2)}  ${String(s.tdoa_resid_km?.toFixed(0) ?? "-").padStart(6)}  ` +
+    `${flag}${String(s.quorum).padStart(2)}  ${String(s._n_broadcasts).padStart(1)}  ` +
+    `${String(s._conv_km?.toFixed(0) ?? "-").padStart(6)}  ` +
+    `${String(s.tdoa_resid_km?.toFixed(0) ?? "-").padStart(6)}  ` +
     `${String(s.delta_km?.toFixed(0) ?? "-").padStart(5)}  ${String(s.delta_hours?.toFixed(2) ?? "-").padStart(5)}  ` +
     `${String(s.implied_kn?.toFixed(0) ?? "-").padStart(7)}   ` +
     `${String(s.mmsi).padStart(10)}  ${String(s.vessel_name || s.ais_reason || "-").slice(0,18).padEnd(18)}  ` +

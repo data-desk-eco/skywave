@@ -100,11 +100,17 @@ export function solveTdoa(dets, opts = {}) {
   const ref = dets[0];
   const obsDts = dets.map(d => d.t - ref.t);  // shared clock; diffs only
 
-  // Search area: bbox of receivers expanded by `pad` degrees. For MF
-  // first-hop skywave (≲2000 km from any receiver) a 15° pad is ample.
+  // Search area: bbox of receivers expanded by `pad` degrees. The
+  // 15° default works for surround geometries where the TX is inside
+  // the receiver hull, but one-sided cohorts (all receivers in Europe,
+  // ship in Asia) need a much wider search to even discover the true
+  // basin — otherwise the solver finds only the "European ghost" of
+  // an Asian transmitter. 60° gives ~6500 km of pad which covers all
+  // practical HF skip distances. Cost is quadratic in nCoarse, so we
+  // also bump nCoarse to keep grid cells reasonable (~70 km).
   const lats = dets.map(d => d.gps[0]);
   const lons = dets.map(d => d.gps[1]);
-  const pad = opts.padDeg ?? 15;
+  const pad = opts.padDeg ?? 60;
   const latMin = Math.min(...lats) - pad, latMax = Math.max(...lats) + pad;
   const lonMin = Math.min(...lons) - pad, lonMax = Math.max(...lons) + pad;
 
@@ -129,9 +135,13 @@ export function solveTdoa(dets, opts = {}) {
     return s;
   };
 
-  // Phase 1: coarse sweep. Keep top-K candidates.
-  const nCoarse = opts.coarseN ?? 81;
-  const topK = opts.topK ?? 6;
+  // Phase 1: coarse sweep. Keep top-K candidates. Grid cell ≈
+  // (latMax-latMin)/(nCoarse-1). With pad=60 the bbox can span 200°
+  // so 161 cells gives ~140 km cells in the worst case — still well
+  // below the 250 km timing-noise floor and tight enough to discover
+  // distinct basins.
+  const nCoarse = opts.coarseN ?? 161;
+  const topK = opts.topK ?? 8;
   const top = [];   // [{r, la, lo}, ...] sorted ascending by r
   for (let i = 0; i < nCoarse; i++) {
     const la = latMin + (latMax - latMin) * i / (nCoarse - 1);
@@ -152,6 +162,11 @@ export function solveTdoa(dets, opts = {}) {
     (lonMax - lonMin) / (nCoarse - 1),
   );
   let best = { r: Infinity, la: top[0].la, lo: top[0].lo };
+  // Track ALL refined basins so we can report the runner-up for
+  // ghost-basin detection. If basin #2 has a residual close to the
+  // best one but at a very different location, the cohort has a real
+  // ambiguity — even a low best-residual fix can't be trusted.
+  const refinedBasins = [];
   const refineN = opts.refineN ?? 21;
   const refineSteps = opts.refineSteps ?? 6;
   const shrink = opts.shrink ?? 0.3;
@@ -171,11 +186,38 @@ export function solveTdoa(dets, opts = {}) {
       la = localBest.la; lo = localBest.lo;
       range *= shrink;
     }
+    refinedBasins.push(localBest);
     if (localBest.r < best.r) best = localBest;
   }
 
+  // Find the second-best DISTINCT basin (>500 km from `best`, so we're
+  // not just measuring two refinements of the same minimum). Its
+  // residual relative to the best gives an ambiguity score: 1.0 means
+  // "two equally-good basins exist — fix is fundamentally ambiguous";
+  // ≫1 means "best basin is uniquely the lowest — trustworthy".
+  let runnerUpResid = null;
+  for (const cand of refinedBasins.sort((a, b) => a.r - b.r)) {
+    if (cand === best) continue;
+    const dKm = 2 * EARTH_R / 1000 * Math.asin(Math.min(1, Math.sqrt(
+      Math.sin((cand.la - best.la) * Math.PI / 360) ** 2
+        + Math.cos(best.la * Math.PI / 180) * Math.cos(cand.la * Math.PI / 180)
+        * Math.sin((cand.lo - best.lo) * Math.PI / 360) ** 2,
+    )));
+    if (dKm > 500) { runnerUpResid = cand.r; break; }
+  }
+  const ambiguity = runnerUpResid != null && best.r > 0
+    ? Math.sqrt(runnerUpResid / best.r)
+    : null;
+
   const rmsTimeErr = Math.sqrt(best.r / Math.max(1, dets.length - 1));
-  return { lat: best.la, lon: best.lo, residualKm: rmsTimeErr * C / 1000 };
+  return {
+    lat: best.la,
+    lon: best.lo,
+    residualKm: rmsTimeErr * C / 1000,
+    // ratio of runner-up to best basin residual (in time-rms units).
+    // 1.0 = ambiguous (ghost basin equally plausible), ≥2 = clear winner.
+    basinAmbiguity: ambiguity,
+  };
 }
 
 // Position uncertainty from cohort geometry. Linearises the TDOA
