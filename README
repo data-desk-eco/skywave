@@ -1,5 +1,5 @@
-Skywave — live DSC monitor
-==========================
+Skywave — live DSC monitor + ground-wave TDoA
+=============================================
 
 A browser-native view onto the routine maritime radio traffic almost
 nobody reads anymore. Skywave picks dozens of public KiwiSDRs around
@@ -8,21 +8,34 @@ Calling channels (MF 2187.5 kHz and five HF frequencies), decodes every
 burst, dedupes across receivers, and prints the result as a scrolling
 table of who's calling whom, from where, about what.
 
+For target regions where enough KiwiSDRs cluster around the same patch
+of sea, Skywave also runs a TDOA solver: when ≥3 receivers hear the
+same DSC burst, the cross-correlated arrival times triangulate the
+transmitter's position to within tens of kilometres on MF.
+
 How it works: one Cloudflare Durable Object per KiwiSDR channel holds
 the only upstream WebSocket, runs the decoder at the edge, and fans
 decoded calls out to every browser attached to it. One listener on
 each channel, forever, serving everyone who turns up — regardless of
-how many people land on the page. See `PLAN.md` for the design
+how many people land on the page. See `CLAUDE.md` for the design
 narrative and `worker/src/` for the code.
 
 
 Using it
 --------
 
-Open the page. The gateway composes a rack of ~48 KiwiSDRs covering
-the six DSC channels in the selected region and the browser attaches
-to each. The top-right dropdown narrows the scan — NW Europe, the
-Mediterranean, US East Coast, and so on.
+Open the page. The gateway composes a rack of KiwiSDRs covering the
+relevant DSC channels for the selected region and the browser attaches
+to each. The top-right dropdown narrows the scan:
+
+* **ALL** — global rack (96 slots across 6 DSC bands).
+* **ENGCH** — English Channel target cohort (35 MF receivers within
+  400 km of (50°N, 0°E) — the methodology's best-case geometry, where
+  TDOA fixes are reliably accurate within 50 km).
+* **NAT, BSK, SEAP, PG** — long-baseline target cohorts for the North
+  Atlantic, Black Sea, SE Asia / W Pacific, Persian Gulf. Useful for
+  watching DSC traffic in those areas; TDOA fixes from these are
+  multi-hop skywave and not as reliable.
 
 Audio stays silent between transmissions. When a DSC FSK burst is
 detected on one of the receivers we're listening to, the strongest
@@ -31,7 +44,8 @@ the protocol the first time it happens, which is the fun bit.
 
 Click a row to expand: decoder internals, the full list of receivers
 that heard the call, and a mini-map showing where those receivers sit
-along with the vessel's last known position.
+along with the vessel's last known position. When TDOA solves a burst,
+the fix is rendered as a circle on the map (radius = solver residual).
 
 Vessel enrichment uses Global Fishing Watch's public search + tracks
 endpoints, proxied through the Cloudflare Worker. Ship name, flag,
@@ -43,24 +57,26 @@ Rack selection
 --------------
 
 Out of the ~900 public KiwiSDRs, the picker keeps the ones that are
-actually worth listening to:
+worth listening to:
 
 * **Active & reachable** — self-reports `status=active`, list entry
   refreshed within the last hour, doesn't IP-blacklist Cloudflare's
   egress ranges.
-* **Coastal** — within 8° of a major port / chokepoint anchor. DSC is
-  a maritime service; inland receivers rarely hear anything.
-* **Healthy** — the receiver's self-reported SNR is ≥ 15 dB; the
-  antenna description gets a small boost when it mentions a known-
-  broadband design (loop, dipole, T2FD, Beverage).
+* **GPS-equipped & fixing** — TDOA needs per-frame GNSS timestamps
+  for the shared time base (`fixes_hour ≥ 100`).
+* **Coastal** (bbox picker only) — within 8° of a major port /
+  chokepoint anchor. Target picks don't filter on coast; they
+  already constrain by a centroid + radius.
 * **Considerate** — ≥ 2 free user slots so a human listener always
   has one spare. Skywave never squats the last slot.
-* **Geographically diverse** — same-band picks are ≥ 3° apart, and
-  any single receiver is capped at 2 bands, so the rack spreads
-  across the region's coastline instead of stacking on one port.
 
-Scoring is `freeSlots × coastalProximity × snrBonus × antennaBonus`,
-greedy pick across 6 DSC bands × 8 slots each = 48 total (cap 60).
+Cohort selection differs between bbox and target picks. Bbox uses
+`freeSlots × coastalProximity × snrBonus × antennaBonus` greedy
+across 6 DSC bands × ~16 slots each = 96 total. Target picks for
+ground-wave-only regions take the closest receiver in each compass
+octant, then top up with the next-closest unpicked, site-deduped at
+5 km. Surround-mode targets (HF skywave) replicate one octant pick
+across all 6 bands. See `CLAUDE.md` for the methodology in detail.
 
 
 Etiquette
@@ -70,7 +86,8 @@ Public KiwiSDR receivers have a limited number of user slots. The
 Worker holds exactly one connection per channel per receiver —
 `ident_user=skywave shared listener` — no matter how many humans are
 viewing. A ReceiverDO tears itself down five minutes after the last
-subscriber disconnects, so a quiet region stops squatting slots.
+subscriber disconnects, so a quiet region stops squatting slots. The
+≥ 2 free slots filter ensures we never take the last available slot.
 
 
 Repo layout
@@ -87,14 +104,22 @@ Repo layout
     worker/            Cloudflare Worker + Durable Objects
       wrangler.toml    DO bindings + migrations
       src/
-        index.js       router: /v2/rack, /v2/slot, /gfw(/tracks), /receivers
-        directory-do.js  rack composer + receiver-list refresh
-        receiver-do.js   per-channel KiwiSDR listener + decoder + fanout
-        kiwi-upstream.js server-side KiwiSDR WS client
-        dsc.js           ITU-R M.493 decoder
-        regions.js       BANDS + bboxes + coastal anchors + pickRack
-        location-hint.js GPS → Cloudflare locationHint
-    PLAN.md            the v2 design narrative (shipped)
+        index.js          router: /v2/rack, /v2/slot, /v2/tdoa/*, /gfw…
+        directory-do.js   rack composer + receiver-list refresh
+        receiver-do.js    per-channel KiwiSDR listener + decoder + fanout
+        kiwi-upstream.js  server-side KiwiSDR WS client (IQ mode)
+        dsc.js            ITU-R M.493 decoder
+        regions.js        BANDS + bboxes + target regions + pickers
+        tdoa.js           solver math: xcorr + solveTdoa (geodesic)
+        tdoa-do.js        TDOADO: bucket → cross-correlate → solve
+        location-hint.js  GPS → Cloudflare locationHint
+    scripts/           offline validation + live testing
+      test_tdoa.mjs            synthetic geometry — p50 ≈ 1.6 km
+      test_tdoa_e2e.mjs        synthetic through coordinator — p50 ≈ 1.1 km
+      tdoa_watch.mjs           live capture + GFW/LSEG ground truth
+      analyse_solves.mjs       offline analyser for watch JSONL
+      global_chokepoints.mjs   feasibility sweep — where can we run this?
+      inject_tdoa*.mjs         synthetic injection at /v2/tdoa/inject
 
 
 Local development
@@ -114,6 +139,17 @@ dev URL (e.g. `http://127.0.0.1:8787`) if you want local end-to-end.
 
 Add `?debug=1` to the page URL for verbose console logging.
 
+Run a live capture:
+
+    node scripts/tdoa_watch.mjs --region english-channel --duration 1800 \
+        --out /tmp/capture.jsonl --no-ais
+    # then:
+    node scripts/analyse_solves.mjs /tmp/capture.jsonl
+
+Find new feasible target regions:
+
+    node scripts/global_chokepoints.mjs
+
 
 Credits & research
 ------------------
@@ -121,4 +157,6 @@ Credits & research
 Decoder ported from the Data Desk research repo at
 `~/Research/dsc-triangulation`. Original Python reference:
 `scripts/dsc_decode_ddesk.py`. Canonical .NET reference:
-`vendor/TAOSW.DSC_Decoder.Core/GMDSSDecoder.cs`.
+`vendor/TAOSW.DSC_Decoder.Core/GMDSSDecoder.cs`. KiwiSDR practitioner
+consensus on TDoA: HF Underground topic 117872 (ground-wave is what
+actually works on the public fleet).

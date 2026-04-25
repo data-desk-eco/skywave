@@ -13,12 +13,25 @@ export const REGION_STORAGE_KEY = "skywave.region";
 // positioned for solid TDOA geometry around a specific patch of sea.
 // Add future presets here as they prove out.
 export const REGIONS = [
-  { id: "global",          name: "ALL",  bbox: null                   },
-  { id: "english-channel", name: "ENGCH",bbox: [46, -8,  54,   8]    },
-  { id: "sea-pac",         name: "SEAP", bbox: [-35, 95,  35, 155]    },
-  { id: "black-sea",       name: "BSK",  bbox: [40,  25,  48,  42]    },
-  { id: "n-atlantic",      name: "NAT",  bbox: [28, -65,  60,   2]    },
-  { id: "persian-gulf",    name: "PG",   bbox: [20,  48,  32,  62]    },
+  { id: "global",             name: "ALL",   bbox: null                   },
+  // Tier-1 ground-wave MF TDOA targets — sub-100 km fix accuracy
+  // achievable, validated against AIS.
+  { id: "english-channel",    name: "ENGCH", bbox: [46, -8,  54,   8]    },
+  // Tier-2 ground-wave MF targets — surround geometry not as tight as
+  // English Channel but each has 15+ distinct receivers within 400 km
+  // for a viable cohort.
+  { id: "ny-harbour",         name: "NY",    bbox: [38, -76,  43, -71]   },
+  { id: "kattegat",           name: "KAT",   bbox: [54,  10,  58,  14]   },
+  { id: "chesapeake",         name: "CHES",  bbox: [35, -78,  39, -74]   },
+  { id: "ligurian",           name: "LIG",   bbox: [42,   6,  46,  11]   },
+  { id: "western-approaches", name: "WAPP",  bbox: [48,  -8,  52,  -3]   },
+  // Long-baseline (HF skywave) target cohorts. TDOA fixes from these
+  // are not as reliable but the rack is still useful for watching DSC
+  // traffic in the area.
+  { id: "sea-pac",            name: "SEAP",  bbox: [-35, 95,  35, 155]   },
+  { id: "black-sea",          name: "BSK",   bbox: [40,  25,  48,  42]   },
+  { id: "n-atlantic",         name: "NAT",   bbox: [28, -65,  60,   2]   },
+  { id: "persian-gulf",       name: "PG",    bbox: [20,  48,  32,  62]   },
 ];
 
 export function currentRegion() {

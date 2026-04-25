@@ -86,21 +86,59 @@ export const REGIONS = [
   // the rack to MF only (HF in the same area would mix in 1-3 hop
   // skywave from non-cohort regions of the world). Busiest shipping
   // lane on Earth → abundant DSC traffic + AIS ground truth.
-  { id: "english-channel", name: "English Channel (MF test)", bbox: null,
+  // English Channel — proving ground for ground-wave MF TDOA. Centroid
+  // (50, 0) sits between the south coast of England and Le Havre. The
+  // 400 km cohort radius pulls in 25-35 distinct MF receivers (after
+  // 5 km site dedup): max bearing gap ~60°, all within MF ground-wave
+  // range over salt water (~600 km). Live-validated against AIS:
+  // WHITCHALLENGER (UK tanker at anchor in the Solent) was solved at
+  // q=4/6/7 with fixes converging within 10 km of each other and
+  // 40-50 km of her actual position.
+  { id: "english-channel", name: "English Channel", bbox: null,
     target: {
-      gps: [50.0, 0.0],
-      radiusKm: 400,
-      // Take the whole available pool. Each KiwiSDR has some independent
-      // probability of missing each burst (RFI, scheduling, decoder
-      // race-conditions, worker upstream failures), and we need quorum=3
-      // *post-attrition* on every burst. The MIN_FREE_SLOTS_TO_JOIN=2
-      // etiquette filter still leaves a slot for human listeners on
-      // each KiwiSDR. Naturally limited by available candidates after
-      // site dedup; in practice ~25 distinct sites within 400 km of
-      // the centroid.
-      cohortSize: 40,
-      bands: [2187.5],
-      monitoringRadiusKm: 600,
+      gps: [50.0, 0.0], radiusKm: 400, cohortSize: 40, bands: [2187.5],
+    } },
+  // NY Harbour & approaches — second-tier feasibility per
+  // global_chokepoints.mjs. ~23 distinct MF sites surround New York
+  // Harbour out to 400 km; bearing gap 130° is wider than English
+  // Channel but still surround geometry. Channel approaches into
+  // Newark/JFK area are some of the world's busiest shipping lanes.
+  { id: "ny-harbour", name: "NY Harbour", bbox: null,
+    target: {
+      gps: [40.5, -74.0], radiusKm: 400, cohortSize: 40, bands: [2187.5],
+    } },
+  // Kattegat / Øresund — Danish & Swedish coastal MF receivers around
+  // the strait between Denmark and Sweden. ~15 distinct sites, bearing
+  // gap ~120°. Heavy shipping density (Baltic↔North Sea transits via
+  // the Great Belt and Øresund).
+  { id: "kattegat", name: "Kattegat / Øresund", bbox: null,
+    target: {
+      gps: [56.0, 12.0], radiusKm: 400, cohortSize: 40, bands: [2187.5],
+    } },
+  // Chesapeake & US Mid-Atlantic — DC/Virginia/NC coastal cluster.
+  // ~18 distinct sites surrounding the bay; bearing gap ~165°. Lots
+  // of military and commercial shipping (Norfolk navy base, Baltimore
+  // commercial, Charleston container).
+  { id: "chesapeake", name: "Chesapeake", bbox: null,
+    target: {
+      gps: [37.0, -76.0], radiusKm: 400, cohortSize: 40, bands: [2187.5],
+    } },
+  // Ligurian Sea — north-west Italian / Riviera coast. Surprise tier-2
+  // hit from the global sweep: ~28 distinct MF sites within 400 km of
+  // (44, 8.5), centred between Genoa and Marseille. Heavy commercial
+  // traffic (Genoa container port, Marseille, Livorno) plus Med
+  // ferry routes.
+  { id: "ligurian", name: "Ligurian Sea", bbox: null,
+    target: {
+      gps: [44.0, 8.5], radiusKm: 400, cohortSize: 40, bands: [2187.5],
+    } },
+  // Western Approaches — Cornwall + Brittany coast. ~19 MF sites,
+  // bearing gap ~120°. Watches the funnel where Atlantic shipping
+  // turns into the Channel and the Bay of Biscay (transatlantic
+  // routes, Bordeaux/Nantes traffic).
+  { id: "western-approaches", name: "Western Approaches", bbox: null,
+    target: {
+      gps: [50.0, -5.5], radiusKm: 400, cohortSize: 40, bands: [2187.5],
     } },
 ];
 
