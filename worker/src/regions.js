@@ -90,7 +90,15 @@ export const REGIONS = [
     target: {
       gps: [50.0, 0.0],
       radiusKm: 400,
-      cohortSize: 10,
+      // Take the whole available pool. Each KiwiSDR has some independent
+      // probability of missing each burst (RFI, scheduling, decoder
+      // race-conditions, worker upstream failures), and we need quorum=3
+      // *post-attrition* on every burst. The MIN_FREE_SLOTS_TO_JOIN=2
+      // etiquette filter still leaves a slot for human listeners on
+      // each KiwiSDR. Naturally limited by available candidates after
+      // site dedup; in practice ~25 distinct sites within 400 km of
+      // the centroid.
+      cohortSize: 40,
       bands: [2187.5],
       monitoringRadiusKm: 600,
     } },
@@ -406,7 +414,13 @@ function targetCandidates(receivers, target) {
     const free = Math.max(0, (parseInt(r.users_max, 10) || 0) - (parseInt(r.users, 10) || 0));
     if (free < MIN_FREE_SLOTS_TO_JOIN) continue;
     const snr = snrDb(r.snr);
-    if (snr != null && snr < MIN_SNR_DB) continue;
+    // Ground-wave-restricted target: skip the SNR floor. Self-reported
+    // SNR is a noise-floor measurement, not a DSC-decode predictor;
+    // close-in receivers with low list SNR (Brighton, Chichester) often
+    // decode MF DSC just fine, while distant high-SNR receivers can be
+    // silent due to upstream/antenna issues we can't see at pick time.
+    // For other targets keep the legacy filter.
+    if (!allowedBands && snr != null && snr < MIN_SNR_DB) continue;
     const bearing = bearingDegFrom(center, gps);
     out.push({
       host, port, gps, distKm, bearing, free, snr,
@@ -469,7 +483,12 @@ function pickSurroundCohort(candidates, octants = 6, maxPerOctant = 1) {
 // 1) and then top up with the next-closest unpicked (round 2). Result:
 // a tight cohort (~50-300 km from centroid) with reasonable bearing
 // spread when the receiver distribution allows it.
-const SITE_DEDUP_KM = 30;   // collapse multi-Kiwi sites within 30 km
+// Site dedup. Keep at 5 km — only collapse literal collocations (e.g.
+// the same operator running two KiwiSDR boxes side-by-side). Anything
+// further apart gives genuinely different timing, and *quantity of
+// independent decoders* matters more than perfect spread for hitting
+// quorum reliably.
+const SITE_DEDUP_KM = 5;
 
 function pickGroundWaveCohort(candidates, size) {
   if (!candidates.length) return [];
