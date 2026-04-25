@@ -87,6 +87,14 @@ const SINGLE_HOP_KM_BY_BAND = {
   HF12: 4500,
   HF16: 4500,
 };
+// Minimum receiver-to-solution distance for HF skywave geometry.
+// Practitioner consensus (HF Underground TDoA thread Sept 2023): when
+// a receiver is closer than ~500 km to the transmitter, ground-wave
+// dominates the skywave model the solver assumes and the per-pair
+// timing develops a near-field bias that pulls the fix off-target.
+// Receivers below this floor still contribute (they can hear the
+// burst!) but mark the tier as "tentative" rather than "trusted".
+const MIN_BASELINE_KM = 500;
 // Leave-one-out cross-validation: at q≥5 we re-solve N times, each
 // excluding one receiver. If the resulting positions agree (median
 // pairwise distance below this threshold), the cohort is internally
@@ -436,16 +444,23 @@ export class TDOADO {
     const effectiveDets = keptDets;
     const confirmed = effectiveDets.length >= CONFIRMED_MIN_RECEIVERS;
     let allSingleHop = confirmed;
+    let allAboveFloor = confirmed;
     let furthestRxKm = 0;
+    let nearestRxKm = Infinity;
     for (let i = 0; i < effectiveDets.length; i++) {
       const band = bandOf(effectiveDets[i].slotId);
       const dKm = gcDistanceKm(pos, effectiveDets[i].gps);
       if (dKm > furthestRxKm) furthestRxKm = dKm;
+      if (dKm < nearestRxKm) nearestRxKm = dKm;
       const limit = SINGLE_HOP_KM_BY_BAND[band];
       if (limit != null && dKm > limit) allSingleHop = false;
+      if (dKm < MIN_BASELINE_KM) allAboveFloor = false;
     }
+    // "trusted" requires both the upper bound (single-hop) AND the
+    // lower bound (no near-field receivers): the propagation geometry
+    // we're modelling is bounded on both ends.
     const tier = !confirmed ? "preliminary"
-              : allSingleHop ? "trusted"
+              : (allSingleHop && allAboveFloor) ? "trusted"
               : "tentative";
 
     // Note: xcorr peak prominence (`minProminence`) is reported in the
@@ -553,7 +568,9 @@ export class TDOADO {
         // length the solver implicitly assumed. <single-hop limit =
         // trusted regime; > = multi-hop, position less trustworthy.
         furthestReceiverKm: +furthestRxKm.toFixed(0),
+        nearestReceiverKm: Number.isFinite(nearestRxKm) ? +nearestRxKm.toFixed(0) : null,
         allReceiversSingleHop: allSingleHop,
+        allReceiversAboveFloor: allAboveFloor,
       },
       packetGpsNs: ref.packetGpsNs.toString(),
       broadcastMs: Date.now(),
