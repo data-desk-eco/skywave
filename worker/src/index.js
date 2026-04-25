@@ -6,6 +6,7 @@
 //   WS   /v2/slot/:host/:port/:bandKHz  → attach to a ReceiverDO
 //   GET  /gfw?query=<mmsi>              → GFW identity lookup (proxy)
 //   GET  /gfw/tracks?vesselId=          → GFW decimated 14-day AIS track
+//   GET  /lseg/track?mmsi=<mmsi>        → LSEG fresh AIS position (cached 30s)
 //   GET  /receivers                     → kiwisdr_com list as JSON
 //                                         (kept as a handy debug endpoint;
 //                                          no client code hits it since v2)
@@ -16,6 +17,7 @@ import { ReceiverDO } from "./receiver-do.js";
 import { DirectoryDO } from "./directory-do.js";
 import { TDOADO } from "./tdoa-do.js";
 import { locationHintFor } from "./location-hint.js";
+import { lsegLookupMmsi } from "./lseg.js";
 
 export { ReceiverDO, DirectoryDO, TDOADO };
 
@@ -156,6 +158,29 @@ async function gfwTracks(url) {
   });
 }
 
+async function lseg(url, env) {
+  const mmsi = url.searchParams.get("mmsi") || "";
+  if (!/^\d{9}$/.test(mmsi)) {
+    return new Response("bad mmsi", { status: 400, headers: CORS });
+  }
+  try {
+    const result = await lsegLookupMmsi(env, mmsi);
+    return new Response(JSON.stringify(result), {
+      headers: {
+        "content-type": "application/json",
+        // Browser-side cache: 30 s matches the worker-side position cache.
+        "cache-control": "public, max-age=30",
+        ...CORS,
+      },
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e.message || e) }), {
+      status: 502,
+      headers: { "content-type": "application/json", ...CORS },
+    });
+  }
+}
+
 // -------------------------------------------------------------------
 // v2 routing — DirectoryDO (rack composition) + ReceiverDO (per-slot WS)
 // -------------------------------------------------------------------
@@ -238,6 +263,7 @@ export default {
     if (url.pathname === "/receivers") return receivers();
     if (url.pathname === "/gfw") return gfw(url);
     if (url.pathname === "/gfw/tracks") return gfwTracks(url);
+    if (url.pathname === "/lseg/track") return lseg(url, env);
 
     return new Response(
       "skywave gateway · /v2/rack · /v2/slot/:host/:port/:band · /gfw · /gfw/tracks · /receivers",

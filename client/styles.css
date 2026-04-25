@@ -294,6 +294,9 @@ body.tdoa-only .call:not(.has-tdoa) { display: none; }
 }
 .tdoa-fix .tdoa-coord { color: var(--fg); font-weight: 700; }
 .tdoa-fix .tdoa-meta  { color: var(--dim); font-size: 11px; }
+/* Δ vs fresh AIS (LSEG) — accuracy quote alongside the fix. */
+.tdoa-fix .tdoa-ais   { color: var(--accent); font-size: 11px; }
+.tdoa-fix .tdoa-ais::before { content: "↪ "; color: var(--dim); }
 /* Preliminary (3-receiver) fixes. No residual self-check possible, so
    the UI marks them as lower-confidence — hollow diamond, slight dim. */
 .tdoa-fix.prelim { opacity: 0.75; }

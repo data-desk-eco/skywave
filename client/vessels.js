@@ -193,8 +193,46 @@ export const Vessels = (() => {
       .catch(() => null);
   }
 
+  // Fresh AIS position via LSEG. Independent of the GFW lookup chain
+  // because LSEG returns minute-fresh positions while GFW lastPos can
+  // be days stale. Result merged into the same vessel info so the
+  // existing onUpdate listeners pick it up; key field is `aisLive`
+  // so legacy GFW lastPos isn't accidentally overwritten.
+  const liveAisPending = new Set();
+  const liveAisCacheMs = new Map();   // mmsi → last fetch wall-clock time
+  const LIVE_AIS_TTL_MS = 30_000;
+  function liveAis(mmsi) {
+    if (!/^\d{9}$/.test(mmsi || "")) return;
+    if (liveAisPending.has(mmsi)) return;
+    const last = liveAisCacheMs.get(mmsi) || 0;
+    if (Date.now() - last < LIVE_AIS_TTL_MS) return;     // server-side cached too
+    if (!GATEWAY) return;
+    liveAisPending.add(mmsi);
+    fetch(`${GATEWAY}/lseg/track?mmsi=${mmsi}`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => {
+        if (!data || data.error || !Number.isFinite(data.lat) || !Number.isFinite(data.lon)) return;
+        const info = cache.get(mmsi) || {};
+        info.aisLive = {
+          lat: data.lat, lon: data.lon, ts: data.ts,
+          name: data.name, speed: data.speed, dest: data.dest,
+        };
+        // Backfill identity fields if GFW didn't have them.
+        if (!info.name && data.name) info.name = data.name;
+        if (!info.flag && data.flag) info.flag = data.flag;
+        if (!info.imo && data.imo) info.imo = data.imo;
+        cache.set(mmsi, info);
+        liveAisCacheMs.set(mmsi, Date.now());
+        scheduleSave();
+        notify(mmsi, info);
+      })
+      .catch(() => {})
+      .finally(() => liveAisPending.delete(mmsi));
+  }
+
   return {
     lookup,
+    liveAis,
     get: (mmsi) => cache.get(mmsi) || null,
     onUpdate: (fn) => listeners.add(fn),
   };

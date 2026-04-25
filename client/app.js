@@ -11,9 +11,9 @@
 //      un-follow the others so the server doesn't waste bandwidth
 //      streaming PCM we'd never play.
 
-import { Vessels } from "./vessels.js?v=30";
-import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=30";
-import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=30";
+import { Vessels } from "./vessels.js?v=31";
+import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=31";
+import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=31";
 
 const DEBUG = /(\?|&)debug=1\b/.test(location.search);
 const AUDIO_LEAD_SEC = 0.25;
@@ -468,6 +468,9 @@ function connectTdoaFeed() {
     let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
     if (!msg || msg.t !== "tdoa" || !msg.mmsi || !msg.position) return;
     tdoaByMmsi.set(msg.mmsi, msg);
+    // Kick off a fresh-AIS lookup. LSEG returns minute-fresh positions,
+    // letting the UI render Δkm vs ground truth alongside the fix.
+    Vessels.liveAis(msg.mmsi);
     for (const entry of callIndex.values()) {
       if (entry.call.caller === msg.mmsi) renderTdoaInCard(entry, msg);
     }
@@ -527,12 +530,31 @@ function renderTdoaInCard(entry, tdoa) {
     const qualityMeta = isPrelim
       ? `max-gap ${tdoa.geometry?.maxBearingGapDeg?.toFixed(0) ?? "?"}°`
       : `±${residualKm.toFixed(1)} km`;
+    // Pull fresh AIS (LSEG) for ground-truth comparison if available.
+    const info = Vessels.get(entry.call.caller);
+    let aisLine = "";
+    if (info && info.aisLive) {
+      const a = info.aisLive;
+      const dKm = haversineKm(lat, lon, a.lat, a.lon);
+      const dt = a.ts ? (Date.now() - a.ts) / 60000 : null;
+      const dtTxt = dt == null ? "" : dt < 60 ? `${dt.toFixed(0)}m ago`
+                  : dt < 1440 ? `${(dt / 60).toFixed(1)}h ago` : `${(dt / 1440).toFixed(1)}d ago`;
+      aisLine = `<span class="tdoa-ais">vs AIS Δ ${dKm.toFixed(0)} km${dtTxt ? ` · ${dtTxt}` : ""}</span>`;
+    }
     tdoaEl.innerHTML =
       `<span class="tdoa-label">${label}</span>` +
       `<span class="tdoa-coord">${lat.toFixed(3)}°, ${lon.toFixed(3)}°</span>` +
-      `<span class="tdoa-meta">${qualityMeta} · q=${tdoa.quorum} · ${when}</span>`;
+      `<span class="tdoa-meta">${qualityMeta} · q=${tdoa.quorum} · ${when}</span>` +
+      aisLine;
   }
   if (entry._mapInited) setTdoaOnMiniMap(entry, tdoa);
+}
+
+function haversineKm(la1, lo1, la2, lo2) {
+  const R = 6371, p1 = la1 * Math.PI / 180, p2 = la2 * Math.PI / 180;
+  const dp = (la2 - la1) * Math.PI / 180, dl = (lo2 - lo1) * Math.PI / 180;
+  const h = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
 function updateHeard(entry) {
@@ -649,13 +671,18 @@ Vessels.onUpdate((mmsi, info) => {
   renderVessel(mmsi, info);
   if (!info) return;
   for (const entry of callIndex.values()) {
-    if (entry.call.caller !== mmsi || !entry._mapInited) continue;
-    if (info.lastPos) {
-      setVesselOnMiniMap(entry, info);
-    } else if (info.vesselId) {
-      const c = entry.row.querySelector(".mini-map");
-      if (c) c.classList.add("no-track");
+    if (entry.call.caller !== mmsi) continue;
+    if (entry._mapInited) {
+      if (info.lastPos) {
+        setVesselOnMiniMap(entry, info);
+      } else if (info.vesselId) {
+        const c = entry.row.querySelector(".mini-map");
+        if (c) c.classList.add("no-track");
+      }
     }
+    // If a TDOA fix already landed and now LSEG fresh AIS arrived, re-
+    // render the TDOA block so the Δ-vs-AIS line appears.
+    if (info.aisLive && entry.tdoa) renderTdoaInCard(entry, entry.tdoa);
   }
 });
 
