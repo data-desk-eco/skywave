@@ -3,16 +3,23 @@
 // Each ReceiverDO POSTs a detection here whenever its decoder locks on a
 // call. The record carries the receiver's GPS, a GPS-ns anchor at the
 // packet start, and a ~2 s audio snippet aligned to that anchor. We
-// bucket incoming detections by fuzzy MMSI + proximity on packetGpsNs;
-// when 3+ distinct hosts land in one bucket we cross-correlate their
-// snippets, feed the refined arrival times to solveTdoa, and broadcast
-// the position to every client on /subscribe.
+// bucket incoming detections by fuzzy MMSI + same band + proximity on
+// packetGpsNs; when 3+ distinct hosts land in one bucket we
+// cross-correlate their snippets, feed the refined arrival times to
+// solveTdoa, and broadcast the position to every client on /subscribe.
 //
-// Operating regime: ground-wave only. Cohort selection (regions.js,
-// `target.bands` restriction + tight `radiusKm`) keeps every receiver
-// inside MF ground-wave range of the area we're monitoring. Multi-hop
-// skywave is explicitly out of scope here — those fixes are dominated
-// by ionospheric path bias the solver isn't modelling.
+// Operating regime: any band, geometry-gated. Two propagation regimes
+// produce real fixes on the public KiwiSDR fleet:
+//   · MF ground-wave on a tight cohort (LIG / WAPP / english-channel /
+//     dover / etc.) — the cleanest physics, handful of cohorts where the
+//     fleet has the density to form quorum.
+//   · HF skywave on a globally-spread cohort — produces real fixes when
+//     the receiver geometry around the source is good (tight ellipse,
+//     low bearing gap), and produces clear ghosts when it isn't. The
+//     gates below separate the two well in live data.
+// Cross-band buckets are explicitly rejected at ingest: receivers on
+// different DSC bands hear different physical transmissions and the
+// xcorr between their snippets is noise.
 //
 // Routes:
 //   POST /detect      — from ReceiverDO (fire-and-forget)
@@ -21,24 +28,31 @@
 
 import { solveTdoa, xcorr, tdoaUncertainty, C } from "./tdoa.js";
 
-// Quorum tiers reflect overdetermination, not propagation regime:
-//   · q=3 → "preliminary": exactly-determined in 2D, residual is by
-//     construction zero — useful as presence info only.
-//   · q≥4 → "trusted":     residual is a real quality signal; broadcast
-//     unless it's above MAX_RESIDUAL_KM.
-const MIN_RECEIVERS = 3;
-const TRUSTED_MIN_RECEIVERS = 4;
+// q=4 minimum. q=3 is exactly determined in 2D, has a mirror ambiguity
+// that only q=4 breaks, and residual ≡ 0 by construction — too unreliable
+// to publish as a position. Decoded calls still surface in the table
+// (presence info); we just don't pretend we know where the source is.
+const MIN_RECEIVERS = 4;
 // Maximum solver RMS time residual, converted to km (c·Δt). With ~1 ms
 // KiwiSDR clock jitter and good ground-wave geometry the floor is
 // 100-200 km; 300 km admits all reasonable fixes while catching the
-// ghost-basin / bad-xcorr cases that produce 1000+ km residuals.
+// gross bad-xcorr cases that produce 1000+ km residuals. Belt-and-
+// suspenders against the ellipse gate — most ghosts have small residuals
+// because the wrong basin is internally self-consistent.
 const MAX_RESIDUAL_KM = 300;
 // Maximum bearing gap from the solved position to consecutive receivers
-// around the compass. >270° means all receivers are bunched in <90° of
-// the compass — degenerate geometry where any timing-noise pull
-// produces wildly different positions. The fix is fundamentally
-// unconstrained in the away-from-receivers direction.
-const MAX_BEARING_GAP_DEG = 270;
+// around the compass. >220° means receivers span less than 140° of the
+// compass — geometry degenerate enough that the fix is essentially
+// unconstrained in the away-from-receivers direction. Ghost basins on
+// HF skywave routinely sit at 230-247°.
+const MAX_BEARING_GAP_DEG = 220;
+// Maximum 1σ position-uncertainty ellipse semi-major (km), assuming
+// 1 ms per-receiver timing noise. This is the most discriminating
+// signal in live data: real fixes on both MF ground-wave and HF skywave
+// land at <600 km; ghost basins (one-sided cohort, near-singular Fisher
+// matrix) blow up to 1500-20000 km. 1000 km gives margin around the
+// real cluster while catching every ghost we've observed.
+const MAX_ELLIPSE_SEMI_MAJOR_KM = 1000;
 // Time window (on packetGpsNs) during which arrivals from different
 // receivers count as the same packet. Real MF-ground-wave TDOA is ≲4 ms
 // even for the longest baselines we'd consider; 2 s lets the
@@ -151,7 +165,7 @@ export class TDOADO {
     this._reap();
     this.state.storage.setAlarm(Date.now() + KEEPALIVE_MS).catch(() => {});
     const mmsi = det.call.caller ?? "?";
-    let b = this._findMatchingBucket(mmsi, det.packetGpsNs);
+    let b = this._findMatchingBucket(mmsi, det.band, det.packetGpsNs);
     if (!b) {
       b = { mmsi, firstSeenMs: det.receivedMs, dets: [] };
       if (!this.buckets.has(mmsi)) this.buckets.set(mmsi, []);
@@ -173,18 +187,20 @@ export class TDOADO {
       try { result = this._solveBucket(b); } catch (_) { return; }
       if (result) {
         result.quorum = result.receivers.length;
-        console.log(`tdoa/solve: mmsi=${b.mmsi} pos=${result.position.lat.toFixed(3)},${result.position.lon.toFixed(3)} resid=${result.position.residualKm.toFixed(1)}km q=${result.quorum} tier=${result.tier}`);
+        console.log(`tdoa/solve: mmsi=${b.mmsi} pos=${result.position.lat.toFixed(3)},${result.position.lon.toFixed(3)} resid=${result.position.residualKm.toFixed(1)}km q=${result.quorum} ellipse=${result.geometry.ellipseSemiMajorKm}km`);
         this._broadcast(result);
       }
     }
   }
 
-  _findMatchingBucket(mmsi, packetGpsNs) {
+  _findMatchingBucket(mmsi, band, packetGpsNs) {
     const spreadNs = BigInt(MAX_SPREAD_MS) * 1_000_000n;
     for (const list of this.buckets.values()) {
       for (let i = list.length - 1; i >= 0; i--) {
         const b = list[i];
         if (!mmsiCompatible(mmsi, b.mmsi)) continue;
+        // Same-band only: cross-band xcorr is noise (different transmissions).
+        if (b.dets[0].band !== band) continue;
         let minNs = b.dets[0].packetGpsNs, maxNs = minNs;
         for (const d of b.dets) {
           if (d.packetGpsNs < minNs) minNs = d.packetGpsNs;
@@ -217,8 +233,18 @@ export class TDOADO {
   //   feature at ref-sample F aligns with det-sample F+L → same wall
   //   time when  ref.startGpsNs + F/sr  =  det.startGpsNs + (F+L)/sr
   //   so the arrival-time delta t_det − t_ref = startDt + L/sr.
+  //
+  // The reference is the cohort's cleanest decode (highest mmsiQuality):
+  // every other receiver's snippet is correlated against it, so picking
+  // a noisy template (the old "first arrival" default) directly inflates
+  // the lag estimate noise on every other receiver.
   _solveBucket(bucket) {
-    const dets = bucket.dets;
+    const dets = [...bucket.dets];
+    const refIdx = dets.reduce(
+      (best, d, i) => mmsiQuality(d.call.caller) > mmsiQuality(dets[best].call.caller) ? i : best,
+      0,
+    );
+    if (refIdx !== 0) [dets[0], dets[refIdx]] = [dets[refIdx], dets[0]];
     const ref = dets[0];
     const refSR = ref.snippet.sampleRate;
 
@@ -254,18 +280,14 @@ export class TDOADO {
       return null;
     };
 
-    // 1. Residual gate. 300 km admits any fix consistent with ~1 ms
-    //    KiwiSDR clock jitter on tight ground-wave geometry; rejects
-    //    the bad-xcorr / ghost-basin cases that produce 1000+ km
-    //    residuals.
+    // 1. Residual gate. Belt-and-suspenders against bad xcorr lags;
+    //    most ghosts have small residuals (the wrong basin is
+    //    internally consistent) so this gate rarely fires alone.
     if (sol.residualKm > MAX_RESIDUAL_KM) return rej("residual");
 
-    // 2. Bearing-gap gate. Compute max angular gap between consecutive
-    //    receivers as seen from the solved position. Above 270° means
-    //    every receiver is bunched inside a 90° wedge of the compass —
-    //    degenerate geometry where any timing pull yields wildly
-    //    different positions in the away-from-receivers direction.
-    //    Cheapest-to-compute gate that actually catches ghost basins.
+    // 2. Bearing-gap gate. Cheap geometric proxy for one-sided cohorts.
+    //    Catches the worst wedge geometries (gap > 220°) before we
+    //    bother computing the ellipse.
     const bearings = solverDets
       .map((d) => bearingFromTo(pos, d.gps))
       .sort((a, b) => a - b);
@@ -276,11 +298,17 @@ export class TDOADO {
     }
     if (maxGap > MAX_BEARING_GAP_DEG) return rej("bearing");
 
-    const tier = dets.length >= TRUSTED_MIN_RECEIVERS ? "trusted" : "preliminary";
-
-    // Telemetry: uncertainty ellipse, reported but not gated. Cohort
-    // selection (regions.js) is responsible for ensuring usable geometry.
+    // 3. Ellipse gate. Direct measurement of position uncertainty given
+    //    cohort geometry + 1 ms timing noise: a singular Fisher matrix
+    //    blows the semi-major axis up to thousands of km. The strongest
+    //    single signal — separates the convergent S China Sea AtoN
+    //    (semi-major ~200 km) from the Falmouth-coast-station-fixing-
+    //    in-Coral-Sea ghost (semi-major ~1900 km) cleanly.
     const ellipse = tdoaUncertainty(solverDets, pos, 1.0);
+    if (ellipse && ellipse.semiMajorKm > MAX_ELLIPSE_SEMI_MAJOR_KM) {
+      return rej("ellipse");
+    }
+
     let furthestRxKm = 0, nearestRxKm = Infinity;
     for (const d of dets) {
       const dKm = gcDistanceKm(pos, d.gps);
@@ -290,7 +318,6 @@ export class TDOADO {
 
     return {
       t: "tdoa",
-      tier,
       mmsi: bucket.mmsi,
       call: ref.call,
       position: { lat: sol.lat, lon: sol.lon, residualKm: sol.residualKm },
@@ -315,7 +342,6 @@ export class TDOADO {
     }
     this.recentSolves.push({
       mmsi: msg.mmsi,
-      tier: msg.tier,
       position: msg.position,
       quorum: msg.quorum,
       geometry: msg.geometry,

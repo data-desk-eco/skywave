@@ -31,9 +31,10 @@ browser —ws—┘        │ upstream ws://
   1785 Hz). Uses the hibernation API so client sockets are cheap;
   closes itself 5 min after the last viewer leaves. Also POSTs each
   decoded call's GPS-anchored audio snippet to `TDOADO`.
-* **TDOADO** (singleton) buckets snippets by fuzzy MMSI + tight
-  packetGpsNs window, cross-correlates them, runs `solveTdoa`, and
-  broadcasts each fix to clients on `/v2/tdoa/subscribe`.
+* **TDOADO** (singleton) buckets snippets by fuzzy MMSI + same band +
+  tight packetGpsNs window, cross-correlates them, runs `solveTdoa`,
+  applies the geometry gates (residual + bearing-gap + ellipse), and
+  broadcasts each surviving fix to clients on `/v2/tdoa/subscribe`.
 * **locationHint**: a ReceiverDO is placed near its KiwiSDR via a
   GPS-derived CF region string (apac / weur / wnam …), keeping
   upstream hops on-continent.
@@ -80,111 +81,160 @@ Scoring (bbox): `freeSlots × coastalProximity × snrBonus × antennaBonus`.
 `antennaBonus = 1.5` when the antenna free-text mentions a broadband
 design (loop / dipole / T2FD / Beverage / folded / longwire).
 
-## TDOA methodology — ground-wave only
+## TDOA methodology
 
-The solver and gates are calibrated for **one defensible regime**:
-a tight cohort of MF receivers all within ground-wave range of the
-area we're monitoring. That's the regime where the maths actually
-works in practice on the public KiwiSDR fleet.
+Operating regime: **any DSC band, geometry-gated**. Two propagation
+regimes both produce real fixes on the public KiwiSDR fleet, and the
+gate stack admits both:
 
-The previous methodology tried to handle multi-hop skywave with
-slant-distance corrections and per-pair propagation models; live
-captures showed it consistently emitting plausible-looking-but-wrong
-fixes for vessels far outside the cohort's radio horizon, with no
-gate able to reliably separate them from real fixes. The simpler
-ground-wave-only approach has been ground-truth-validated against
-real vessels in the English Channel.
+- **MF ground-wave** on a tight cohort (LIG, WAPP, NY, KAT, CHES,
+  english-channel, dover — see `regions.js`). Cleanest physics:
+  signals travel along the great-circle surface at ~c, so timing-to-
+  distance is plain geodesic distance. Where the fleet has the density
+  to form a 3+ receiver ground-wave cohort, fixes land within tens of
+  km of truth.
+- **HF skywave** on a globally-spread cohort (Global / "ALL" view).
+  Receivers hear the same burst via 1-3 hop F2 reflection, with all
+  the per-pair propagation unknowns that implies. Live data shows two
+  clear populations: real fixes with tight error ellipses (semi-major
+  <600 km) and ghost basins with wide ones (1500-20000 km). The gates
+  separate them empirically.
 
-### What "ground wave" buys us
+The previous methodology was *ground-wave only* and rejected HF
+outright. Live capture against the deployed Global rack showed several
+q≥4 HF skywave fixes landing on AIS truth (MEDI NOSHIMA in Bay of
+Biscay; an S-China-Sea AtoN converging across q3→q6 bursts; a SG-flag
+ship in Danish waters). Those would have been thrown away. The new
+gate stack admits HF when the geometry is good and rejects it when it
+isn't — regardless of band.
 
-- On MF (2187.5 kHz, the international DSC distress channel) signals
-  propagate as ground wave to ~600 km over salt water.
-- Ground wave travels along the great-circle surface at ~c — so the
-  timing-to-distance map is plain geodesic distance. No F2 layer
-  reflection, no per-pair hop-count unknown, no ionospheric
-  variability. The clean physics regime where the solver's residual
-  landscape has one well-defined minimum near the truth.
-- HF DSC bands are deliberately excluded from target cohorts: HF
-  ground wave dies inside ~100 km, so HF receivers in the same area
-  hear bursts via 1-3 hop skywave with all the propagation unknowns
-  that brings.
+### What the gates catch
 
-### Cohort selection
+`worker/src/tdoa-do.js`:
 
-`worker/src/regions.js`:
-- A target region with `target.bands: [2187.5]` is a ground-wave
-  cohort. `pickGroundWaveCohort` selects within `radiusKm` of the
-  centroid, octant-balanced for bearing spread.
-- 5 km site-dedup collapses literal collocations (one operator
-  running multiple KiwiSDR boxes at the same site). 30 km would have
-  been too aggressive — two different operators 15-30 km apart give
-  measurably different timing, and quantity matters for hitting
-  quorum.
-- Quantity matters because each KiwiSDR has some independent
-  probability of missing each burst (RFI, scheduling, decoder race-
-  conditions, worker upstream failures). Over-provisioning the
-  cohort (`cohortSize: 40`) ensures 3+ active decoders on most
-  bursts even when half the picks are silent.
+- **q ≥ 4 required.** q=3 is exactly determined in 2D, has a mirror
+  ambiguity that only a 4th constraint breaks, and residual ≡ 0 by
+  construction — too unreliable to publish as a position. Decoded
+  calls still surface in the table (presence info); we just don't
+  pretend we know where the source is. Live data: every clear ghost
+  in the un-rejected set was q=3.
+- **Same band per bucket** — receivers on different DSC bands hear
+  different physical transmissions, so cross-band snippet xcorr is
+  noise. Imposed at ingest in `_findMatchingBucket`. Different-band
+  receivers form parallel buckets, each tracking that band on its own.
+- **Residual ≤ 300 km** — belt-and-suspenders against grossly bad
+  xcorr lags. Rarely fires alone: most ghosts have small residuals
+  because the wrong basin is internally self-consistent.
+- **Bearing gap ≤ 220°** — max angular gap between consecutive
+  receivers as seen from the solved position. >220° means the cohort
+  is bunched in <140° of the compass and the fix is unconstrained in
+  the away direction. Tightened from 270° after live data showed
+  Madagascar-style ghosts at 246° passing.
+- **Ellipse semi-major ≤ 1000 km** — the 1σ position-uncertainty
+  ellipse from the cohort's Fisher matrix at 1 ms per-receiver timing
+  noise. The most discriminating single signal: a near-singular Fisher
+  matrix (one-sided cohort) blows up to thousands of km along the
+  unconstrained axis. Cleanly separates the convergent S-China-Sea
+  AtoN (semi-major 200 km) from the Falmouth-coast-station-fixing-in-
+  Coral-Sea ghost (semi-major ~1900 km) in live data.
+
+The 1 ms timing-noise figure isn't ground-truthed — it's a reasonable
+estimate of KiwiSDR GPS-discipline behaviour. The ellipse gate is
+calibrated to the same σ_t the `tdoaUncertainty` function already
+uses, so threshold and value scale together if the real σ_t is
+different.
+
+### Reference receiver
+
+The reference is the cohort's **cleanest decode** (highest
+`mmsiQuality` — fewest `?` characters in the recovered MMSI), not
+just the first detection to arrive. The reference snippet is the
+xcorr template every other receiver gets correlated against, so a
+noisy template directly inflates the lag estimate noise on every
+other receiver. Picking the cleanest decode is a strict improvement
+with no downside, since most cohorts have at least one receiver that
+got every bit right and ties fall back to first-arrival.
+
+### Hyperbola visualisation
+
+Each non-reference receiver contributes one hyperbola: the locus of
+points where geodesic timing would match the measured offset. In a
+clean fix all curves intersect at the diamond and fan out elsewhere;
+in a degenerate fix they run nearly parallel near the fix or have a
+second near-intersection that gives the solver a competing basin —
+which is exactly the failure mode the gates can't always catch
+(AWTAD-style "wrong propagation model fits a near-cohort source").
+
+The mini-map traces each curve via marching-squares zero-crossings
+of the constraint on a global lat/lon grid, drawn as subtle white
+polylines. Cheaper than ray-casting from the fix, and works equally
+well far from the fix where the diagnostic value lives. See
+`client/hyperbola.js`.
 
 ### Solver
 
 `worker/src/tdoa.js`:
-- Plain geodesic distance — no skywave / slant correction.
+- Plain geodesic distance — no skywave / slant correction. The HF
+  skywave fixes that pass do so because their geometry is good enough
+  that residual per-hop variability stays inside the timing-noise
+  budget the gates already account for.
 - Two-phase grid search: 81×81 coarse sweep over the receiver bbox
   expanded by 10°, then nested refinement on the top-3 coarse cells
-  (top-3 instead of top-1 rescues cases where the coarse-cell minimum
-  is one cell off truth due to grid discretisation).
-- Single basin in practice — the residual landscape on a tight
-  cohort doesn't have ghost minima you could mistake for the truth.
+  (top-3 rescues cases where the coarse-cell minimum is one cell off
+  truth due to grid discretisation).
+- `tdoaUncertainty` returns the 1σ error ellipse (Fisher inverse →
+  2×2 eigendecomposition). **Load-bearing for the ellipse gate**, not
+  just telemetry.
 
-### Coordinator gates
+### Cohort selection
 
-`worker/src/tdoa-do.js`:
-- **q ≥ 3** to solve at all, **q ≥ 4** to label `tier="trusted"`
-  (residual gate is meaningful), **q = 3** is `tier="preliminary"`
-  (exactly determined, residual is ~0 by construction).
-- **Residual ≤ 300 km** — admits any fix consistent with ~1 ms
-  KiwiSDR clock jitter on tight ground-wave geometry; rejects bad-
-  xcorr / ghost-basin cases that produce 1000+ km residuals.
-- **Bearing gap ≤ 270°** — max gap between consecutive receivers as
-  seen from the solved position. Above 270° means every receiver is
-  bunched in a 90° wedge of the compass — degenerate geometry where
-  any timing pull yields wildly different positions in the away-
-  from-receivers direction. The cheapest geometric check that
-  actually catches ghost basins; everything else (ellipse semi-major,
-  per-band single-hop, leave-one-out scatter, multi-burst history,
-  area-of-interest containment) was found in live data to either
-  duplicate this signal or fire on real fixes too.
-
-That's the whole gate stack. The previous methodology had ~10 gates
-and a three-tier system; the simplification is the work that made
-real fixes start landing.
+`worker/src/regions.js`:
+- **bbox regions** (Global + continent presets) → `pickRack` allocates
+  96 slots across all 6 DSC bands, weighted by where multi-hearings
+  actually happen (HF8/HF12 heaviest). Most multi-RX detections in
+  this rack are HF skywave; the ones that survive the gates are the
+  real-HF path.
+- **target regions with `target.bands: [2187.5]`** → `pickGroundWaveCohort`
+  picks octant-balanced MF receivers within `radiusKm`. Site-deduped
+  at 5 km. SNR self-report ignored (it's a noise-floor estimate, not
+  a decode-rate predictor). The high-confidence ground-wave path.
+- **target regions without `target.bands`** → `pickSurroundCohort`
+  for long-baseline targets where ground wave isn't an option.
+- All picks pass the same hard health filters: active, GPS-fixing,
+  considerate (≥2 free user slots), recent.
 
 ### Validation
 
-Live capture against the `english-channel` cohort (35 receivers, MF
-only, ≤400 km from (50, 0)) produced:
+Live capture against the deployed Global rack (`/v2/tdoa/recent`)
+during methodology revision:
+- ~10 fixes/min throughput.
+- Of 20 fixes in a 4-minute snapshot: 6 with semi-major <600 km
+  looked plausible (3 converging on one S-China-Sea AtoN, an SG-flag
+  ship in Danish waters, a Singapore-area HF16, and a Danish coast
+  station fixing in Denmark on MF); 11 with semi-major >1500 km were
+  clear ghosts (UK Falmouth coast station "fixing" in the Coral Sea
+  three times, a HK ship "in" Madagascar, a fix in landlocked
+  Central African Republic).
+- The ~800 km gap in the ellipse distribution was empirical, not
+  designed — the 1000 km gate drops every ghost in the sample while
+  keeping every plausible fix.
 
-- WHITCHALLENGER (UK tanker, MMSI 235007413): repeat q=4/6/7 fixes
-  all converging within 10 km of each other and **40-50 km of her
-  actual Solent anchor position**. Best ground-truth-validated
-  case so far.
-- 5 of 5 vessel fixes plausible by speed (Δ km from stale GFW
-  lastPos divided by Δ hours = implied speed within plausible
-  vessel range).
-- Ghost-basin cases (TROMS CAPELLA at 61°N Sweden, JAN-LAURENZ at
-  39°N Spain) caught by the bearing-gap gate after the methodology
-  reset.
+The earlier `english-channel` ground-wave validation (WHITCHALLENGER,
+UK tanker, MMSI 235007413: repeat q=4/6/7 fixes converging within 10
+km of each other and 40-50 km of her actual Solent anchor) still
+stands — that geometry has tight ellipse and low bearing gap, so it
+passes the new gates as well as the old.
 
-`scripts/global_chokepoints.mjs` ranks where else the methodology
-can run on the current public KiwiSDR fleet:
-- **Tier 1**: Dover Strait, English Channel — orders of magnitude
-  better than anywhere else, 26-32 receivers within 60° bearing gap.
+`scripts/global_chokepoints.mjs` ranks where ground-wave cohorts can
+form on the current public KiwiSDR fleet:
+- **Tier 1**: Dover Strait, English Channel — 26-32 receivers within
+  60° bearing gap.
 - **Tier 2**: NY Harbour, Skagerrak/Kattegat, Chesapeake, Cornwall
   Lands End, Northern Italy — 11-19 receivers within 95-167° gap.
-- **Most strategic chokepoints lack receiver density** (Hormuz,
-  Malacca, Bosphorus, Singapore, etc.) — too few hobby KiwiSDRs in
-  the area.
+- **Other strategic chokepoints** (Hormuz, Malacca, Bosphorus,
+  Singapore) lack ground-wave receiver density — they appear on the
+  Global rack via HF skywave instead, and benefit from the same
+  geometry gates.
 
 ## Tone & design
 
@@ -210,6 +260,11 @@ Radio-ham tinker spirit served with Data Desk restraint.
   a schema version.
 - `regions.js` — region dropdown data, MID-to-ISO, GPS parser.
 - `map.js` — Leaflet mini-map per card; lazy-mounted on first expand.
+- `hyperbola.js` — geo math + marching-squares trace of the per-pair
+  TDOA constraint. Pure function `hyperbolaSegments(refGps, otherGps,
+  dtSec)` returns `[[lat,lon],[lat,lon]]` segments for `map.js` to
+  draw. Lets the human see at a glance whether a fix is the unique
+  intersection of all curves or a coincidental near-miss with ghosts.
 - `index.html`, `styles.css`, `favicon.svg`.
 
 ### `worker/src/` — Cloudflare Worker + Durable Objects
@@ -221,12 +276,14 @@ Radio-ham tinker spirit served with Data Desk restraint.
 - `receiver-do.js` — `ReceiverDO`. The hot path. Upstream + decoder
   + hibernation fanout + idle alarm. Also emits TDOA detection
   records (GPS-anchored audio snippets) to `TDOADO`.
-- `tdoa-do.js` — `TDOADO`. Singleton coordinator. Fuzzy-MMSI-pairs
-  detections across receivers, cross-correlates snippets, calls the
-  solver, applies the residual + bearing gates, broadcasts.
+- `tdoa-do.js` — `TDOADO`. Singleton coordinator. Fuzzy-MMSI +
+  same-band bucketing across receivers, cross-correlates snippets,
+  calls the solver, applies the residual + bearing-gap + ellipse
+  gates, broadcasts.
 - `tdoa.js` — pure solver math. `xcorr` + `solveTdoa` (two-phase
-  grid-search assuming geodesic distance) + `tdoaUncertainty` for
-  telemetry. Exercised offline by the scripts under `scripts/`.
+  grid-search assuming geodesic distance) + `tdoaUncertainty`
+  (Fisher-inverse ellipse, load-bearing for the ellipse gate).
+  Exercised offline by the scripts under `scripts/`.
 - `kiwi-upstream.js` — server-side KiwiSDR WebSocket client. Runs in
   IQ mode so every frame carries a GPS-ns header — the shared time
   base the TDOA coordinator needs.
@@ -290,12 +347,14 @@ Radio-ham tinker spirit served with Data Desk restraint.
 - Storing secrets. The GFW proxy works with an empty bearer because
   of Origin/Referer allow-listing on globalfishingwatch.org; no API
   key anywhere.
-- Re-introducing complex TDOA gates without a ground-truth-validated
-  case showing they reject wrong solves *more* than they reject
-  right ones. The history is littered with gates that looked
-  principled but in live data fired on edge-of-cluster real fixes
-  while letting through obvious ghost basins. Residual + bearing-gap
-  is the gate stack that earned its keep.
+- Adding TDOA gates without a live-data case showing the new gate
+  rejects ghosts *more* than it rejects real fixes. The history is
+  littered with gates that looked principled but in practice fired
+  on real fixes while letting through obvious ghosts. Current stack
+  (residual + bearing-gap + ellipse + same-band-per-bucket) earned
+  its keep against a 20-fix `/v2/tdoa/recent` snapshot showing clean
+  separation between real fixes (semi-major <600 km) and ghosts
+  (semi-major >1500 km). Same standard for any future addition.
 
 ## Gotchas
 
@@ -349,6 +408,14 @@ Radio-ham tinker spirit served with Data Desk restraint.
   on degenerate math. `tdoa-do.js` collapses on `host:port`. The
   picker also site-dedups at 5 km so two boxes at the same operator
   don't burn two cohort slots.
+- **Cross-band buckets are rejected at ingest.** A burst heard by
+  receiver A on HF8 and receiver B on HF12 is two different physical
+  transmissions; xcorr between their snippets returns a noise lag
+  that the solver then triangulates into a ghost. `_findMatchingBucket`
+  requires same-band, so a single MMSI heard on multiple bands within
+  the 2 s window forms parallel buckets, each tracking its band
+  independently. Real cross-band convergence (vessel re-keys all DSC
+  channels back-to-back) is rare and not worth the ghost risk.
 - **MMSIs decoded under noise differ between receivers.** One Kiwi
   reads `563250300`, another `5632??300`, a third `563252??0` — all
   the same ship. The coordinator fuzzy-matches with `?` as a

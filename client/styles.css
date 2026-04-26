@@ -297,22 +297,15 @@ body.tdoa-only .call:not(.has-tdoa) { display: none; }
 /* Δ vs fresh AIS (LSEG) — accuracy quote alongside the fix. */
 .tdoa-fix .tdoa-ais   { color: var(--accent); font-size: 11px; }
 .tdoa-fix .tdoa-ais::before { content: "↪ "; color: var(--dim); }
-/* Preliminary (3-receiver) fixes. No residual self-check possible, so
-   the UI marks them as lower-confidence — hollow diamond, slight dim. */
-.tdoa-fix.prelim { opacity: 0.75; }
-.tdoa-fix.prelim .tdoa-coord { font-weight: 500; }
-
 /* Indicator on the always-visible summary row when a fix exists. */
 .call .c-heard.has-tdoa::before {
   content: "◆ ";
   color: var(--fg);
   margin-right: 2px;
 }
-.call.tdoa-prelim .c-heard.has-tdoa::before { content: "◇ "; }
 
 /* Diamond icon for the TDOA marker on the mini-map. */
 .tdoa-marker { background: transparent; border: none; }
-.tdoa-marker.tdoa-prelim .tdoa-diamond { opacity: 0.55; }
 .tdoa-diamond {
   width: 10px;
   height: 10px;

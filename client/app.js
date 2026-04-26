@@ -11,28 +11,14 @@
 //      un-follow the others so the server doesn't waste bandwidth
 //      streaming PCM we'd never play.
 
-import { Vessels } from "./vessels.js?v=31";
-import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=31";
-import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=31";
+import { Vessels } from "./vessels.js?v=33";
+import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=33";
+import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=33";
 
 const DEBUG = /(\?|&)debug=1\b/.test(location.search);
 const AUDIO_LEAD_SEC = 0.25;
 const AUDIO_HOLD_MS  = 6000;
 const RACK_REFRESH_MS = 60_000;
-// Only surface TDOA fixes whose solver residual is tight enough to be
-// worth trusting. Bigger residuals usually mean a 3-receiver mirror
-// ambiguity landed on the wrong hyperbola basin, or the packet reached
-// some receivers via an extra skywave hop the solver models as
-// straight-line c. Silent is better than misleading; a later re-solve
-// with more receivers often tightens the fix and it'll appear then.
-//
-// Calibrated against simulation: with realistic 1 ms KiwiSDR timing
-// jitter and good (≤180°) geometry, the inherent residual floor is
-// 100-200 km. The previous 100 km cutoff was rejecting genuinely-
-// good fixes whose underlying timing precision simply couldn't beat
-// the ms-level GPS jitter — same reason the server-side gate sits at
-// 250 km. The UI shows residual prominently so the human can judge.
-const TDOA_MAX_RESIDUAL_KM = 250;
 
 const GATEWAY = (() => {
   const meta = document.querySelector('meta[name="skywave-gateway"]');
@@ -483,14 +469,8 @@ function connectTdoaFeed() {
 }
 
 function renderTdoaInCard(entry, tdoa) {
-  // Confirmed fixes (≥4 receivers, residual is meaningful): drop those
-  // whose residual exceeds the self-check threshold. Preliminary fixes
-  // (3 receivers, exactly determined, residual is always ~0) bypass
-  // that check — they're already gated server-side on stricter
-  // geometry and will render with a visible "preliminary" marker.
-  const residKm = tdoa?.position?.residualKm;
-  const isPrelim = tdoa.tier === "preliminary";
-  if (!isPrelim && (!Number.isFinite(residKm) || residKm >= TDOA_MAX_RESIDUAL_KM)) return;
+  // Server has already gated on residual + bearing-gap + ellipse +
+  // single-band-bucket + q≥4. Trust it: render whatever it sends.
   entry.tdoa = tdoa;
   // Merge the coordinator's authoritative receiver list into
   // entry.receivers. MMSIs decoded under noise vary between receivers,
@@ -504,7 +484,6 @@ function renderTdoaInCard(entry, tdoa) {
   }
   if (!entry.row) return;
   entry.row.classList.add("has-tdoa");
-  entry.row.classList.toggle("tdoa-prelim", isPrelim);
 
   updateHeard(entry);
   const summary = entry.row.querySelector(".c-heard");
@@ -523,13 +502,7 @@ function renderTdoaInCard(entry, tdoa) {
     }
     const { lat, lon, residualKm } = tdoa.position;
     const when = new Date(tdoa.broadcastMs).toISOString().slice(11, 19) + "Z";
-    tdoaEl.classList.toggle("prelim", isPrelim);
-    const label = isPrelim ? "TDOA fix · preliminary" : "TDOA fix";
-    // Residual is meaningful only for confirmed fixes; for preliminary
-    // we show the geometry (bearing spread) instead as the quality cue.
-    const qualityMeta = isPrelim
-      ? `max-gap ${tdoa.geometry?.maxBearingGapDeg?.toFixed(0) ?? "?"}°`
-      : `±${residualKm.toFixed(1)} km`;
+    const qualityMeta = `±${residualKm.toFixed(1)} km`;
     // Pull fresh AIS (LSEG) for ground-truth comparison if available.
     const info = Vessels.get(entry.call.caller);
     let aisLine = "";
@@ -542,7 +515,7 @@ function renderTdoaInCard(entry, tdoa) {
       aisLine = `<span class="tdoa-ais">vs AIS Δ ${dKm.toFixed(0)} km${dtTxt ? ` · ${dtTxt}` : ""}</span>`;
     }
     tdoaEl.innerHTML =
-      `<span class="tdoa-label">${label}</span>` +
+      `<span class="tdoa-label">TDOA fix</span>` +
       `<span class="tdoa-coord">${lat.toFixed(3)}°, ${lon.toFixed(3)}°</span>` +
       `<span class="tdoa-meta">${qualityMeta} · q=${tdoa.quorum} · ${when}</span>` +
       aisLine;

@@ -1,12 +1,16 @@
 // Per-card mini-map — one tiny Leaflet instance, lazy-mounted on first
-// expand. Renders three layers:
+// expand. Renders these layers:
 //   · listening receivers (hollow white rings) — local WS feed
 //   · GFW vessel position (filled white dot + 14-day trail) if available
 //   · TDOA solved position (hollow diamond + dashed residual circle)
 //     with extra receiver rings for cohort members this browser isn't
 //     directly attached to.
+//   · TDOA hyperbolas (subtle white lines) — one curve per non-reference
+//     receiver, all converging at the diamond on a clean fix; a useful
+//     diagnostic for "why did this fix land here vs there".
 
-import { Vessels } from "./vessels.js?v=31";
+import { Vessels } from "./vessels.js?v=33";
+import { hyperbolaSegments } from "./hyperbola.js?v=33";
 
 const TILE_URL = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png";
 const TILE_ATTR = '&copy; <a href="https://carto.com/">carto</a> · OSM';
@@ -126,17 +130,13 @@ export function setTdoaOnMiniMap(entry, tdoa) {
     addRxRing(entry, hostKey, r.gps, r.slot.replace("|", " · "));
   }
 
-  const isPrelim = tdoa.tier === "preliminary";
+  drawHyperbolas(entry, tdoa);
 
-  // Preliminary fixes (q=3, no residual check) get a translucent ring at
-  // a fixed "nominal uncertainty" of 50 km so the visual doesn't imply a
-  // precision we can't verify. Confirmed fixes size the ring from the
-  // solver residual as before.
   if (entry._tdoaCircle) entry._map.removeLayer(entry._tdoaCircle);
   entry._tdoaCircle = L.circle([lat, lon], {
-    radius: isPrelim ? 50_000 : Math.max(500, (residualKm || 0) * 1000),
-    color: "#fff", weight: 1, opacity: isPrelim ? 0.3 : 0.5, dashArray: "2 3",
-    fillColor: "#fff", fillOpacity: isPrelim ? 0.04 : 0.08,
+    radius: Math.max(500, (residualKm || 0) * 1000),
+    color: "#fff", weight: 1, opacity: 0.5, dashArray: "2 3",
+    fillColor: "#fff", fillOpacity: 0.08,
     interactive: false,
   }).addTo(entry._map);
 
@@ -145,19 +145,46 @@ export function setTdoaOnMiniMap(entry, tdoa) {
   } else {
     entry._tdoaMarker = L.marker([lat, lon], {
       icon: L.divIcon({
-        className: isPrelim ? "tdoa-marker tdoa-prelim" : "tdoa-marker",
+        className: "tdoa-marker",
         html: '<div class="tdoa-diamond"></div>',
         iconSize: [14, 14], iconAnchor: [7, 7],
       }),
     }).bindTooltip(
-      isPrelim
-        ? `TDOA fix · preliminary · q=${tdoa.quorum} · max-gap ${tdoa.geometry?.maxBearingGapDeg?.toFixed(0) ?? "?"}°`
-        : `TDOA fix · ±${(residualKm || 0).toFixed(1)} km · q=${tdoa.quorum}`,
+      `TDOA fix · ±${(residualKm || 0).toFixed(1)} km · q=${tdoa.quorum}`,
       { direction: "top", offset: [0, -6] },
     );
     entry._tdoaMarker.addTo(entry._map);
   }
   fitMiniMap(entry);
+}
+
+// One hyperbola per non-reference receiver: the locus of points where
+// the timing offset would match the measured one assuming geodesic
+// propagation. The reference (which the broadcast lists first, with
+// dtSec = 0) is the cohort's cleanest decode — so its position+timing
+// is the trusted anchor against which every other curve is drawn.
+function drawHyperbolas(entry, tdoa) {
+  const L = window.L;
+  if (entry._hyperbolas) {
+    entry._map.removeLayer(entry._hyperbolas);
+    entry._hyperbolas = null;
+  }
+  const rx = tdoa.receivers;
+  if (!rx || rx.length < 2) return;
+  const ref = rx[0];
+  if (!ref || !Array.isArray(ref.gps)) return;
+
+  const all = [];
+  for (let i = 1; i < rx.length; i++) {
+    const o = rx[i];
+    if (!o || !Array.isArray(o.gps) || !Number.isFinite(o.dtSec)) continue;
+    for (const seg of hyperbolaSegments(ref.gps, o.gps, o.dtSec)) all.push(seg);
+  }
+  if (!all.length) return;
+  entry._hyperbolas = L.polyline(all, {
+    color: "#fff", weight: 1, opacity: 0.18,
+    interactive: false, smoothFactor: 2,
+  }).addTo(entry._map);
 }
 
 function fitMiniMap(entry) {
