@@ -53,28 +53,28 @@ const MAX_BEARING_GAP_DEG = 220;
 // matrix) blow up to 1500-20000 km. 1000 km gives margin around the
 // real cluster while catching every ghost we've observed.
 const MAX_ELLIPSE_SEMI_MAJOR_KM = 1000;
-// Regime detection. Each bucket falls into one of three classes
-// based on band + cohort spread; we apply different site-dedup at
-// each, and refuse to solve the ambiguous middle.
+// Regime detection. Used only to pick the right site-dedup radius:
 //
 //   ground-wave   — MF, all receivers within ~ground-wave range.
 //                   Solver's geodesic assumption matches reality.
 //                   5 km dedup (collocations only).
-//   long-baseline — HF cohort spread ≫ "fool the solver" range.
-//                   Skywave is the actual physics, but the spread is
-//                   so large that geometry forces a unique solution
-//                   near the truth even with the wrong propagation
-//                   model. Adaptive dedup at max_pairwise/20.
-//   ambiguous     — anything else: HF cohorts in the 100-5000 km
-//                   middle zone, or unusually-wide MF cohorts.
-//                   The PALATINE/AWTAD/ISABELITA failure mode lives
-//                   here. Refuse to solve.
+//   long-baseline — everything else (any HF cohort, or wide MF).
+//                   Skywave is the actual physics; clustered
+//                   receivers contribute the same constraint, so
+//                   adaptive dedup at max(500 km, max_pairwise/20)
+//                   collapses near-duplicates and lets the post-solve
+//                   ellipse + bearing-gap gates judge what survives.
 //
-// Re-classified on every arrival, so a bucket that starts ambiguous
-// (3 European HF receivers) and gains a distant straggler (NZ) can
-// transition to long-baseline mid-life.
+// Earlier iterations refused to solve the "ambiguous middle" (HF
+// cohorts with 100-5000 km spread) at the regime stage. Live data
+// showed the ellipse gate had headroom to spare (zero firings in 87
+// minutes), so the regime check was doubly conservative — turning
+// it from a rejection into just a dedup-radius selector lets more
+// fixes attempt to solve, with the post-solve gates doing the actual
+// quality filtering. AWTAD/PALATINE-class cohorts (clustered HF
+// receivers) collapse to ≤1 effective receiver under long-baseline
+// dedup, then fail the q≥4 check at the dedup gate.
 const GROUND_WAVE_MAX_SPAN_KM = 1500;
-const LONG_BASELINE_MIN_SPAN_KM = 5000;
 const GROUND_WAVE_DEDUP_KM = 5;
 const LONG_BASELINE_DEDUP_MIN_KM = 500;
 const LONG_BASELINE_DEDUP_FACTOR = 20;
@@ -92,6 +92,18 @@ const PROPAGATION_SLACK_SEC = 0.010;
 // Keepalive alarm: CF DOs stay resident while an alarm is pending, so
 // refresh one on every ingest to keep buckets alive across a cohort.
 const KEEPALIVE_MS = 60_000;
+// Multi-burst convergence telemetry. For each MMSI we keep the last
+// few fixes within a sliding window; on each new fix we report how
+// many of the recent ones land within CONVERGENCE_AGREE_KM of the new
+// one. Pure observability — not a gate. The point is to expose the
+// failure mode where geometry passes the gates but the fix repeats
+// in a wrong basin: those show high "agree" counts, but a vessel
+// transiting a real route across multiple bursts also shows high
+// agree, so this can't be a hard reject. The UI surfaces it so
+// humans can judge.
+const CONVERGENCE_WINDOW_MS = 30 * 60 * 1000;
+const CONVERGENCE_HISTORY = 10;
+const CONVERGENCE_AGREE_KM = 200;
 
 export class TDOADO {
   constructor(state, env) {
@@ -101,6 +113,7 @@ export class TDOADO {
     this.recentDets = [];
     this.recentSolves = [];
     this.rejections = {};            // gate → count, observability only
+    this.recentFixesByMmsi = new Map(); // mmsi → [{lat,lon,broadcastMs}]
     this.state.blockConcurrencyWhile(async () => {
       this.recentDets   = (await this.state.storage.get("recentDets"))   || [];
       this.recentSolves = (await this.state.storage.get("recentSolves")) || [];
@@ -271,10 +284,6 @@ export class TDOADO {
   // reference by virtue of `dedupByLocation` returning cleanest-first).
   _solveBucket(bucket) {
     const regime = classifyRegime(bucket.dets);
-    if (!regime) {
-      this.rejections.regime = (this.rejections.regime || 0) + 1;
-      return null;
-    }
     const dets = dedupByLocation(bucket.dets, regime.dedupKm);
     if (dets.length < MIN_RECEIVERS) {
       this.rejections.dedup = (this.rejections.dedup || 0) + 1;
@@ -351,6 +360,8 @@ export class TDOADO {
       if (dKm < nearestRxKm) nearestRxKm = dKm;
     }
 
+    const convergence = this._updateConvergence(bucket.mmsi, pos);
+
     return {
       t: "tdoa",
       regime: regime.name,
@@ -366,8 +377,34 @@ export class TDOADO {
         ellipseSemiMinorKm: ellipse ? +ellipse.semiMinorKm.toFixed(0) : null,
         ellipseOrientationDeg: ellipse ? +ellipse.orientationDeg.toFixed(0) : null,
       },
+      convergence,
       packetGpsNs: ref.packetGpsNs.toString(),
       broadcastMs: Date.now(),
+    };
+  }
+
+  // Update per-MMSI fix history and return a convergence summary for
+  // the new fix: how many recent fixes (within CONVERGENCE_WINDOW_MS)
+  // land within CONVERGENCE_AGREE_KM of the new one. Pure observability.
+  _updateConvergence(mmsi, pos) {
+    const now = Date.now();
+    const cutoff = now - CONVERGENCE_WINDOW_MS;
+    const old = this.recentFixesByMmsi.get(mmsi) || [];
+    const fresh = old.filter((f) => f.broadcastMs >= cutoff);
+    let agree = 1;  // include the new fix
+    let maxKm = 0;
+    for (const f of fresh) {
+      const d = gcDistanceKm(pos, [f.lat, f.lon]);
+      if (d <= CONVERGENCE_AGREE_KM) agree++;
+      if (d > maxKm) maxKm = d;
+    }
+    fresh.push({ lat: pos[0], lon: pos[1], broadcastMs: now });
+    if (fresh.length > CONVERGENCE_HISTORY) fresh.splice(0, fresh.length - CONVERGENCE_HISTORY);
+    this.recentFixesByMmsi.set(mmsi, fresh);
+    return {
+      fixCount: fresh.length,
+      agreeCount: agree,
+      maxDistKm: +maxKm.toFixed(0),
     };
   }
 
@@ -382,6 +419,7 @@ export class TDOADO {
       position: msg.position,
       quorum: msg.quorum,
       geometry: msg.geometry,
+      convergence: msg.convergence,
       receivers: msg.receivers.map((r) => r.slot),
       broadcastMs: msg.broadcastMs,
     });
@@ -452,27 +490,24 @@ function cohortMaxPairwiseKm(dets) {
   return max;
 }
 
-// Classify the cohort's propagation regime from band + spread. Returns
-// { name, dedupKm } for solvable regimes, or null for ambiguous (which
-// the caller treats as "refuse to solve"). All bucket dets share a
-// band by ingest invariant, so we can read it off dets[0].
+// Classify the cohort's propagation regime from band + spread, used
+// to pick the site-dedup radius. Always returns a regime — there's
+// no "refuse to solve" verdict here; the post-solve gates (residual,
+// bearing-gap, ellipse) judge whether the resulting fix is trustworthy.
+// All bucket dets share a band by ingest invariant.
 function classifyRegime(dets) {
-  if (!dets.length) return null;
+  if (!dets.length) {
+    return { name: "long-baseline", dedupKm: LONG_BASELINE_DEDUP_MIN_KM };
+  }
   const band = dets[0].band;
   const span = cohortMaxPairwiseKm(dets);
-  if (band === "MF") {
-    if (span <= GROUND_WAVE_MAX_SPAN_KM) {
-      return { name: "ground-wave", dedupKm: GROUND_WAVE_DEDUP_KM };
-    }
-    return null;
+  if (band === "MF" && span <= GROUND_WAVE_MAX_SPAN_KM) {
+    return { name: "ground-wave", dedupKm: GROUND_WAVE_DEDUP_KM };
   }
-  if (span >= LONG_BASELINE_MIN_SPAN_KM) {
-    return {
-      name: "long-baseline",
-      dedupKm: Math.max(LONG_BASELINE_DEDUP_MIN_KM, span / LONG_BASELINE_DEDUP_FACTOR),
-    };
-  }
-  return null;
+  return {
+    name: "long-baseline",
+    dedupKm: Math.max(LONG_BASELINE_DEDUP_MIN_KM, span / LONG_BASELINE_DEDUP_FACTOR),
+  };
 }
 
 // slotId is "host:port|band". Dedup by the host:port half so the same

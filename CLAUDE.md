@@ -33,11 +33,11 @@ browser —ws—┘        │ upstream ws://
   decoded call's GPS-anchored audio snippet to `TDOADO`.
 * **TDOADO** (singleton) buckets snippets by fuzzy MMSI + same band +
   tight packetGpsNs window, classifies each bucket's propagation
-  regime from cohort spread, applies regime-specific site-dedup,
-  cross-correlates the survivors, runs `solveTdoa`, applies the shared
-  geometry gates (residual + bearing-gap + ellipse), and broadcasts
-  each surviving fix to clients on `/v2/tdoa/subscribe`. Buckets in
-  the ambiguous middle regime are refused outright.
+  regime to pick a site-dedup radius, cross-correlates the survivors,
+  runs `solveTdoa`, applies the post-solve gates (residual +
+  bearing-gap + ellipse), tracks per-MMSI fix history for convergence
+  telemetry, and broadcasts each surviving fix to clients on
+  `/v2/tdoa/subscribe`.
 * **locationHint**: a ReceiverDO is placed near its KiwiSDR via a
   GPS-derived CF region string (apac / weur / wnam …), keeping
   upstream hops on-continent.
@@ -86,24 +86,26 @@ design (loop / dipole / T2FD / Beverage / folded / longwire).
 
 ## TDOA methodology
 
-The pipeline organises around **propagation regimes**. Each bucket
-(MMSI + band + same-burst time-window) is classified into one of three
-regimes from cohort properties (band + max pairwise distance), and the
-solver applies regime-specific rules. The middle zone — physically
-ambiguous cohorts — is refused outright, because in live data we
-can't tell those apart from their ghosts using anything we measure.
+The pipeline organises around **propagation regimes**, but uses them
+only to pick the right site-dedup radius — not as a hard gate. Live
+data showed regime-as-rejection was doubly conservative: it filtered
+many legitimate cohorts while the post-solve ellipse + bearing-gap
+gates had headroom to spare. The current shape:
 
-### The three regimes
+1. Bucket by `(MMSI, band, same-burst time-window)`.
+2. Classify the cohort's regime from band + max pairwise distance.
+3. Site-dedup at the regime-appropriate radius (adaptive for HF).
+4. Solve.
+5. Apply the post-solve gates (residual, bearing-gap, ellipse).
+6. Record per-MMSI fix history; report convergence as telemetry.
+7. Broadcast.
+
+### The two regimes
 
 | regime | trigger | site-dedup | what it is |
 |---|---|---|---|
-| **ground-wave** | band = MF AND cohort max-pairwise ≤ 1500 km | 5 km | Signals travel geodesically along the surface at ~c. Solver assumption matches reality. The clean-physics regime, used by LIG / WAPP / NY / KAT / CHES / english-channel / dover. |
-| **long-baseline** | cohort max-pairwise ≥ 5000 km | adaptive: max(500 km, max_pairwise / 20) | HF skywave, but the cohort spread is so large relative to the per-hop propagation slop that geometry forces a unique solution near truth even with the wrong propagation model. The Global rack's good HF fixes (MEDI NOSHIMA, SBITANGO, the convergent S-China-Sea AtoN). |
-| **ambiguous** | everything else: HF cohorts in the 100-5000 km middle zone, or unusually-wide MF cohorts | — (refuse to solve) | The PALATINE / AWTAD / ISABELITA failure mode: receivers clustered tightly enough that several receivers contribute the same constraint, and timing differences fit a "near-cohort source" interpretation under the ground-wave model when actual physics is multi-hop skywave from somewhere far. The gates can't reliably distinguish these from real fixes, so we don't publish them. |
-
-Re-classified on every new arrival, so a bucket that starts ambiguous
-(3 European HF receivers) and gains a distant straggler (Sydney) can
-transition to long-baseline mid-life.
+| **ground-wave** | band = MF AND cohort max-pairwise ≤ 1500 km | 5 km | Signals travel geodesically along the surface at ~c. Solver assumption matches reality. Used by LIG / WAPP / NY / KAT / CHES / english-channel / dover. |
+| **long-baseline** | everything else (any HF cohort, or wide MF) | adaptive: max(500 km, max_pairwise / 20) | Skywave is the actual physics; clustered receivers contribute the same constraint, so the dedup collapses near-duplicates and the post-solve gates judge what survives. AWTAD/PALATINE-class cohorts (clustered HF receivers ≤500 km apart) all collapse to ≤1 effective receiver and fail q≥4 at the dedup gate. ISABELITA-class (3 European HF receivers 480-830 km apart, in a 17 000 km cohort) collapse via the adaptive radius (~850 km) to 1 effective European, then fail q≥4. SBITANGO/MEDI NOSHIMA-class (genuinely distributed) survive.
 
 ### Per-regime site-dedup
 
@@ -149,20 +151,62 @@ estimate of KiwiSDR GPS-discipline behaviour. The ellipse gate is
 calibrated to the same σ_t `tdoaUncertainty` already uses, so
 threshold and value scale together if the real σ_t is different.
 
-### Telemetry
+### Convergence telemetry
 
-The `regime` field is included in each broadcast and in
-`recentSolves`, and the rejection counter (`/v2/tdoa/recent`) tracks
-buckets dropped at each stage:
-- `regime` — bucket classified as ambiguous (HF middle zone or wide
-  MF), refused before even attempting to solve
-- `dedup` — survived classification but post-dedup count fell below
-  q=4
+For each MMSI we keep the last 10 fixes within a 30-minute sliding
+window. Every broadcast includes a `convergence` field:
+
+```
+{ fixCount, agreeCount, maxDistKm }
+```
+
+`agreeCount` is the number of recent fixes within 200 km of the new
+one (including the new one itself). `maxDistKm` is the widest
+separation in the recent set.
+
+This is **observability, not a gate**. Live data shows:
+- Most repeat fixes converge tightly (0–250 km between fixes for the
+  same MMSI), regardless of whether they're real or wrong. A coast
+  station that consistently fixes in the wrong basin still shows
+  `2/2 within 0 km`.
+- Genuinely useful: catches the `004122100`-class case where 5 of 6
+  fixes converge at the Yangtze and 1 outlier is 7700 km away.
+- The UI surfaces it as `N/M converging` so the human can judge.
+
+### Rejection telemetry
+
+The rejection counter (`/v2/tdoa/recent`) tracks buckets dropped at
+each stage:
+- `dedup` — post-dedup count fell below q=4 (catches AWTAD/PALATINE/
+  ISABELITA-class clustered cohorts)
 - `residual`, `bearing`, `ellipse` — failed the named gate at solve
   time
 
 Watching the relative counts across these is the cheapest way to
 understand which class of cohort the rack is actually producing.
+
+### Known limit: persistent ghosts
+
+Geometric gating + convergence catches *most* failures, but cannot
+catch the case where **a stable HF cohort consistently produces the
+same wrong basin across multiple bursts**. That happens when:
+- The cohort hears a far source via multi-hop skywave
+- The path-difference timing fits a "different-distance source via
+  geodesic" interpretation just as well
+- The same cohort hearing the same MMSI's repeat bursts always lands
+  the solver in the same wrong basin
+
+Live examples: `005030001` (UK Falmouth coast station) consistently
+fixing in the Coral Sea / W Australia at the same wrong position
+across multiple bursts; `636022352` OLIVIA C (real position Malacca
+Strait) consistently fixing in southern China. Both have small
+ellipses (~270-465 km), passable bearing gaps, and 100% convergence
+across repeats — there's no purely-internal signal that flags them.
+
+Catching these requires an **external oracle**: either a known-
+position registry for fixed transmitters (coast stations, AtoNs) or
+cross-check against fresh AIS for vessels. That's a separate feature
+on top of the per-burst TDOA pipeline, not a gate refinement.
 
 ### Reference receiver
 
@@ -275,19 +319,31 @@ form on the current public KiwiSDR fleet:
 
 ### Future work
 
-- **Multi-burst aggregation.** When a vessel emits multiple bursts
-  within a few minutes, each yields an independent fix. A layer above
-  per-burst TDOA could combine convergent fixes (geometric mean,
-  weighted by ellipse) and treat divergent fixes as evidence of
-  unreliable propagation. Doesn't fit inside the per-burst window
-  (the snippet xcorr requires single-burst grouping at the seconds
-  scale), but is a natural enhancement at the minutes scale where
-  vessel motion is negligible.
+- **External oracle for persistent ghosts.** The big remaining failure
+  mode (stable cohort + wrong basin + 100% convergence across repeats)
+  can only be caught by comparison against an external truth. Two
+  practical sources:
+  - **Coast-station / AtoN registry** for fixed-position MMSIs. ITU
+    publishes one; we'd need to import a subset for the most-heard
+    stations and reject TDOA fixes that disagree with the registered
+    location. Definitive: an MMSI registered to "UK Falmouth Radio"
+    fixing in the Coral Sea is provably wrong.
+  - **AIS cross-check** (LSEG or GFW) for vessels. Already wired up
+    in the client for display; could move into the worker as a fix-
+    time check (with caching). Less definitive (AIS can be days
+    stale), but a TDOA fix > 60 kn implied speed from the most-
+    recent AIS is almost certainly a ghost.
+- **Multi-burst aggregation as a fix-quality signal.** Convergence
+  telemetry is in place but only as observability. A future iteration
+  could weight the broadcast position by recent convergent fixes
+  (geometric median, ellipse-weighted) and emit a fused fix instead of
+  the latest raw one. Improves spatial accuracy for vessels emitting
+  multiple bursts.
 - **Threshold calibration from live data.** The 1500 km / 5000 km
   regime boundaries and the 5 / 500 / max_pairwise/20 dedup scales
-  are picked off intuition. The `regime` field on every broadcast and
-  the rejection counters under `regime` and `dedup` give the data
-  needed to retune over a longer capture.
+  are picked off intuition. The `regime` field on every broadcast,
+  the rejection counter under `dedup`, and the `convergence` field
+  give the data needed to retune over a longer capture.
 
 ## Tone & design
 

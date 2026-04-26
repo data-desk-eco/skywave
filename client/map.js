@@ -9,8 +9,8 @@
 //     receiver, all converging at the diamond on a clean fix; a useful
 //     diagnostic for "why did this fix land here vs there".
 
-import { Vessels } from "./vessels.js?v=34";
-import { hyperbolaSegments } from "./hyperbola.js?v=34";
+import { Vessels } from "./vessels.js?v=35";
+import { hyperbolaSegments } from "./hyperbola.js?v=35";
 
 const TILE_URL = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png";
 const TILE_ATTR = '&copy; <a href="https://carto.com/">carto</a> · OSM';
