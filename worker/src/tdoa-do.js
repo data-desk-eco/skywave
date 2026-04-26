@@ -53,6 +53,31 @@ const MAX_BEARING_GAP_DEG = 220;
 // matrix) blow up to 1500-20000 km. 1000 km gives margin around the
 // real cluster while catching every ghost we've observed.
 const MAX_ELLIPSE_SEMI_MAJOR_KM = 1000;
+// Regime detection. Each bucket falls into one of three classes
+// based on band + cohort spread; we apply different site-dedup at
+// each, and refuse to solve the ambiguous middle.
+//
+//   ground-wave   — MF, all receivers within ~ground-wave range.
+//                   Solver's geodesic assumption matches reality.
+//                   5 km dedup (collocations only).
+//   long-baseline — HF cohort spread ≫ "fool the solver" range.
+//                   Skywave is the actual physics, but the spread is
+//                   so large that geometry forces a unique solution
+//                   near the truth even with the wrong propagation
+//                   model. Adaptive dedup at max_pairwise/20.
+//   ambiguous     — anything else: HF cohorts in the 100-5000 km
+//                   middle zone, or unusually-wide MF cohorts.
+//                   The PALATINE/AWTAD/ISABELITA failure mode lives
+//                   here. Refuse to solve.
+//
+// Re-classified on every arrival, so a bucket that starts ambiguous
+// (3 European HF receivers) and gains a distant straggler (NZ) can
+// transition to long-baseline mid-life.
+const GROUND_WAVE_MAX_SPAN_KM = 1500;
+const LONG_BASELINE_MIN_SPAN_KM = 5000;
+const GROUND_WAVE_DEDUP_KM = 5;
+const LONG_BASELINE_DEDUP_MIN_KM = 500;
+const LONG_BASELINE_DEDUP_FACTOR = 20;
 // Time window (on packetGpsNs) during which arrivals from different
 // receivers count as the same packet. Real MF-ground-wave TDOA is ≲4 ms
 // even for the longest baselines we'd consider; 2 s lets the
@@ -187,7 +212,7 @@ export class TDOADO {
       try { result = this._solveBucket(b); } catch (_) { return; }
       if (result) {
         result.quorum = result.receivers.length;
-        console.log(`tdoa/solve: mmsi=${b.mmsi} pos=${result.position.lat.toFixed(3)},${result.position.lon.toFixed(3)} resid=${result.position.residualKm.toFixed(1)}km q=${result.quorum} ellipse=${result.geometry.ellipseSemiMajorKm}km`);
+        console.log(`tdoa/solve: regime=${result.regime} mmsi=${b.mmsi} pos=${result.position.lat.toFixed(3)},${result.position.lon.toFixed(3)} resid=${result.position.residualKm.toFixed(1)}km q=${result.quorum} ellipse=${result.geometry.ellipseSemiMajorKm}km`);
         this._broadcast(result);
       }
     }
@@ -238,13 +263,23 @@ export class TDOADO {
   // every other receiver's snippet is correlated against it, so picking
   // a noisy template (the old "first arrival" default) directly inflates
   // the lag estimate noise on every other receiver.
+  //
+  // Regime classification + per-regime site-dedup runs first; ambiguous
+  // cohorts (the PALATINE/ISABELITA middle zone) are refused outright.
+  // Surviving cohorts are deduped at the regime-appropriate scale, and
+  // the cleanest decode in each cluster wins (becoming the xcorr
+  // reference by virtue of `dedupByLocation` returning cleanest-first).
   _solveBucket(bucket) {
-    const dets = [...bucket.dets];
-    const refIdx = dets.reduce(
-      (best, d, i) => mmsiQuality(d.call.caller) > mmsiQuality(dets[best].call.caller) ? i : best,
-      0,
-    );
-    if (refIdx !== 0) [dets[0], dets[refIdx]] = [dets[refIdx], dets[0]];
+    const regime = classifyRegime(bucket.dets);
+    if (!regime) {
+      this.rejections.regime = (this.rejections.regime || 0) + 1;
+      return null;
+    }
+    const dets = dedupByLocation(bucket.dets, regime.dedupKm);
+    if (dets.length < MIN_RECEIVERS) {
+      this.rejections.dedup = (this.rejections.dedup || 0) + 1;
+      return null;
+    }
     const ref = dets[0];
     const refSR = ref.snippet.sampleRate;
 
@@ -318,6 +353,7 @@ export class TDOADO {
 
     return {
       t: "tdoa",
+      regime: regime.name,
       mmsi: bucket.mmsi,
       call: ref.call,
       position: { lat: sol.lat, lon: sol.lon, residualKm: sol.residualKm },
@@ -342,6 +378,7 @@ export class TDOADO {
     }
     this.recentSolves.push({
       mmsi: msg.mmsi,
+      regime: msg.regime,
       position: msg.position,
       quorum: msg.quorum,
       geometry: msg.geometry,
@@ -385,6 +422,57 @@ function mmsiQuality(m) {
   let q = 0;
   for (let i = 0; i < m.length; i++) if (m[i] !== "?") q++;
   return q;
+}
+
+// Greedy site-dedup: walk detections cleanest-decode-first, keep each
+// only if it's ≥ radiusKm from every already-kept one. Returned list
+// is in keep-order, so dets[0] is the cohort-wide cleanest decode —
+// the natural reference for the xcorr template.
+function dedupByLocation(dets, radiusKm) {
+  const sorted = [...dets].sort(
+    (a, b) => mmsiQuality(b.call.caller) - mmsiQuality(a.call.caller),
+  );
+  const keep = [];
+  for (const d of sorted) {
+    if (keep.every((k) => gcDistanceKm(d.gps, k.gps) >= radiusKm)) keep.push(d);
+  }
+  return keep;
+}
+
+// Compute the maximum pairwise distance (km) among the cohort. O(N²)
+// over typically 3-10 detections — trivially cheap.
+function cohortMaxPairwiseKm(dets) {
+  let max = 0;
+  for (let i = 0; i < dets.length; i++) {
+    for (let j = i + 1; j < dets.length; j++) {
+      const d = gcDistanceKm(dets[i].gps, dets[j].gps);
+      if (d > max) max = d;
+    }
+  }
+  return max;
+}
+
+// Classify the cohort's propagation regime from band + spread. Returns
+// { name, dedupKm } for solvable regimes, or null for ambiguous (which
+// the caller treats as "refuse to solve"). All bucket dets share a
+// band by ingest invariant, so we can read it off dets[0].
+function classifyRegime(dets) {
+  if (!dets.length) return null;
+  const band = dets[0].band;
+  const span = cohortMaxPairwiseKm(dets);
+  if (band === "MF") {
+    if (span <= GROUND_WAVE_MAX_SPAN_KM) {
+      return { name: "ground-wave", dedupKm: GROUND_WAVE_DEDUP_KM };
+    }
+    return null;
+  }
+  if (span >= LONG_BASELINE_MIN_SPAN_KM) {
+    return {
+      name: "long-baseline",
+      dedupKm: Math.max(LONG_BASELINE_DEDUP_MIN_KM, span / LONG_BASELINE_DEDUP_FACTOR),
+    };
+  }
+  return null;
 }
 
 // slotId is "host:port|band". Dedup by the host:port half so the same

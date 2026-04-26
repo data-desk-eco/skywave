@@ -152,6 +152,8 @@ function runTrial(txGps, rng) {
     coord._ingest({
       receivedMs: Date.now(),
       slotId: `${rec.slot.slot}|${rec.slot.band}`,
+      band: rec.slot.band,
+      label: rec.slot.slot,
       gps: rec.slot.gps,
       call: rec.call,
       packetGpsNs: BigInt(rec.packetGpsNs),

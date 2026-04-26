@@ -11,9 +11,9 @@
 //      un-follow the others so the server doesn't waste bandwidth
 //      streaming PCM we'd never play.
 
-import { Vessels } from "./vessels.js?v=33";
-import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=33";
-import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=33";
+import { Vessels } from "./vessels.js?v=34";
+import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=34";
+import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=34";
 
 const DEBUG = /(\?|&)debug=1\b/.test(location.search);
 const AUDIO_LEAD_SEC = 0.25;
@@ -502,7 +502,8 @@ function renderTdoaInCard(entry, tdoa) {
     }
     const { lat, lon, residualKm } = tdoa.position;
     const when = new Date(tdoa.broadcastMs).toISOString().slice(11, 19) + "Z";
-    const qualityMeta = `±${residualKm.toFixed(1)} km`;
+    const regimeTxt = tdoa.regime ? ` · ${tdoa.regime}` : "";
+    const qualityMeta = `±${residualKm.toFixed(1)} km${regimeTxt}`;
     // Pull fresh AIS (LSEG) for ground-truth comparison if available.
     const info = Vessels.get(entry.call.caller);
     let aisLine = "";

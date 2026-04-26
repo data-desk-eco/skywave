@@ -9,8 +9,8 @@
 //     receiver, all converging at the diamond on a clean fix; a useful
 //     diagnostic for "why did this fix land here vs there".
 
-import { Vessels } from "./vessels.js?v=33";
-import { hyperbolaSegments } from "./hyperbola.js?v=33";
+import { Vessels } from "./vessels.js?v=34";
+import { hyperbolaSegments } from "./hyperbola.js?v=34";
 
 const TILE_URL = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png";
 const TILE_ATTR = '&copy; <a href="https://carto.com/">carto</a> · OSM';
@@ -150,7 +150,7 @@ export function setTdoaOnMiniMap(entry, tdoa) {
         iconSize: [14, 14], iconAnchor: [7, 7],
       }),
     }).bindTooltip(
-      `TDOA fix · ±${(residualKm || 0).toFixed(1)} km · q=${tdoa.quorum}`,
+      `TDOA fix · ±${(residualKm || 0).toFixed(1)} km · q=${tdoa.quorum}${tdoa.regime ? ` · ${tdoa.regime}` : ""}`,
       { direction: "top", offset: [0, -6] },
     );
     entry._tdoaMarker.addTo(entry._map);

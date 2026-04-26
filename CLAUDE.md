@@ -32,9 +32,12 @@ browser —ws—┘        │ upstream ws://
   closes itself 5 min after the last viewer leaves. Also POSTs each
   decoded call's GPS-anchored audio snippet to `TDOADO`.
 * **TDOADO** (singleton) buckets snippets by fuzzy MMSI + same band +
-  tight packetGpsNs window, cross-correlates them, runs `solveTdoa`,
-  applies the geometry gates (residual + bearing-gap + ellipse), and
-  broadcasts each surviving fix to clients on `/v2/tdoa/subscribe`.
+  tight packetGpsNs window, classifies each bucket's propagation
+  regime from cohort spread, applies regime-specific site-dedup,
+  cross-correlates the survivors, runs `solveTdoa`, applies the shared
+  geometry gates (residual + bearing-gap + ellipse), and broadcasts
+  each surviving fix to clients on `/v2/tdoa/subscribe`. Buckets in
+  the ambiguous middle regime are refused outright.
 * **locationHint**: a ReceiverDO is placed near its KiwiSDR via a
   GPS-derived CF region string (apac / weur / wnam …), keeping
   upstream hops on-continent.
@@ -83,66 +86,83 @@ design (loop / dipole / T2FD / Beverage / folded / longwire).
 
 ## TDOA methodology
 
-Operating regime: **any DSC band, geometry-gated**. Two propagation
-regimes both produce real fixes on the public KiwiSDR fleet, and the
-gate stack admits both:
+The pipeline organises around **propagation regimes**. Each bucket
+(MMSI + band + same-burst time-window) is classified into one of three
+regimes from cohort properties (band + max pairwise distance), and the
+solver applies regime-specific rules. The middle zone — physically
+ambiguous cohorts — is refused outright, because in live data we
+can't tell those apart from their ghosts using anything we measure.
 
-- **MF ground-wave** on a tight cohort (LIG, WAPP, NY, KAT, CHES,
-  english-channel, dover — see `regions.js`). Cleanest physics:
-  signals travel along the great-circle surface at ~c, so timing-to-
-  distance is plain geodesic distance. Where the fleet has the density
-  to form a 3+ receiver ground-wave cohort, fixes land within tens of
-  km of truth.
-- **HF skywave** on a globally-spread cohort (Global / "ALL" view).
-  Receivers hear the same burst via 1-3 hop F2 reflection, with all
-  the per-pair propagation unknowns that implies. Live data shows two
-  clear populations: real fixes with tight error ellipses (semi-major
-  <600 km) and ghost basins with wide ones (1500-20000 km). The gates
-  separate them empirically.
+### The three regimes
 
-The previous methodology was *ground-wave only* and rejected HF
-outright. Live capture against the deployed Global rack showed several
-q≥4 HF skywave fixes landing on AIS truth (MEDI NOSHIMA in Bay of
-Biscay; an S-China-Sea AtoN converging across q3→q6 bursts; a SG-flag
-ship in Danish waters). Those would have been thrown away. The new
-gate stack admits HF when the geometry is good and rejects it when it
-isn't — regardless of band.
+| regime | trigger | site-dedup | what it is |
+|---|---|---|---|
+| **ground-wave** | band = MF AND cohort max-pairwise ≤ 1500 km | 5 km | Signals travel geodesically along the surface at ~c. Solver assumption matches reality. The clean-physics regime, used by LIG / WAPP / NY / KAT / CHES / english-channel / dover. |
+| **long-baseline** | cohort max-pairwise ≥ 5000 km | adaptive: max(500 km, max_pairwise / 20) | HF skywave, but the cohort spread is so large relative to the per-hop propagation slop that geometry forces a unique solution near truth even with the wrong propagation model. The Global rack's good HF fixes (MEDI NOSHIMA, SBITANGO, the convergent S-China-Sea AtoN). |
+| **ambiguous** | everything else: HF cohorts in the 100-5000 km middle zone, or unusually-wide MF cohorts | — (refuse to solve) | The PALATINE / AWTAD / ISABELITA failure mode: receivers clustered tightly enough that several receivers contribute the same constraint, and timing differences fit a "near-cohort source" interpretation under the ground-wave model when actual physics is multi-hop skywave from somewhere far. The gates can't reliably distinguish these from real fixes, so we don't publish them. |
 
-### What the gates catch
+Re-classified on every new arrival, so a bucket that starts ambiguous
+(3 European HF receivers) and gains a distant straggler (Sydney) can
+transition to long-baseline mid-life.
+
+### Per-regime site-dedup
+
+Receivers within the regime's dedup radius give essentially the same
+TDOA constraint and shouldn't fake `q ≥ 4` overdetermination. Solve-
+time dedup runs after classification; the cleanest decode in each
+cluster wins (and becomes the xcorr reference by virtue of
+`dedupByLocation` returning cleanest-first).
+
+The long-baseline radius is **adaptive**: `max(500 km, max_pairwise /
+20)`. Empirically, this keeps the SBITANGO-class cohorts (4-5 well-
+spread receivers, closest pair ~700 km) intact while collapsing
+ISABELITA-class cohorts (3 European receivers within 800 km collapse
+to 1 because at a 17 000 km cohort spread their TDOA contributions are
+geometrically equivalent). Dedup goes greedy cleanest-decode-first —
+order matters, so picking by `mmsiQuality` keeps it deterministic.
+
+### Gates that apply across all surviving regimes
 
 `worker/src/tdoa-do.js`:
 
-- **q ≥ 4 required.** q=3 is exactly determined in 2D, has a mirror
-  ambiguity that only a 4th constraint breaks, and residual ≡ 0 by
-  construction — too unreliable to publish as a position. Decoded
-  calls still surface in the table (presence info); we just don't
-  pretend we know where the source is. Live data: every clear ghost
-  in the un-rejected set was q=3.
-- **Same band per bucket** — receivers on different DSC bands hear
-  different physical transmissions, so cross-band snippet xcorr is
-  noise. Imposed at ingest in `_findMatchingBucket`. Different-band
-  receivers form parallel buckets, each tracking that band on its own.
+- **q ≥ 4 (post-dedup)**. q=3 is exactly determined in 2D, has a
+  mirror ambiguity that only a 4th constraint breaks, residual ≡ 0 by
+  construction. Decoded calls still surface in the table (presence
+  info); we just don't pretend we know where the source is.
+- **Same band per bucket** (ingest invariant) — receivers on different
+  DSC bands hear different physical transmissions, so cross-band
+  snippet xcorr is noise. Imposed in `_findMatchingBucket`.
 - **Residual ≤ 300 km** — belt-and-suspenders against grossly bad
-  xcorr lags. Rarely fires alone: most ghosts have small residuals
-  because the wrong basin is internally self-consistent.
+  xcorr lags. Most ghosts have small residuals because the wrong basin
+  is internally self-consistent, so this rarely fires alone.
 - **Bearing gap ≤ 220°** — max angular gap between consecutive
   receivers as seen from the solved position. >220° means the cohort
   is bunched in <140° of the compass and the fix is unconstrained in
-  the away direction. Tightened from 270° after live data showed
-  Madagascar-style ghosts at 246° passing.
+  the away direction.
 - **Ellipse semi-major ≤ 1000 km** — the 1σ position-uncertainty
   ellipse from the cohort's Fisher matrix at 1 ms per-receiver timing
-  noise. The most discriminating single signal: a near-singular Fisher
-  matrix (one-sided cohort) blows up to thousands of km along the
-  unconstrained axis. Cleanly separates the convergent S-China-Sea
-  AtoN (semi-major 200 km) from the Falmouth-coast-station-fixing-in-
-  Coral-Sea ghost (semi-major ~1900 km) in live data.
+  noise. Strongest single signal in live data: a near-singular Fisher
+  matrix blows up to thousands of km along the unconstrained axis.
 
 The 1 ms timing-noise figure isn't ground-truthed — it's a reasonable
 estimate of KiwiSDR GPS-discipline behaviour. The ellipse gate is
-calibrated to the same σ_t the `tdoaUncertainty` function already
-uses, so threshold and value scale together if the real σ_t is
-different.
+calibrated to the same σ_t `tdoaUncertainty` already uses, so
+threshold and value scale together if the real σ_t is different.
+
+### Telemetry
+
+The `regime` field is included in each broadcast and in
+`recentSolves`, and the rejection counter (`/v2/tdoa/recent`) tracks
+buckets dropped at each stage:
+- `regime` — bucket classified as ambiguous (HF middle zone or wide
+  MF), refused before even attempting to solve
+- `dedup` — survived classification but post-dedup count fell below
+  q=4
+- `residual`, `bearing`, `ellipse` — failed the named gate at solve
+  time
+
+Watching the relative counts across these is the cheapest way to
+understand which class of cohort the rack is actually producing.
 
 ### Reference receiver
 
@@ -190,14 +210,20 @@ well far from the fix where the diagnostic value lives. See
 
 `worker/src/regions.js`:
 - **bbox regions** (Global + continent presets) → `pickRack` allocates
-  96 slots across all 6 DSC bands, weighted by where multi-hearings
-  actually happen (HF8/HF12 heaviest). Most multi-RX detections in
-  this rack are HF skywave; the ones that survive the gates are the
-  real-HF path.
+  96 slots across all 6 DSC bands. **For HF bands, picks are scored
+  by `base_score × spread_bonus`**, where `spread_bonus` saturates at
+  5 000 km from the nearest already-picked same-band receiver — that's
+  the long-baseline-regime threshold the solver uses, so picks beyond
+  it count as "geometrically distinct" for free. The intent is to
+  build an HF rack whose detection cohorts are *long-baseline by
+  construction*, so most HF multi-RX bursts land cleanly in the
+  long-baseline regime instead of the ambiguous middle. **MF picks
+  keep the original "best score" behaviour** because tight ground-wave
+  coverage is what we want there.
 - **target regions with `target.bands: [2187.5]`** → `pickGroundWaveCohort`
   picks octant-balanced MF receivers within `radiusKm`. Site-deduped
   at 5 km. SNR self-report ignored (it's a noise-floor estimate, not
-  a decode-rate predictor). The high-confidence ground-wave path.
+  a decode-rate predictor). Feeds the ground-wave regime by design.
 - **target regions without `target.bands`** → `pickSurroundCohort`
   for long-baseline targets where ground wave isn't an option.
 - All picks pass the same hard health filters: active, GPS-fixing,
@@ -205,25 +231,36 @@ well far from the fix where the diagnostic value lives. See
 
 ### Validation
 
-Live capture against the deployed Global rack (`/v2/tdoa/recent`)
-during methodology revision:
-- ~10 fixes/min throughput.
-- Of 20 fixes in a 4-minute snapshot: 6 with semi-major <600 km
-  looked plausible (3 converging on one S-China-Sea AtoN, an SG-flag
-  ship in Danish waters, a Singapore-area HF16, and a Danish coast
-  station fixing in Denmark on MF); 11 with semi-major >1500 km were
-  clear ghosts (UK Falmouth coast station "fixing" in the Coral Sea
-  three times, a HK ship "in" Madagascar, a fix in landlocked
-  Central African Republic).
-- The ~800 km gap in the ellipse distribution was empirical, not
-  designed — the 1000 km gate drops every ghost in the sample while
-  keeping every plausible fix.
-
-The earlier `english-channel` ground-wave validation (WHITCHALLENGER,
-UK tanker, MMSI 235007413: repeat q=4/6/7 fixes converging within 10
-km of each other and 40-50 km of her actual Solent anchor) still
-stands — that geometry has tight ellipse and low bearing gap, so it
-passes the new gates as well as the old.
+Live capture against the deployed Global rack while iterating the
+gate stack:
+- ~10 fixes/min throughput pre-regime-classification; expected to
+  drop to a slower stream of higher-confidence fixes after, with the
+  ambiguous middle dropped wholesale.
+- The decisive failures that drove the regime split:
+  - **AWTAD** (Saudi cargo, q=3 → q=4 after MIN_RECEIVERS bump): 3
+    NW-European HF16 receivers heard a Persian-Gulf transmission via
+    skywave; fix landed in the cohort itself in NW Europe. Cluster
+    diameter ~600 km → ambiguous → reject.
+  - **PALATINE** (MLT cargo, q=4): 3 N-Italian HF8 receivers within
+    150 km + 1 in the UK; fix landed inside the Italian cluster.
+    Cluster diameter ~1500 km, HF → ambiguous → reject.
+  - **ISABELITA** (q=5): 3 European HF12 receivers (480-830 km
+    pairwise) + 1 NZ + 1 Indonesia; long-baseline cohort spread, but
+    European 3 contributed identical constraint and fix landed in
+    Tibet. Cohort diameter ~18 000 km → long-baseline → adaptive
+    dedup at ~900 km collapses the European 3 to 1 → q=3 < 4 → drop
+    at the dedup gate.
+- Cases preserved by the new methodology:
+  - **WHITCHALLENGER** (UK tanker, english-channel cohort): MF
+    ground-wave, q=4/6/7 fixes converging within 10 km of each other
+    and 40-50 km of her Solent anchor. Tight cohort (~700 km
+    diameter), MF → ground-wave regime → preserved.
+  - **SBITANGO** (MHL cargo): 5 HF12 receivers spanning NZ →
+    Hong Kong → Finland → UK / Denmark; fix at (5.7°N, 71°E) Indian
+    Ocean validated against fresh AIS. Cohort diameter ~17 000 km →
+    long-baseline → adaptive dedup at ~850 km is large enough to
+    drop one of the 700-km European pairs but leaves q=4 distinct
+    geographies.
 
 `scripts/global_chokepoints.mjs` ranks where ground-wave cohorts can
 form on the current public KiwiSDR fleet:
@@ -233,8 +270,24 @@ form on the current public KiwiSDR fleet:
   Lands End, Northern Italy — 11-19 receivers within 95-167° gap.
 - **Other strategic chokepoints** (Hormuz, Malacca, Bosphorus,
   Singapore) lack ground-wave receiver density — they appear on the
-  Global rack via HF skywave instead, and benefit from the same
-  geometry gates.
+  Global rack via HF skywave instead, and depend on the long-baseline
+  regime + HF spread bias in the picker for usable cohorts.
+
+### Future work
+
+- **Multi-burst aggregation.** When a vessel emits multiple bursts
+  within a few minutes, each yields an independent fix. A layer above
+  per-burst TDOA could combine convergent fixes (geometric mean,
+  weighted by ellipse) and treat divergent fixes as evidence of
+  unreliable propagation. Doesn't fit inside the per-burst window
+  (the snippet xcorr requires single-burst grouping at the seconds
+  scale), but is a natural enhancement at the minutes scale where
+  vessel motion is negligible.
+- **Threshold calibration from live data.** The 1500 km / 5000 km
+  regime boundaries and the 5 / 500 / max_pairwise/20 dedup scales
+  are picked off intuition. The `regime` field on every broadcast and
+  the rejection counters under `regime` and `dedup` give the data
+  needed to retune over a longer capture.
 
 ## Tone & design
 

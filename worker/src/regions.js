@@ -663,28 +663,55 @@ export function pickRack(receivers, bbox, requested = DEFAULT_FANOUT) {
   const picks = [];
   const bandsPerHost = new Map();  // host → count of picks using it
 
-  // First pass: respect per-band spatial diversity + per-host band cap.
+  // First pass: pick the best-spread-and-scoring candidate per band per
+  // round, with per-host band cap. For HF bands we re-rank candidates
+  // each round by `score × spread bonus`, where the bonus saturates at
+  // 5000 km from the nearest already-picked same-band receiver — that's
+  // the long-baseline-regime threshold the solver uses, so picks beyond
+  // it count as "geometrically distinct" for free. MF bands keep the
+  // original "best score wins, just enforce MIN_SEP_DEG" behaviour
+  // because tight ground-wave coverage is the goal there.
+  const HF_SPREAD_SATURATION_KM = 5000;
+  const HF_SPREAD_FLOOR = 0.2;
   let progress = true;
   while (progress && picks.length < n) {
     progress = false;
     for (let bi = 0; bi < k; bi++) {
       if (quota[bi] <= 0) continue;
       const pool = pools[bi];
+      const isHF = bandsKHz[bi] !== 2187.5;
+      const sameBand = picks.filter((p) => p.bandKHz === bandsKHz[bi]);
+
+      let bestIdx = -1, bestScore = -Infinity;
       for (let ci = 0; ci < pool.length; ci++) {
         const c = pool[ci];
         if (!c) continue;
         if ((bandsPerHost.get(c.host) || 0) >= MAX_BANDS_PER_HOST) continue;
-        const sameBand = picks.filter((p) => p.bandKHz === bandsKHz[bi]);
         const tooClose = sameBand.some(
           (p) => Math.hypot(p.gps[0] - c.gps[0], p.gps[1] - c.gps[1]) < MIN_SEP_DEG,
         );
         if (tooClose) continue;
+
+        let scored = c.score;
+        if (isHF && sameBand.length > 0) {
+          let minKm = Infinity;
+          for (const p of sameBand) {
+            const d = kmDistance(p.gps, c.gps);
+            if (d < minKm) minKm = d;
+          }
+          scored *= HF_SPREAD_FLOOR + (1 - HF_SPREAD_FLOOR) *
+            Math.min(1, minKm / HF_SPREAD_SATURATION_KM);
+        }
+        if (scored > bestScore) { bestScore = scored; bestIdx = ci; }
+      }
+
+      if (bestIdx >= 0) {
+        const c = pool[bestIdx];
         picks.push({ ...c, bandKHz: bandsKHz[bi] });
         bandsPerHost.set(c.host, (bandsPerHost.get(c.host) || 0) + 1);
-        pool[ci] = null;
+        pool[bestIdx] = null;
         quota[bi]--;
         progress = true;
-        break;
       }
       if (picks.length >= n) break;
     }
