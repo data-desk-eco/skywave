@@ -130,7 +130,6 @@ body.tdoa-only .call:not(.has-tdoa) { display: none; }
   align-items: flex-end;
   justify-content: center;
   gap: 2px;
-  min-height: 30px;              /* reserve space for the (often empty) playing line */
   font-size: 10px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -142,6 +141,7 @@ body.tdoa-only .call:not(.has-tdoa) { display: none; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   max-width: 100%;
   color: var(--fg);
+  min-height: 1.45em;            /* always reserve one line so header height is constant */
 }
 .rxcount { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .playing.on::before {
