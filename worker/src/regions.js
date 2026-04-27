@@ -199,8 +199,8 @@ export function coversBand(rx, khz) {
 // Rack selection — defensible narrative
 // =====================================
 //
-// Out of the ~900 public KiwiSDRs, we pick 16 per DSC band (96 slots
-// total) for a given region. The criteria, in order:
+// Out of the ~900 public KiwiSDRs, we pick a band-weighted slice (40
+// slots total) for a given region. The criteria, in order:
 //
 //   Hard filters (all must pass):
 //     · receiver self-reports `status=active`, not `offline=yes`
@@ -263,7 +263,7 @@ const MIN_SEP_DEG = 1.5;       // was 3 — two receivers on the same stretch
 const MAX_BANDS_PER_HOST = 2;
 const MIN_GPS_FIXES_HOUR = 100;  // GPS hardware must actually be fixing
 const GPS_HW_MARKER = "📡 GPS"; // substring in `sdr_hw` when the option is present
-export const DEFAULT_FANOUT = 96;  // also the hard ceiling — ?fanout= can only narrow the rack
+export const DEFAULT_FANOUT = 40;  // also the hard ceiling — ?fanout= can only narrow the rack
 
 // Cluster gate — a candidate is only kept if at least one other same-
 // band candidate exists within the band's cluster radius. Purely a
@@ -287,12 +287,12 @@ const CLUSTER_RADIUS_KM_BY_BAND = {
 // these proportionally and rounds to integers; any residual goes to
 // the highest-weighted band.
 const BAND_WEIGHTS = {
-  2187.5:  0.145,   // MF   — 14/96
-  4207.5:  0.063,   // HF4  —  6/96
-  6312.0:  0.188,   // HF6  — 18/96
-  8414.5:  0.208,   // HF8  — 20/96
-  12577.0: 0.208,   // HF12 — 20/96
-  16804.5: 0.188,   // HF16 — 18/96
+  2187.5:  0.145,   // MF   — 6/40
+  4207.5:  0.063,   // HF4  — 3/40
+  6312.0:  0.188,   // HF6  — 8/40
+  8414.5:  0.208,   // HF8  — 8/40
+  12577.0: 0.208,   // HF12 — 8/40
+  16804.5: 0.188,   // HF16 — 8/40
 };
 
 // Coast-station-style MMSIs and many public KiwiSDRs name-check their

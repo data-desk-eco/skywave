@@ -78,7 +78,8 @@ blacklisting us**, and **considerate** (≥ 2 free user slots so a human
 listener always has one). Any one (host, port) is capped at 2 bands
 in the bbox picker so the rack doesn't over-index on a single operator;
 target picks replicate across allowed bands deliberately. The "Global"
-view and per-region bbox views share a 96-slot ceiling.
+view and per-region bbox views share a 40-slot ceiling (lowered from
+96 to keep monthly DO compute under Cloudflare's 400k GB-s free tier).
 
 Scoring (bbox): `freeSlots × coastalProximity × snrBonus × antennaBonus`.
 `antennaBonus = 1.5` when the antenna free-text mentions a broadband
@@ -254,7 +255,7 @@ well far from the fix where the diagnostic value lives. See
 
 `worker/src/regions.js`:
 - **bbox regions** (Global + continent presets) → `pickRack` allocates
-  96 slots across all 6 DSC bands. **For HF bands, picks are scored
+  40 slots across all 6 DSC bands. **For HF bands, picks are scored
   by `base_score × spread_bonus`**, where `spread_bonus` saturates at
   5 000 km from the nearest already-picked same-band receiver — that's
   the long-baseline-regime threshold the solver uses, so picks beyond
