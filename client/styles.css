@@ -206,6 +206,7 @@ body.tdoa-only .call:not(.has-tdoa) { display: none; }
 .call.distress {
   background: var(--fg);
   color: var(--bg);
+  margin: 0 -8px;
   padding: 10px 8px;
 }
 .call.distress .c-t,
@@ -215,7 +216,7 @@ body.tdoa-only .call:not(.has-tdoa) { display: none; }
 .call.distress .c-pay,
 .call.distress .c-heard { color: var(--bg); }
 
-.call.urgency { border-left: 2px solid var(--fg); padding-left: 6px; }
+.call.urgency { box-shadow: inset 2px 0 0 var(--fg); margin-left: -8px; padding-left: 8px; }
 .call.urgency .c-flow { font-weight: 700; }
 .call.safety  .c-flow { font-weight: 700; }
 
@@ -389,7 +390,7 @@ body.tdoa-only .call:not(.has-tdoa) { display: none; }
     column-gap: 16px;
     padding: 8px 0;
   }
-  .call.distress { padding: 8px 0; }
+  .call.distress { margin: 0; padding: 8px 0; }
   .call.open .call-detail {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
