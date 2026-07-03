@@ -185,11 +185,13 @@ export class TDOADO {
     this.buckets = new Map();        // mmsi → [{mmsi, firstSeenMs, dets[]}]
     this.recentDets = [];
     this.recentSolves = [];
+    this.recentRejects = [];         // suppressed fixes, with position + gate
     this.rejections = {};            // gate → count, observability only
     this.recentFixesByMmsi = new Map(); // mmsi → [{lat,lon,broadcastMs}]
     this.state.blockConcurrencyWhile(async () => {
-      this.recentDets   = (await this.state.storage.get("recentDets"))   || [];
-      this.recentSolves = (await this.state.storage.get("recentSolves")) || [];
+      this.recentDets    = (await this.state.storage.get("recentDets"))    || [];
+      this.recentSolves  = (await this.state.storage.get("recentSolves"))  || [];
+      this.recentRejects = (await this.state.storage.get("recentRejects")) || [];
     });
   }
 
@@ -228,9 +230,10 @@ export class TDOADO {
       return Response.json({
         recentDetections: this.recentDets.slice(-50),
         openBuckets,
-        recentSolves: this.recentSolves.slice(-20),
+        recentSolves: this.recentSolves.slice(-40),
+        recentRejects: this.recentRejects.slice(-60),
         rejections: this.rejections,
-      });
+      }, { headers: { "access-control-allow-origin": "*" } });
     }
 
     return new Response("tdoa coordinator", { status: 404 });
@@ -459,6 +462,18 @@ export class TDOADO {
     const rej = (gate) => {
       this.rejections[gate] = (this.rejections[gate] || 0) + 1;
       console.log(`tdoa/reject: gate=${gate} mmsi=${bucket.mmsi} q=${dets.length} pos=${pos[0].toFixed(2)},${pos[1].toFixed(2)} resid=${sol.residualKm.toFixed(0)}km`);
+      // Suppressed fixes keep their position + cohort so a map can plot
+      // ghosts alongside real fixes (these are the interesting rejects —
+      // the pre-solve dedup/pair drops have no position and stay counts).
+      this.recentRejects.push({
+        mmsi: bucket.mmsi, gate, regime: regime.name,
+        position: { lat: +sol.lat.toFixed(3), lon: +sol.lon.toFixed(3), residualKm: +sol.residualKm.toFixed(1) },
+        quorum: dets.length,
+        receivers: dets.map((d) => ({ slot: hostOf(d.slotId), label: d.label, gps: d.gps })),
+        broadcastMs: Date.now(),
+      });
+      if (this.recentRejects.length > 100) this.recentRejects.splice(0, this.recentRejects.length - 100);
+      this.state.storage.put("recentRejects", this.recentRejects).catch(() => {});
       return null;
     };
 
