@@ -97,7 +97,27 @@ const rows = fs.readFileSync(path, "utf8").trim().split("\n").map((l) => {
   try { return JSON.parse(l); } catch { return null; }
 }).filter(Boolean);
 
-const solves = rows.filter((r) => r.kind === "solve");
+// Accept both row formats:
+//   - tdoa_watch.mjs rows ({kind:"solve", tdoa:[la,lo], ...})
+//   - raw TDOADO broadcasts from CapturerDO chunks ({t:"tdoa", position:{...}})
+const solves = rows
+  .filter((r) => r.kind === "solve" || r.t === "tdoa"
+    || (r.position && typeof r.position.lat === "number" && r.mmsi))
+  .map((r) => {
+    if (r.kind === "solve") return r;
+    return {
+      kind: "solve",
+      mmsi: r.mmsi,
+      quorum: r.quorum ?? (r.receivers || []).length,
+      tdoa: [r.position.lat, r.position.lon],
+      tdoa_resid_km: r.position.residualKm,
+      heard_by: (r.receivers || []).map((x) => x.slot || x),
+      receivers: r.receivers || [],
+      geometry: r.geometry,
+      regime: r.regime,
+      convergence: r.convergence,
+    };
+  });
 
 // Filter: at least one cohort host must have heard the burst.
 function hostFromSlot(slot) { return String(slot || "").split("|")[0].split(":")[0]; }
@@ -186,5 +206,25 @@ if (coast.length) {
 if (vessel.length) {
   const ok = vessel.filter(r => (r.impliedKn ?? 0) <= 60).length;
   const close = vessel.filter(r => r.deltaKm < 200).length;
-  console.log(`# Vessels: ${ok}/${vessel.length} plausible by speed; ${close}/${vessel.length} within 200 km of stale GFW lastPos`);
+  const tight = vessel.filter(r => r.deltaKm < 100).length;
+  console.log(`# Vessels: ${ok}/${vessel.length} plausible by speed; ${tight}/${vessel.length} within 100 km, ${close}/${vessel.length} within 200 km of stale GFW lastPos`);
+}
+
+// Per-fix accuracy over EVERY coast-station broadcast (not just the
+// best-quorum one per MMSI). This is the headline number for "valid
+// positional reads on a reliable cadence": each fix is an independent
+// solve of a transmitter whose true position we know exactly.
+const coastFixes = [];
+for (const s of ours) {
+  const cs = COAST_STATIONS[String(s.mmsi || "")];
+  if (!cs) continue;
+  coastFixes.push({ mmsi: s.mmsi, q: s.quorum, errKm: gcKm(s.tdoa, cs.gps) });
+}
+if (coastFixes.length) {
+  const errs = coastFixes.map(f => f.errKm).sort((a, b) => a - b);
+  const pq = (q) => errs[Math.min(errs.length - 1, Math.floor(errs.length * q))];
+  const within100 = errs.filter(e => e < 100).length;
+  console.log();
+  console.log(`# Per-fix coast-station accuracy over ${errs.length} fixes:`);
+  console.log(`#   p50=${pq(0.5).toFixed(0)} km  p90=${pq(0.9).toFixed(0)} km  max=${errs[errs.length-1].toFixed(0)} km  within 100 km: ${within100}/${errs.length} (${(100*within100/errs.length).toFixed(0)}%)`);
 }

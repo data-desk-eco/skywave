@@ -4,6 +4,11 @@
 // Routes:
 //   GET  /v2/rack?region=<id>           → regional rack as JSON
 //   WS   /v2/slot/:host/:port/:bandKHz  → attach to a ReceiverDO
+//   POST /v2/capture/start              → start a fixed-window capture
+//   POST /v2/capture/stop               → kill switch
+//   GET  /v2/capture/status             → current session
+//   GET  /v2/capture/list               → past captures (R2-backed)
+//   GET  /v2/capture/report/:id         → prior-validation metrics
 //   GET  /gfw?query=<mmsi>              → GFW identity lookup (proxy)
 //   GET  /gfw/tracks?vesselId=          → GFW decimated 14-day AIS track
 //   GET  /lseg/track?mmsi=<mmsi>        → LSEG fresh AIS position (cached 30s)
@@ -16,10 +21,11 @@
 import { ReceiverDO } from "./receiver-do.js";
 import { DirectoryDO } from "./directory-do.js";
 import { TDOADO } from "./tdoa-do.js";
+import { CapturerDO } from "./capturer-do.js";
 import { locationHintFor } from "./location-hint.js";
 import { lsegLookupMmsi } from "./lseg.js";
 
-export { ReceiverDO, DirectoryDO, TDOADO };
+export { ReceiverDO, DirectoryDO, TDOADO, CapturerDO };
 
 const CORS = {
   "access-control-allow-origin": "*",
@@ -258,6 +264,17 @@ export default {
                       : "https://do/subscribe";
       const inner = new URL(innerPath);
       return env.TDOA.get(id).fetch(new Request(inner, request));
+    }
+
+    // Capture orchestration — opens WS to a full rack, logs TDOA fixes
+    // to R2 for offline prior-validation analysis. Hard-capped to a
+    // few hours per session, see capturer-do.js for cost rationale.
+    if (url.pathname.startsWith("/v2/capture/")) {
+      const id = env.CAPTURER.idFromName("singleton");
+      const tail = url.pathname.slice("/v2/capture".length);
+      const inner = new URL(`https://do${tail}`);
+      for (const [k, v] of url.searchParams) inner.searchParams.set(k, v);
+      return env.CAPTURER.get(id).fetch(new Request(inner, request));
     }
 
     if (url.pathname === "/receivers") return receivers();

@@ -55,7 +55,7 @@ async function ensureLsegToken(env, force = false) {
       LibraryVersion: "1.0",
     }),
   });
-  if (!r.ok) throw new Error(`LSEG handshake ${r.status}`);
+  if (!r.ok) throw new Error(`LSEG handshake ${r.status}: ${(await r.text()).slice(0, 200)}`);
   const j = await r.json();
   lsegToken = j.access_token;
   lsegTokenAt = now;

@@ -23,8 +23,28 @@ class_name = "DirectoryDO"
 name = "TDOA"
 class_name = "TDOADO"
 
+# CapturerDO — fixed-window simulator that pretends to be a real
+# listener so the rack actually fires. Opens outbound WS to every slot
+# in a chosen rack and writes TDOA broadcasts to R2 for offline prior-
+# validation analysis. Hard-capped to a few hours per session — see
+# capturer-do.js for cost rationale.
+[[durable_objects.bindings]]
+name = "CAPTURER"
+class_name = "CapturerDO"
+
+# R2 bucket for capture data. One-time setup before first deploy:
+#   npx wrangler r2 bucket create skywave-captures
+[[r2_buckets]]
+binding = "CAPTURES"
+bucket_name = "skywave-captures"
+
 # SQLite-backed DO classes — the default after 2025-01-01 compat date,
 # but be explicit so migrations survive compat-date bumps.
+[vars]
+# cloudflare workers refuse fetch() to bare IPs (error 1003); nip.io
+# wildcard DNS gives the LSEG proxy VM a resolvable hostname.
+LSEG_PROXY_URL = "http://34.13.53.112.nip.io:8080"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ReceiverDO", "DirectoryDO"]
@@ -32,3 +52,7 @@ new_sqlite_classes = ["ReceiverDO", "DirectoryDO"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["TDOADO"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["CapturerDO"]

@@ -26,7 +26,7 @@ const TRIALS = parseInt(getArg("--trials", "20"), 10);
 // Per-receiver wall-clock offset in the snippet start (seconds). Models
 // the fact that each ReceiverDO runs its own decoder loop and picks the
 // snippet window at slightly different moments.
-const JITTER_SEC = parseFloat(getArg("--jitter", "0.3"));
+const JITTER_SEC = parseFloat(getArg("--jitter", "0.05"));  // live packet-anchor skew measures <=30 ms
 const SEED = parseInt(getArg("--seed", "7"), 10);
 const SR = 12000;
 const OVERSAMPLE = 8;
@@ -109,7 +109,7 @@ function mockState() {
   };
 }
 
-function runTrial(txGps, rng) {
+async function runTrial(txGps, rng) {
   const base = makeBurst(200, mulberry32(0xD5C));
   // Ground-wave propagation: signal travels great-circle at c. Matches
   // the production solver's geodesic-distance assumption — the cohort
@@ -149,7 +149,7 @@ function runTrial(txGps, rng) {
   coord._broadcast = (m) => { latest = m; };
 
   for (const rec of records) {
-    coord._ingest({
+    await coord._ingest({
       receivedMs: Date.now(),
       slotId: `${rec.slot.slot}|${rec.slot.band}`,
       band: rec.slot.band,
@@ -185,16 +185,16 @@ const txs = [
   [58.0,  5.5],    // inside surround — Norwegian coast
 ];
 console.log(`# TDOA end-to-end (coordinator path) — jitter=${JITTER_SEC}s, seed=${SEED}`);
-console.log("tx_lat   tx_lon   err_km   resid_km   lags(samples)");
+console.log("tx_lat   tx_lon   err_km   resid_km   dt(ms)");
 
 const errors = [];
 for (const tx of txs) {
   for (let t = 0; t < TRIALS; t++) {
-    const r = runTrial(tx, rng);
+    const r = await runTrial(tx, rng);
     if (!r.ok) { console.log(`${tx}: ${r.reason}`); continue; }
     errors.push(r.errKm);
     if (t === 0) {
-      const lagStr = r.lags.map(l => l.lagSamples.toFixed(1)).join(" ");
+      const lagStr = r.lags.map(l => (l.dtSec * 1e3).toFixed(2)).join(" ");
       console.log(`${tx[0].toFixed(3).padStart(6)}  ${tx[1].toFixed(3).padStart(7)}  ${r.errKm.toFixed(2).padStart(6)}  ${r.residualKm.toFixed(3).padStart(8)}   ${lagStr}`);
     }
   }

@@ -26,7 +26,11 @@
 //   GET  /subscribe   — WS upgrade for clients
 //   GET  /recent      — debug snapshot (persisted across eviction)
 
-import { solveTdoa, xcorr, tdoaUncertainty, C } from "./tdoa.js";
+import { solveTdoa, tdoaUncertainty, farFieldCheck, nearestSubsetIdx, C } from "./tdoa.js";
+import { estimateDt, hilbert, resample } from "./toa.js";
+import { lsegLookupMmsi } from "./lseg.js";
+import { densityPenaltyDex } from "./density.js";
+import { coastRegistryCheck, REGISTRY_MAX_KM } from "./coast-registry.js";
 
 // q=4 minimum. q=3 is exactly determined in 2D, has a mirror ambiguity
 // that only q=4 breaks, and residual ≡ 0 by construction — too unreliable
@@ -89,9 +93,78 @@ const PAIR_WINDOW_MS = 30_000;
 // Ground-wave on MF is at c, so any pair across our cohort
 // (≤1500 km baseline) arrives within 5 ms of the snippet anchor.
 const PROPAGATION_SLACK_SEC = 0.010;
+// Minimum envelope peak-to-floor ratio for a cross-correlation pair to
+// count. Live Channel pairs with verified geometry measure 2.5-3.8;
+// unlocked/noise pairs sit near 1. Rejected pairs are dropped from the
+// cohort individually (counted under `pair`), not fatal to the bucket.
+const MIN_PEAK_RATIO = 2.0;
+// AIS oracle (vessels only; coast stations have the registry gate).
+// The one failure mode no internal signal can catch — proven live
+// 2026-07-03: a q=4 night cohort heard ESVAGT OBSERVER ~970 km away
+// off Shetland via 1-hop skywave, and the path-difference timings fit
+// a mid-Channel geodesic source with 0.8 km residual and a 102x
+// far-field ratio. Internally flawless, externally provably wrong —
+// fresh AIS (LSEG) at fix time is the only counter. A fix implying
+// > AIS_MAX_IMPLIED_KN from the last AIS point is rejected; lookup
+// failures and missing credentials never block a broadcast.
+const AIS_MAX_IMPLIED_KN = 60;
+const AIS_MAX_AGE_H = 12;
 // Keepalive alarm: CF DOs stay resident while an alarm is pending, so
 // refresh one on every ingest to keep buckets alive across a cohort.
 const KEEPALIVE_MS = 60_000;
+// Vessel-density prior for dual-basin disambiguation. Score per
+// candidate basin is `residualKm + λ · densityPenaltyDex(la, lo)`,
+// where the penalty is in log10(vessel-hours) below the global busiest
+// cell (~0 for Hormuz / Singapore / English Channel, ~7-8 for empty
+// Southern Ocean). λ is in km per dex; with λ = 100 a single-dex
+// difference in shipping density buys 100 km of residual headroom.
+//
+// Calibrated against captured ghosts:
+//   NEWRESOURCE  truth Δdex=2.5  wrong Δdex=6.3  →  Δ=380 km headroom
+//   EUPHONY ACE  truth Δdex=2.8  wrong Δdex=3.5  →  Δ=78 km headroom
+// The headroom only needs to outweigh the residual gap between the
+// two basins (typically <100 km when both are good fits), so 100 is
+// enough margin to flip the EUPHONY case while leaving room for the
+// residual to dominate when it's actually decisive. Bigger λ would
+// over-weight the prior and pull single-basin fixes toward shipping
+// lanes; smaller λ would fail EUPHONY-class cases.
+const PRIOR_LAMBDA_KM = 100;
+// Far-field gate. Reject when a plane wave explains the measured
+// timings nearly as well as the point fix: the cohort then carries no
+// range information and the "fix" is an arbitrary basin (the night-MF-
+// skywave failure mode — Channel cohorts hearing Lyngby/Civitavecchia/
+// Aegean traffic 750-2400 km away and solving local ghosts).
+//
+// Calibration (scripts/test_farfield.mjs, synthetic Channel cohort):
+// sources ≤300 km from the cohort give planeResid/pointResid ≥ 2.8
+// (p10) at 0.1 ms timing noise with fix errors ≤50 km; sources
+// ≥800 km give ratio ≈ 1 and 200+ km errors. Live ghosts measured
+// 1.12 (q=8) and 1.59 (q=5). The ratio doubles as an accuracy gate:
+// cohorts whose ratio is below ~2 produce >100 km errors even when the
+// source is real, because timing noise has drowned the curvature.
+// 2.5 (up from the initial 2.0) kills the marginal rescue leaks in the
+// far-source synthetics without costing any recovered real fix — the
+// recovered Milford-class fixes measure 2.65-5.23, the far-source
+// leaks 2.02-2.39. The absolute floor handles tiny-residual q=4 cases
+// where both fits are near-exact and the ratio becomes noise.
+const FARFIELD_MIN_RATIO = 2.5;
+// q=4 leaves the plane fit a single degree of freedom, so the ratio is
+// noisy and far sources leak through the 2.5 threshold (live case:
+// AIDAdiva at Bergen ghost-fixed inland England at ratio 2.65, q=4).
+// Synthetic q=4 calibration: real near sources measure ratio p50 ≈ 10
+// (78% above 3.5), far skywave sources p50 ≈ 1.1 (11% leak at 3.5).
+const FARFIELD_MIN_RATIO_Q4 = 4.0;
+const FARFIELD_ABS_FLOOR_KM = 30;
+// Mixed-cohort rescue (see _solveBucket): when a big cohort's full
+// solve would fail the residual or far-field gate, re-solve on the 6
+// receivers nearest the initial fix. Only cohorts comfortably larger
+// than the subset get rescued — rescuing q=6 down to 6 is a no-op and
+// q=7→6 barely sheds contamination.
+const RESCUE_MIN_COHORT = 7;
+const RESCUE_SUBSET_K = 6;
+// Known-position registry gate for coast stations: a fix further than
+// REGISTRY_MAX_KM from every registered site for that MMSI is provably
+// wrong no matter how clean the geometry looked (see coast-registry.js).
 // Multi-burst convergence telemetry. For each MMSI we keep the last
 // few fixes within a sliding window; on each new fix we report how
 // many of the recent ones land within CONVERGENCE_AGREE_KM of the new
@@ -136,7 +209,7 @@ export class TDOADO {
       const det = await this._parseDetection(request);
       if (!det) return Response.json({ ok: false, reason: "bad-record" }, { status: 400 });
       this._logDetection(det);
-      this._ingest(det);
+      await this._ingest(det);
       return Response.json({ ok: true });
     }
 
@@ -199,7 +272,7 @@ export class TDOADO {
     };
   }
 
-  _ingest(det) {
+  async _ingest(det) {
     this._reap();
     this.state.storage.setAlarm(Date.now() + KEEPALIVE_MS).catch(() => {});
     const mmsi = det.call.caller ?? "?";
@@ -217,15 +290,25 @@ export class TDOADO {
     if (b.dets.some((d) => hostOf(d.slotId) === detHost)) return;
     b.dets.push(det);
 
+    // Warm the AIS cache as soon as a vessel bucket starts pairing, so
+    // the fix-time oracle (cold chain: GFW → handshake → symbology →
+    // ticket-polled query, easily >5 s) usually hits a cached position.
+    if (b.dets.length === 2 && this.env?.LSEG_APP_KEY
+        && !String(b.mmsi).startsWith("00") && !b.mmsi.includes("?")) {
+      lsegLookupMmsi(this.env, b.mmsi).catch(() => {});
+    }
+
     // Re-solve on every arrival past quorum: a 3-receiver 2D solve has
     // a mirror ambiguity that a 4th collapses; beyond that, the extra
     // overdetermination tightens the estimate. We broadcast each.
     if (b.dets.length >= MIN_RECEIVERS) {
       let result;
-      try { result = this._solveBucket(b); } catch (_) { return; }
+      try { result = await this._solveBucket(b); } catch (_) { return; }
       if (result) {
         result.quorum = result.receivers.length;
-        console.log(`tdoa/solve: regime=${result.regime} mmsi=${b.mmsi} pos=${result.position.lat.toFixed(3)},${result.position.lon.toFixed(3)} resid=${result.position.residualKm.toFixed(1)}km q=${result.quorum} ellipse=${result.geometry.ellipseSemiMajorKm}km`);
+        const ru = result.geometry.runnerUp;
+        const ruStr = ru ? ` runnerUp=(${ru.lat},${ru.lon},${ru.residualKm}km,${ru.priorPenaltyDex}dex,sep=${ru.sepKm}km)` : "";
+        console.log(`tdoa/solve: regime=${result.regime} mmsi=${b.mmsi} pos=${result.position.lat.toFixed(3)},${result.position.lon.toFixed(3)} resid=${result.position.residualKm.toFixed(1)}km q=${result.quorum} ellipse=${result.geometry.ellipseSemiMajorKm}km prior=${result.geometry.priorPenaltyDex}dex${ruStr}`);
         this._broadcast(result);
       }
     }
@@ -282,40 +365,95 @@ export class TDOADO {
   // Surviving cohorts are deduped at the regime-appropriate scale, and
   // the cleanest decode in each cluster wins (becoming the xcorr
   // reference by virtue of `dedupByLocation` returning cleanest-first).
-  _solveBucket(bucket) {
+  async _solveBucket(bucket) {
     const regime = classifyRegime(bucket.dets);
-    const dets = dedupByLocation(bucket.dets, regime.dedupKm);
+    let dets = dedupByLocation(bucket.dets, regime.dedupKm);
     if (dets.length < MIN_RECEIVERS) {
       this.rejections.dedup = (this.rejections.dedup || 0) + 1;
       return null;
     }
     const ref = dets[0];
     const refSR = ref.snippet.sampleRate;
+    const refA = hilbert(ref.snippet.samples);
 
-    // KiwiSDRs run at 12 000 ± a few Hz. Accept anything within 1 % of
-    // the reference; reject pairs whose snippet anchors are wildly out.
-    for (const d of dets) {
-      const ratio = d.snippet.sampleRate / refSR;
-      if (!(ratio > 0.99 && ratio < 1.01)) return null;
-      const dt = Number(d.snippet.startGpsNs - ref.snippet.startGpsNs);
-      if (Math.abs(dt) > MAX_SPREAD_MS * 1_000_000) return null;
-    }
-
-    const solverDets = [{ gps: ref.gps, t: 0 }];
-    const lagsReport = [{ slot: ref.slotId, label: ref.label, band: ref.band, gps: ref.gps, lagSamples: 0, dtSec: 0 }];
+    let solverDets = [{ gps: ref.gps, t: 0 }];
+    let lagsReport = [{ slot: ref.slotId, label: ref.label, band: ref.band, gps: ref.gps, dtSec: 0, peakRatio: null }];
+    const kept = [ref];
     for (let k = 1; k < dets.length; k++) {
       const d = dets[k];
       const startDtSec = Number(d.snippet.startGpsNs - ref.snippet.startGpsNs) / 1e9;
-      const maxLag = Math.ceil((Math.abs(startDtSec) + PROPAGATION_SLACK_SEC) * refSR);
-      const { lag, peak } = xcorr(ref.snippet.samples, d.snippet.samples, maxLag);
-      if (!Number.isFinite(lag) || !(peak > 0)) return null;
-      const dtSec = startDtSec + lag / refSR;
+      // 0.35 s cap: decoder lock offsets measure ≤30 ms across receivers,
+      // while DSC's DX/RX interleave repeats every symbol 400 ms later —
+      // a correlation ghost the search window must never reach.
+      if (Math.abs(startDtSec) > 0.35) continue;
+      // kiwis run at ~12 kHz but a few serve 20.25 kHz — resample those
+      // onto the reference rate instead of discarding them (sample-0
+      // time is preserved, so the anchor math is unchanged).
+      const samples = Math.abs(d.snippet.sampleRate / refSR - 1) < 0.01
+        ? d.snippet.samples
+        : resample(d.snippet.samples, d.snippet.sampleRate, refSR);
+      const dA = hilbert(samples);
+      const est = estimateDt(refA.re, refA.im, dA.re, dA.im, refSR,
+        { maxLagSec: Math.abs(startDtSec) + PROPAGATION_SLACK_SEC });
+      // envelope peak barely above the off-peak floor = the pair never
+      // actually locked on a common waveform; using it would inject a
+      // near-random lag into the solve.
+      if (!est || !Number.isFinite(est.dt) || est.peakRatio < MIN_PEAK_RATIO) {
+        this.rejections.pair = (this.rejections.pair || 0) + 1;
+        continue;
+      }
+      const dtSec = startDtSec + est.dt;
       solverDets.push({ gps: d.gps, t: dtSec });
-      lagsReport.push({ slot: d.slotId, label: d.label, band: d.band, gps: d.gps, lagSamples: lag, dtSec });
+      lagsReport.push({ slot: d.slotId, label: d.label, band: d.band, gps: d.gps, dtSec, peakRatio: +est.peakRatio.toFixed(1), cfoHz: est.cfoHz });
+      kept.push(d);
+    }
+    dets = kept;
+    if (dets.length < MIN_RECEIVERS) {
+      this.rejections.dedup = (this.rejections.dedup || 0) + 1;
+      return null;
     }
 
-    const sol = solveTdoa(solverDets);
+    const SOLVE_OPTS = {
+      prior: densityPenaltyDex,
+      priorLambdaKm: PRIOR_LAMBDA_KM,
+    };
+    let sol = solveTdoa(solverDets, SOLVE_OPTS);
     if (!sol) return null;
+
+    // Mixed-cohort rescue. Night-MF cohorts are often a MIX: receivers
+    // near the source hear it by ground wave (clean timing) while far
+    // ones hear it by skywave (+0.4–1.5 ms hop delay). Plain least
+    // squares smears the regimes — live q=9..11 cohorts for tankers
+    // anchored at Milford Haven produced fixes 60 km from truth but
+    // with ~300 km residuals, dying at the gates (2026-06-09 capture,
+    // FRONT LEOPARD / AURORA SPIRIT). When the full-cohort solve would
+    // fail the residual or far-field gate, re-solve on the 6 receivers
+    // nearest the initial fix: for a real near source those are the
+    // ground-wave hearers (synthetic recovery: 8–35 km errors). The
+    // subset choice is purely geometric, so a far-source cohort can't
+    // be cherry-picked into a timing-coherent ghost — its nearest-6
+    // subset is still skywave-contaminated and still fails the gates.
+    const wouldFail = (s, d) => {
+      if (s.residualKm > MAX_RESIDUAL_KM || s.atEdge) return true;
+      const f = farFieldCheck(d);
+      const minRatio = d.length <= 4 ? FARFIELD_MIN_RATIO_Q4 : FARFIELD_MIN_RATIO;
+      return !!(f && f.planeResidKm < Math.max(minRatio * s.residualKm, FARFIELD_ABS_FLOOR_KM));
+    };
+    let dropped = null;
+    if (solverDets.length >= RESCUE_MIN_COHORT && wouldFail(sol, solverDets)) {
+      const keep = nearestSubsetIdx(solverDets, [sol.lat, sol.lon], RESCUE_SUBSET_K);
+      const subDets = keep.map((i) => solverDets[i]);
+      const subSol = solveTdoa(subDets, SOLVE_OPTS);
+      if (subSol && !wouldFail(subSol, subDets)) {
+        const keepSet = new Set(keep);
+        dropped = lagsReport.filter((_, i) => !keepSet.has(i)).map((r) => r.slot);
+        solverDets = subDets;
+        lagsReport = lagsReport.filter((_, i) => keepSet.has(i));
+        dets = dets.filter((_, i) => keepSet.has(i));
+        sol = subSol;
+        console.log(`tdoa/rescue: mmsi=${bucket.mmsi} kept=${solverDets.length} dropped=${dropped.join(",")} resid=${sol.residualKm.toFixed(0)}km`);
+      }
+    }
 
     const pos = [sol.lat, sol.lon];
     const rej = (gate) => {
@@ -328,6 +466,30 @@ export class TDOADO {
     //    most ghosts have small residuals (the wrong basin is
     //    internally consistent) so this gate rarely fires alone.
     if (sol.residualKm > MAX_RESIDUAL_KM) return rej("residual");
+
+    // 1a. Edge gate. A minimum pinned against the search-box boundary
+    //     means the true source is outside the box (far skywave);
+    //     observed live 2026-07-02 (fixes at exactly bbox-edge lon).
+    if (sol.atEdge) return rej("edge");
+
+    // 1b. Far-field gate. When the plane-wave fit explains the timings
+    //     almost as well as the point fix, the cohort has no range
+    //     information on this source — it's far beyond the cohort
+    //     diameter (night skywave) and the point fix is a ghost.
+    const ff = farFieldCheck(solverDets);
+    const ffMinRatio = solverDets.length <= 4 ? FARFIELD_MIN_RATIO_Q4 : FARFIELD_MIN_RATIO;
+    if (ff && ff.planeResidKm < Math.max(ffMinRatio * sol.residualKm, FARFIELD_ABS_FLOOR_KM)) {
+      return rej("farfield");
+    }
+
+    // 1c. Registry gate. Fixed transmitters with known positions
+    //     (coast stations) can be checked against truth directly; a
+    //     fix > REGISTRY_MAX_KM from every registered site is provably
+    //     wrong even when the geometry looks clean. Catches the
+    //     persistent-ghost mode no internal signal can (stable cohort,
+    //     same wrong basin every burst, 100% convergence).
+    const reg = coastRegistryCheck(bucket.mmsi, pos[0], pos[1]);
+    if (reg && reg.nearestKm > REGISTRY_MAX_KM) return rej("registry");
 
     // 2. Bearing-gap gate. Cheap geometric proxy for one-sided cohorts.
     //    Catches the worst wedge geometries (gap > 220°) before we
@@ -353,6 +515,34 @@ export class TDOADO {
       return rej("ellipse");
     }
 
+    // 4. AIS oracle (vessels, creds permitting). Runs last so LSEG is
+    //    only consulted for fixes that already pass every geometric
+    //    gate. Also annotates surviving broadcasts with the AIS miss
+    //    distance — free validation telemetry on every fix.
+    let ais = null;
+    if (this.env?.LSEG_APP_KEY && !String(bucket.mmsi).startsWith("00") && !bucket.mmsi.includes("?")) {
+      try {
+        const p = await Promise.race([
+          lsegLookupMmsi(this.env, bucket.mmsi),
+          new Promise((res) => setTimeout(() => res(null), 8000)),
+        ]);
+        if (p && !p.error && Number.isFinite(p.lat)) {
+          const km = gcDistanceKm(pos, [p.lat, p.lon]);
+          const ageH = p.ts ? Math.max(0.05, (Date.now() - p.ts) / 3.6e6) : null;
+          const impliedKn = ageH != null ? km / ageH / 1.852 : null;
+          ais = {
+            name: p.name || null,
+            km: +km.toFixed(0),
+            ageH: ageH != null ? +ageH.toFixed(1) : null,
+            impliedKn: impliedKn != null ? +impliedKn.toFixed(0) : null,
+          };
+          if (ageH != null && ageH <= AIS_MAX_AGE_H && impliedKn > AIS_MAX_IMPLIED_KN) {
+            return rej("ais");
+          }
+        }
+      } catch (_) {}
+    }
+
     let furthestRxKm = 0, nearestRxKm = Infinity;
     for (const d of dets) {
       const dKm = gcDistanceKm(pos, d.gps);
@@ -362,6 +552,7 @@ export class TDOADO {
 
     const convergence = this._updateConvergence(bucket.mmsi, pos);
 
+    const priorPenaltyDex = densityPenaltyDex(pos[0], pos[1]);
     return {
       t: "tdoa",
       regime: regime.name,
@@ -376,8 +567,29 @@ export class TDOADO {
         ellipseSemiMajorKm: ellipse ? +ellipse.semiMajorKm.toFixed(0) : null,
         ellipseSemiMinorKm: ellipse ? +ellipse.semiMinorKm.toFixed(0) : null,
         ellipseOrientationDeg: ellipse ? +ellipse.orientationDeg.toFixed(0) : null,
+        priorPenaltyDex: +priorPenaltyDex.toFixed(2),
+        // Far-field diagnostics: how much better the point fix explains
+        // the timings than a plane wave does. Ratios barely above the
+        // gate are range-information-poor; comfortably high ratios mean
+        // the source is genuinely inside the cohort's near field.
+        farfieldRatio: ff ? +(ff.planeResidKm / Math.max(0.001, sol.residualKm)).toFixed(2) : null,
+        planeResidKm: ff ? +ff.planeResidKm.toFixed(1) : null,
+        // Receivers excluded by the mixed-cohort nearest-6 rescue
+        // (their timings were skywave-contaminated vs the kept subset).
+        droppedReceivers: dropped && dropped.length ? dropped : null,
+        // When the residual landscape had a competing basin, surface it
+        // so we can see at a glance whether the prior was load-bearing.
+        // `runnerUp` is null for clean single-basin fixes.
+        runnerUp: sol.runnerUp ? {
+          lat: +sol.runnerUp.lat.toFixed(3),
+          lon: +sol.runnerUp.lon.toFixed(3),
+          residualKm: +sol.runnerUp.residualKm.toFixed(1),
+          sepKm: sol.runnerUp.sepKm,
+          priorPenaltyDex: +densityPenaltyDex(sol.runnerUp.lat, sol.runnerUp.lon).toFixed(2),
+        } : null,
       },
       convergence,
+      ais,
       packetGpsNs: ref.packetGpsNs.toString(),
       broadcastMs: Date.now(),
     };
@@ -420,6 +632,7 @@ export class TDOADO {
       quorum: msg.quorum,
       geometry: msg.geometry,
       convergence: msg.convergence,
+      ais: msg.ais,
       receivers: msg.receivers.map((r) => r.slot),
       broadcastMs: msg.broadcastMs,
     });

@@ -36,12 +36,13 @@ const DECODE_WINDOW_SEC  = 10;
 const RING_MAX_SEC       = 15;
 
 // TDOA snippet: window of audio around each detection handed to the
-// coordinator for cross-correlation. 2 s centred on the packet start
-// comfortably covers the ~500 ms burst plus enough flanking context for
-// sub-sample lag refinement across receivers whose GPS-ns timestamps
-// may disagree by tens of ms due to decoder scheduling jitter.
+// coordinator for cross-correlation. `startSample` marks the end of
+// the phasing preamble; the message body runs several seconds past it,
+// and correlation timing noise scales as 1/sqrt(overlap energy), so we
+// take most of the burst (decode only fires once the message is in the
+// ring, so the tail exists by the time we get here).
 const SNIPPET_BEFORE_SEC = 0.5;
-const SNIPPET_AFTER_SEC  = 1.5;
+const SNIPPET_AFTER_SEC  = 3.5;
 
 export class ReceiverDO {
   constructor(state, env) {
