@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="skywave-gateway" content="https://skywave-gateway.louis-6bf.workers.dev">
+<title>Skywave — TDOA detections map</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin></script>
+<style>
+/* Skywave detections map — pure monochrome, phosphor-amber accent. */
+:root{
+  --bg:#000; --fg:#fff; --dim:#888; --dimmer:#555; --line:#222;
+  --panel:rgba(10,10,10,.92); --accent:#ffb000;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+  font-family:"JetBrains Mono","SF Mono","Menlo",monospace;font-size:12px;line-height:1.4;
+  -webkit-text-size-adjust:100%}
+a{color:var(--fg);text-decoration-color:var(--dimmer)}
+a:hover{text-decoration-color:var(--fg)}
+#map{position:fixed;inset:0;background:#000;z-index:0}
+.leaflet-container{background:#000;font-family:inherit;font-size:11px}
+.leaflet-popup-content-wrapper,.leaflet-popup-tip{background:#0a0a0a;color:var(--fg);
+  border:1px solid var(--line);border-radius:0;box-shadow:0 4px 24px rgba(0,0,0,.6)}
+.leaflet-popup-content{margin:8px 10px;font-size:11px;line-height:1.5}
+.leaflet-popup-content b{color:var(--accent)}
+.leaflet-popup-content .k{color:var(--dim)}
+.leaflet-tooltip{background:#0a0a0a;border:1px solid var(--line);color:var(--fg);
+  border-radius:0;font-family:inherit;font-size:10px}
+.leaflet-tooltip::before{display:none}
+.leaflet-bar a{background:#0a0a0a;color:var(--fg);border-color:var(--line)}
+.leaflet-bar a:hover{background:#141414}
+.leaflet-control-attribution{background:rgba(0,0,0,.6)!important;color:var(--dimmer)!important}
+.leaflet-control-attribution a{color:var(--dim)!important}
+
+/* diamond marker for solved fixes */
+.fix-diamond{width:12px;height:12px;margin:1px;background:var(--accent);
+  border:1px solid #000;transform:rotate(45deg);
+  box-shadow:0 0 6px var(--accent),0 0 2px #000}
+.fix-marker{background:none;border:none}
+
+/* -- control panel -- */
+#panel{position:fixed;top:0;left:0;z-index:1000;max-width:300px;width:86vw;
+  background:var(--panel);border-right:1px solid var(--line);border-bottom:1px solid var(--line);
+  backdrop-filter:blur(6px);max-height:100vh;overflow:auto;padding:12px 14px 16px}
+#panel h1{font-size:12px;letter-spacing:.14em;text-transform:uppercase;margin:0 0 2px;
+  font-weight:700;display:flex;align-items:baseline;gap:8px}
+#panel h1 .amber{color:var(--accent)}
+#panel .sub{color:var(--dim);font-size:10px;line-height:1.5;margin:0 0 12px}
+#panel .sub a{white-space:nowrap}
+.group{border-top:1px solid var(--line);padding:10px 0 4px}
+.group .glabel{color:var(--dim);font-size:9px;letter-spacing:.12em;text-transform:uppercase;
+  display:flex;justify-content:space-between;margin-bottom:6px}
+label.row{display:flex;align-items:center;gap:8px;cursor:pointer;padding:2px 0;user-select:none}
+label.row:hover{color:var(--fg)}
+label.row input{position:absolute;opacity:0;pointer-events:none}
+.swatch{width:11px;height:11px;flex:none;border:1px solid var(--dimmer);border-radius:50%}
+.swatch.sq{border-radius:0;transform:rotate(45deg);width:10px;height:10px}
+.rname{flex:1;color:var(--fg)}
+label.row.off .rname,label.row.off .cnt{color:var(--dimmer)}
+label.row.off .swatch{opacity:.3}
+.cnt{color:var(--dim);font-variant-numeric:tabular-nums}
+.chk{width:11px;height:11px;flex:none;border:1px solid var(--dim);position:relative}
+label.row.on .chk{background:var(--fg);border-color:var(--fg)}
+label.row.on .chk::after{content:"";position:absolute;inset:2px 2px;background:#000}
+select{font:inherit;font-size:10px;color:var(--fg);background:#000;border:1px solid var(--line);
+  height:26px;padding:0 8px;width:100%;appearance:none;cursor:pointer;letter-spacing:.06em;
+  text-transform:uppercase}
+select:hover{border-color:var(--fg)}
+.toggle-panel{position:fixed;top:8px;left:8px;z-index:999;display:none;
+  background:var(--panel);border:1px solid var(--line);color:var(--fg);
+  font:inherit;font-size:11px;padding:6px 10px;letter-spacing:.1em;text-transform:uppercase;cursor:pointer}
+.hint{color:var(--dimmer);font-size:9px;line-height:1.5;margin-top:8px}
+.live-dot{width:7px;height:7px;border-radius:50%;background:var(--dimmer);flex:none;margin-left:2px}
+label.row.on .live-dot.armed{background:var(--accent);box-shadow:0 0 6px var(--accent)}
+@media(max-width:640px){
+  #panel{transform:translateX(-102%);transition:transform .2s;height:100vh}
+  #panel.open{transform:none}
+  .toggle-panel{display:block}
+  #panel.open ~ .toggle-panel{left:auto;right:8px}
+}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<button class="toggle-panel" id="panel-toggle" type="button">☰ Layers</button>
+<aside id="panel">
+  <h1>SKYWAVE <span class="amber">◆</span> TDOA</h1>
+  <p class="sub" id="subtitle">loading campaign…</p>
+  <div id="controls"></div>
+  <p class="hint">Click any marker for details and its receiver cohort. The 1σ ellipse on each solved fix is the honest position uncertainty. Ground-truth campaign 2026-07-02/03; regenerate with <code>build_map_data.mjs</code>.</p>
+</aside>
+<script type="module" src="detections-map.js?v=1"></script>
+</body>
+</html>
