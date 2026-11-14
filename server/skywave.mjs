@@ -225,7 +225,10 @@ class Rx {
 const tick = () => new Promise((r) => setImmediate(r));
 
 async function solve(b) {
-  let todo = [...rxs.values()].filter((r) => r.s.band === b.band && r.s.gps);
+  // same band, and near enough to the decoders that the burst could
+  // fall inside the ±8 ms search: another region's rack stays out
+  const dec = [...rxs.values()].filter((r) => r.s.band === b.band && b.q.has(r.s.slot) && r.s.gps).map((r) => r.s.gps);
+  let todo = [...rxs.values()].filter((r) => r.s.band === b.band && r.s.gps && dec.some((g) => geodist(g, r.s.gps) < 2e6));
   const iq = [];
   for (let tries = 0; todo.length && tries < 8; tries++) {
     if (tries) await new Promise((r) => setTimeout(r, 3000));
