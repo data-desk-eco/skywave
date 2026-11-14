@@ -1,408 +1,268 @@
-/* Skywave — pure monochrome. Black paper, white ink. Mobile-first. */
+/* skywave: black paper, white ink, one amber accent. mobile first. */
 
 :root {
-  --bg:        #000;
-  --fg:        #fff;
-  --dim:       #888;
-  --dimmer:    #555;
-  --line:      #222;
-  --panel:     #0a0a0a;
-  --panel-2:   #141414;
-  --pad:       14px;
+  --bg: #000;
+  --fg: #fff;
+  --dim: #888;
+  --dimmer: #555;
+  --line: #222;
+  --accent: #ffb000;
+  --pad: 14px;
+  --cols: 88px minmax(200px, 1fr) 150px minmax(200px, 2fr) 110px;
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 html, body {
+  margin: 0;
   background: var(--bg);
   color: var(--fg);
-  font-family: "JetBrains Mono", "SF Mono", "Menlo", "Consolas", monospace;
-  font-size: 13px;
-  line-height: 1.45;
-  margin: 0;
-  padding: 0;
+  font: 13px/1.45 "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
   -webkit-text-size-adjust: 100%;
 }
 
-a { color: var(--fg); text-decoration: underline; text-decoration-color: var(--dimmer); }
+a {
+  color: var(--fg);
+  text-decoration: underline;
+  text-decoration-color: var(--dimmer);
+}
 a:hover { text-decoration-color: var(--fg); }
 
-/* -- Header ------------------------------------------------------------ */
+/* -- header ----------------------------------------------------------- */
 header {
-  display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto auto auto;
+  display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px 8px 10px var(--pad);
+  padding: 10px var(--pad);
   border-bottom: 1px solid var(--line);
-  position: sticky; top: 0; z-index: 5;
+  position: sticky; top: 0; z-index: 1000;
   background: var(--bg);
 }
+.brand { font-weight: 700; font-size: 14px; letter-spacing: 0.14em; }
 
-/* Region selector — native <select> styled as a monochrome dropdown */
-.region {
+.region, .csv, .toggle, .meta {
   font: inherit;
   font-size: 10px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--fg);
+}
+.region, .csv, .toggle {
+  height: 28px;
+  padding: 0 12px;
+  color: var(--dim);
   background: var(--bg);
   border: 1px solid var(--line);
-  height: 28px;
-  padding: 0 22px 0 10px;
+  border-radius: 0;
   cursor: pointer;
+}
+.region:hover, .csv:hover, .toggle:hover,
+.toggle:has(:checked) { color: var(--fg); border-color: var(--fg); }
+:focus-visible { outline: 1px solid var(--fg); outline-offset: 2px; }
+
+.region {
+  color: var(--fg);
+  padding: 0 22px 0 10px;
   appearance: none; -webkit-appearance: none;
-  background-image: linear-gradient(45deg, transparent 50%, var(--dim) 50%),
-                    linear-gradient(135deg, var(--dim) 50%, transparent 50%);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--dim) 50%),
+    linear-gradient(135deg, var(--dim) 50%, transparent 50%);
   background-position: calc(100% - 12px) 12px, calc(100% - 7px) 12px;
-  background-size: 5px 5px, 5px 5px;
+  background-size: 5px 5px;
   background-repeat: no-repeat;
 }
-.region:hover { border-color: var(--fg); }
-.region:focus-visible { outline: 1px solid var(--fg); outline-offset: 2px; }
 
-.csv {
-  display: none;                           /* desktop-only; shown in media query */
-  font: inherit;
-  font-size: 10px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--dim);
-  background: transparent;
-  border: 1px solid var(--line);
-  height: 28px;                            /* match the Data Desk logo */
-  padding: 0 12px;
-  cursor: pointer;
-  line-height: 1;
-}
-.csv:hover { color: var(--fg); border-color: var(--fg); background: transparent; }
-.csv:focus-visible { outline: 1px solid var(--fg); outline-offset: 2px; }
-@media (min-width: 900px) {
-  .csv { display: inline-block; }
-}
-
-.toggle {
-  display: none;                           /* desktop-only; shown in media query */
-  align-items: center;
-  gap: 6px;
-  font: inherit;
-  font-size: 10px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--dim);
-  background: transparent;
-  border: 1px solid var(--line);
-  height: 28px;
-  padding: 0 12px;
-  cursor: pointer;
-  line-height: 1;
-  user-select: none;
-}
-.toggle:hover { color: var(--fg); border-color: var(--fg); }
+/* desktop-only controls */
+.csv, .toggle { display: none; }
+.toggle { align-items: center; gap: 6px; user-select: none; }
 .toggle input {
   appearance: none; -webkit-appearance: none;
-  margin: 0;
-  width: 10px;
-  height: 10px;
-  border: 1px solid var(--line);
-  background: transparent;
+  width: 10px; height: 10px; margin: 0;
+  border: 1px solid var(--dimmer);
   cursor: pointer;
-  display: inline-block;
-  position: relative;
 }
-.toggle:hover input { border-color: var(--fg); }
-.toggle input:checked { background: var(--fg); border-color: var(--fg); }
-.toggle input:focus-visible { outline: 1px solid var(--fg); outline-offset: 2px; }
-.toggle:has(input:checked) { color: var(--fg); border-color: var(--fg); }
-@media (min-width: 900px) {
-  .toggle { display: inline-flex; }
+.toggle input:checked {
+  background: var(--accent); border-color: var(--accent);
 }
-
 body.tdoa-only .call:not(.has-tdoa) { display: none; }
-.brand {
-  color: var(--fg);
-  font-weight: 700;
-  letter-spacing: 0.14em;
-  font-size: 14px;
-}
+
 .meta {
-  display: flex; flex-direction: column;
-  align-items: flex-end;
-  justify-content: center;
-  gap: 2px;
-  font-size: 10px;
+  flex: 1; min-width: 0;
+  text-align: right;
   letter-spacing: 0.06em;
-  text-transform: uppercase;
   color: var(--dim);
-  min-width: 0;
 }
-.rxcount { white-space: nowrap; }
-.playing {
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  max-width: 100%;
-  color: var(--fg);
-  min-height: 1.45em;            /* always reserve one line so header height is constant */
-}
-.rxcount { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
-.playing.on::before {
-  content: "▶ ";
-  color: var(--fg);
-}
-
-/* Data Desk logo */
-.logo {
+.meta span {
   display: block;
-  width: 28px; height: 28px;
-  color: var(--fg);
-  text-decoration: none;
-  opacity: 0.85;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.playing { color: var(--fg); min-height: 1.45em; }   /* constant height */
+.playing.on::before { content: "▶ "; }
+
+.logo { flex: none; width: 28px; height: 28px; opacity: 0.85; }
 .logo:hover { opacity: 1; }
-.logo svg { display: block; width: 100%; height: 100%; }
+.logo svg { display: block; }
 
-/* -- Call log ---------------------------------------------------------- */
-.log {
-  padding: 6px var(--pad) 20px;
-}
-
-/* Mobile: header hidden; each call is a two-line card. */
+/* -- call log --------------------------------------------------------- */
+.log { padding: 6px var(--pad) 20px; }
 .log-head { display: none; }
-
-#calls { display: flex; flex-direction: column; }
 
 .call {
   display: grid;
-  grid-template-columns: auto 1fr auto;
-  grid-template-areas:
-    "t  who   heard"
-    ". flow  flow"
-    ". pay   pay";
-  column-gap: 10px;
-  row-gap: 2px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "t who heard" ". flow flow" ". pay pay";
+  gap: 2px 10px;
   align-items: baseline;
   padding: 10px 0;
   border-bottom: 1px dashed var(--line);
   cursor: pointer;
   animation: flash 800ms ease-out;
 }
-@keyframes flash {
-  from { background: var(--fg); color: var(--bg); }
-  to   { background: transparent; color: inherit; }
+@keyframes flash { from { background: var(--fg); color: var(--bg); } }
+
+.c-t, .c-pay, .c-heard {
+  color: var(--dim); font-variant-numeric: tabular-nums;
 }
-.call .c-t   { grid-area: t;   color: var(--dim); font-variant-numeric: tabular-nums; font-size: 11px; }
-.call .c-who { grid-area: who; color: var(--fg); min-width: 0; }
-.call .c-who .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.call .c-who .flag {
-  color: var(--dim);
-  font-size: 10px;
+.c-t { grid-area: t; font-size: 11px; }
+.c-who {
+  grid-area: who; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.c-who .flag {
   margin-left: 8px;
-  letter-spacing: 0.08em;
+  color: var(--dim); font-size: 10px; letter-spacing: 0.08em;
 }
-.call .c-who .flag:empty { display: none; }
-.call .c-flow { grid-area: flow; color: var(--fg); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
-.call .c-pay  { grid-area: pay;  color: var(--dim); font-size: 11px; }
-.call .c-heard { grid-area: heard; color: var(--dim); font-size: 10px; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.c-flow {
+  grid-area: flow;
+  font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase;
+}
+.c-pay { grid-area: pay; font-size: 11px; }
+.c-heard {
+  grid-area: heard;
+  font-size: 10px; text-align: right; white-space: nowrap;
+}
+/* a position estimate exists for this ship */
+.has-tdoa .c-heard::before { content: "◆ "; color: var(--accent); }
 
 .call.distress {
-  background: var(--fg);
-  color: var(--bg);
-  margin: 0 -8px;
-  padding: 10px 8px;
+  margin: 0 -8px; padding: 10px 8px;
+  background: #fff; color: #000;
+  --fg: #000; --bg: #fff; --dim: #000; --line: #bbb; --accent: #000;
 }
-.call.distress .c-t,
-.call.distress .c-who,
-.call.distress .c-who .mmsi,
-.call.distress .c-flow,
-.call.distress .c-pay,
-.call.distress .c-heard { color: var(--bg); }
+.call.distress .mini-map { --accent: #ffb000; }
+.call.urgency { box-shadow: -8px 0 0 var(--bg), -10px 0 0 var(--fg); }
+.call.urgency .c-flow, .call.safety .c-flow { font-weight: 700; }
 
-.call.urgency { box-shadow: inset 2px 0 0 var(--fg); margin-left: -8px; padding-left: 8px; }
-.call.urgency .c-flow { font-weight: 700; }
-.call.safety  .c-flow { font-weight: 700; }
-
+/* -- expanded card ---------------------------------------------------- */
 .call-detail {
+  display: none;
   grid-column: 1 / -1;
   padding: 10px 0 4px;
   color: var(--dim);
   font-size: 11px;
   line-height: 1.6;
-  display: none;
+  cursor: auto;
 }
 .call.open .call-detail { display: block; }
-.call-detail .kv {
-  display: grid;
-  grid-template-columns: 110px 1fr;
-  gap: 6px 10px;
+
+.vessel { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; }
+.vessel:empty { display: none; }
+.vessel span, .tag {
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
 }
-.call-detail .kv span:first-child { color: var(--dim); }
-.call-detail .kv span:last-child  { color: var(--fg); }
+
+.kv {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 6px 10px;
+  font-variant-numeric: tabular-nums;
+}
+.kv span:nth-of-type(even) { color: var(--fg); }
+/* estimate + AIS rows share the kv grid */
+.pos { display: contents; }
+.pos > span:nth-of-type(even) { color: var(--dim); }
+.pos b { color: var(--fg); margin-right: 6px; }
+.pos b.estimate { color: var(--accent); }
+.tag { color: var(--accent); border-color: currentColor; cursor: help; }
+
+.heard-list { margin-top: 8px; font-size: 10px; }
+.heard-list span { color: var(--fg); }
 .call-detail code {
   display: block;
-  color: var(--fg);
-  word-break: break-all;
   margin-top: 6px;
-  font-size: 10px;
-  opacity: 0.7;
+  color: var(--dimmer);
+  font: inherit; font-size: 10px;
+  word-break: break-all;
 }
-.call-detail .heard-list {
-  margin-top: 8px;
-  color: var(--dim);
-  font-size: 10px;
-}
-.call-detail .heard-list span { color: var(--fg); }
-.call-detail .heard-list em { font-style: normal; color: var(--dim); font-size: 10px; margin-left: 2px; }
 
-/* Per-card mini map: receivers + vessel + lines, country-scale */
+/* -- mini-map --------------------------------------------------------- */
 .mini-map {
   height: 220px;
   margin-top: 12px;
-  background: #050505;
   border: 1px solid var(--line);
-  position: relative;
+  cursor: grab;
 }
-/* "no recent AIS track" chip on mini-maps where GFW has identified
- * the ship but has no track in the past 14 days. */
-.mini-map.no-track::after {
-  content: "no recent AIS track";
-  position: absolute; right: 6px; top: 6px;
-  font-size: 9px; color: var(--dim);
-  letter-spacing: 0.04em;
-  background: rgba(0, 0, 0, 0.65);
-  padding: 2px 5px;
-  border: 1px solid var(--line);
-  pointer-events: none;
-  z-index: 500;
-}
-
-/* TDOA fix line in the call-detail panel. Shown only when the
- * coordinator DO has broadcast a position for this MMSI. */
-.tdoa-fix {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 8px;
-  padding: 6px 8px;
-  margin-bottom: 10px;
-  border: 1px dashed var(--dimmer);
-  font-variant-numeric: tabular-nums;
-  font-size: 12px;
-}
-.tdoa-fix .tdoa-label {
-  color: var(--dim);
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-.tdoa-fix .tdoa-coord { color: var(--fg); font-weight: 700; }
-.tdoa-fix .tdoa-meta  { color: var(--dim); font-size: 11px; }
-/* Δ vs fresh AIS (LSEG) — accuracy quote alongside the fix. */
-.tdoa-fix .tdoa-ais   { color: var(--accent); font-size: 11px; }
-.tdoa-fix .tdoa-ais::before { content: "↪ "; color: var(--dim); }
-/* Indicator on the always-visible summary row when a fix exists. */
-.call .c-heard.has-tdoa::before {
-  content: "◆ ";
-  color: var(--fg);
-  margin-right: 2px;
-}
-
-/* Diamond icon for the TDOA marker on the mini-map. */
-.tdoa-marker { background: transparent; border: none; }
-.tdoa-diamond {
-  width: 10px;
-  height: 10px;
-  margin: 2px;
-  background: rgba(255, 255, 255, 0.15);
-  border: 1.5px solid #fff;
-  transform: rotate(45deg);
-}
-
-/* Vessel info header in a call's detail panel (populated by GFW). */
-.vessel:empty { display: none; }
-.vessel {
-  margin-bottom: 10px;
-  color: var(--fg);
-  font-size: 12px;
-  line-height: 1.5;
-}
-.vessel strong {
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  font-size: 13px;
-  margin-right: 6px;
-}
-.vessel .vchip {
-  display: inline-block;
-  padding: 1px 6px;
-  margin-right: 4px;
-  border: 1px solid var(--line);
-  color: var(--dim);
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-.mini-map .leaflet-container { background: #050505; font-family: inherit; }
+.mini-map.leaflet-container { background: #050505; font: inherit; }
 .mini-map .leaflet-tile { filter: grayscale(1) contrast(0.9); }
 .mini-map .leaflet-control-attribution {
-  background: rgba(0,0,0,0.6); color: var(--dim);
-  font-size: 9px; border: 0;
+  background: rgba(0, 0, 0, 0.6);
+  color: var(--dimmer);
+  font-size: 9px;
 }
 .mini-map .leaflet-control-attribution a { color: var(--dim); }
 .mini-map .leaflet-tooltip {
-  background: var(--bg); color: var(--fg);
-  border: 1px solid var(--line);
-  font-family: inherit; font-size: 10px;
-  box-shadow: none; padding: 3px 6px;
+  padding: 3px 6px;
+  background: #000; color: #fff;
+  border: 1px solid var(--line); border-radius: 0;
+  box-shadow: none;
+  font-size: 10px;
 }
 .mini-map .leaflet-tooltip::before { display: none; }
+/* position estimate: amber diamond */
+.est::before {
+  content: ""; display: block; height: 100%;
+  background: #000;
+  border: 2px solid var(--accent);
+  transform: rotate(45deg);
+}
 
 .empty {
-  padding: 32px 10px;
+  max-width: 58ch;
+  margin: 0 auto;
+  padding: 32px 0;
   color: var(--dim);
   font-size: 12px;
   line-height: 1.6;
-  max-width: 58ch;
-  margin: 0 auto;
 }
 
-/* -- Desktop layout: table-ish row ------------------------------------- */
-/* 5-column grid needs ~820px for minmax(200px, 1fr) + minmax(200px, 2fr)
- * + 88 + 150 + 110 + 4×16px gaps; 900px keeps everything inside the
- * viewport once padding is factored in. */
+/* -- desktop: five-column log ----------------------------------------- */
 @media (min-width: 900px) {
   :root { --pad: 20px; }
-  html, body { font-size: 13px; }
-  header { padding-right: var(--pad); }
-  .log-head {
-    display: grid;
-    grid-template-columns: 88px minmax(200px, 1fr) 150px minmax(200px, 2fr) 110px;
-    gap: 16px;
-    color: var(--dim);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    padding: 6px 0 10px;
-    border-bottom: 1px solid var(--line);
-  }
-  .log-head .c-heard { text-align: right; }
-  .call {
-    grid-template-columns: 88px minmax(200px, 1fr) 150px minmax(200px, 2fr) 110px;
+  .csv { display: block; }
+  .toggle { display: flex; }
+  .log-head, .call {
+    grid-template-columns: var(--cols);
     grid-template-areas: "t who flow pay heard";
     column-gap: 16px;
-    padding: 8px 0;
   }
-  .call.distress { margin: 0; padding: 8px 0; }
+  .log-head {
+    display: grid;
+    padding: 6px 0 10px;
+    border-bottom: 1px solid var(--line);
+    color: var(--dim);
+    font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase;
+  }
+  .log-head .c-heard { text-align: right; }
+  .call { padding: 8px 0; }
+  .call.distress { padding: 8px; }
   .call.open .call-detail {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 20px;
-    align-items: stretch;
     padding-left: 104px;
   }
-  .call-detail .detail-text { min-width: 0; }
-  .call-detail .mini-map {
-    height: 100%;
-    min-height: 260px;
-    margin-top: 0;
-  }
-  .call-detail .kv { grid-template-columns: 140px 1fr; gap: 10px; }
+  .mini-map { height: auto; min-height: 260px; margin-top: 0; }
+  .kv { grid-template-columns: 140px minmax(0, 1fr); }
 }

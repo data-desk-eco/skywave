@@ -1,210 +1,81 @@
-// Per-card mini-map — one tiny Leaflet instance, lazy-mounted on first
-// expand. Renders these layers:
-//   · listening receivers (hollow white rings) — local WS feed
-//   · GFW vessel position (filled white dot + 14-day trail) if available
-//   · TDOA solved position (hollow diamond + dashed residual circle)
-//     with extra receiver rings for cohort members this browser isn't
-//     directly attached to.
-//   · TDOA hyperbolas (subtle white lines) — one curve per non-reference
-//     receiver, all converging at the diamond on a clean fix; a useful
-//     diagnostic for "why did this fix land here vs there".
+// per-card mini-map, mounted on first expand and redrawn whole on each
+// change: the position estimate with its 1σ ellipse, the single latest
+// AIS position, a thin line between the two, and the receivers.
 
-import { Vessels } from "./vessels.js?v=35";
-import { hyperbolaSegments } from "./hyperbola.js?v=35";
+const L = window.L, RAD = Math.PI / 180;
+// Esri dark gray canvas: no key, no labels
+const TILES = "https://server.arcgisonline.com/ArcGIS/rest/services/"
+  + "Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}";
+const ATTR = "Esri, HERE, Garmin, &copy; OpenStreetMap";
+const ACCENT = getComputedStyle(document.documentElement)
+  .getPropertyValue("--accent").trim();
+// tooltips are text nodes: receiver labels come from a public list
+const text = (...bits) =>
+  document.createTextNode(bits.filter(Boolean).join(" · "));
+const num = (x, unit, dp = 0) =>
+  Number.isFinite(x) && `${x.toFixed(dp)} ${unit}`;
 
-const TILE_URL = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png";
-const TILE_ATTR = '&copy; <a href="https://carto.com/">carto</a> · OSM';
-const RX_STYLE = { radius: 4, color: "#fff", weight: 1.5, fillColor: "#000", fillOpacity: 1 };
-
-function addRxRing(entry, hostKey, gps, tooltip) {
-  if (entry._rxMarkers.has(hostKey)) return;
-  const m = window.L.circleMarker(gps, RX_STYLE)
-    .bindTooltip(tooltip, { direction: "top", offset: [0, -4] });
-  m.addTo(entry._map);
-  entry._rxMarkers.set(hostKey, m);
-}
-
-export function initMiniMap(entry) {
-  if (entry._mapInited || !window.L) {
-    if (entry._map) entry._map.invalidateSize();
-    return;
-  }
-  const container = entry.row.querySelector(".mini-map");
-  if (!container) return;
-  entry._mapInited = true;
-  // Wait one frame so the browser has painted the now-open card; Leaflet
-  // reads the container size at init time and produces a 0×0 map if
-  // the parent was still display:none during the same paint tick.
-  requestAnimationFrame(() => {
-    const L = window.L;
-    entry._map = L.map(container, {
-      zoomControl: false,
-      attributionControl: true,
-      dragging: true,
-      scrollWheelZoom: false,
-      doubleClickZoom: true,
-      touchZoom: true,
-      preferCanvas: true,
-    });
-    L.tileLayer(TILE_URL, { subdomains: "abcd", maxZoom: 9, attribution: TILE_ATTR })
-      .addTo(entry._map);
-
-    for (const slot of entry.receiverSlots) addReceiverToMiniMap(entry, slot);
-    const info = Vessels.get(entry.call.caller);
-    if (info && info.lastPos) setVesselOnMiniMap(entry, info);
-    else if (info && info.vesselId) container.classList.add("no-track");
-    // Draw TDOA last so the diamond paints above the GFW disc. Users
-    // are watching this app for the passive radio-triangulation result,
-    // not the GFW track — TDOA wins the z-order contest.
-    if (entry.tdoa) setTdoaOnMiniMap(entry, entry.tdoa);
-    fitMiniMap(entry);
-    setTimeout(() => entry._map && entry._map.invalidateSize(), 120);
+// outline of the 1σ ellipse on the local tangent plane. bearingDeg is
+// the major axis, clockwise from north.
+function ellipse({ lat, lon, semiMajorKm: a, semiMinorKm: b, bearingDeg }) {
+  const s = Math.sin(bearingDeg * RAD), c = Math.cos(bearingDeg * RAD);
+  return Array.from({ length: 72 }, (_, i) => {
+    const u = a * Math.cos(i * 5 * RAD), v = b * Math.sin(i * 5 * RAD);
+    return [lat + (u * c - v * s) / 111.32,
+            lon + (u * s + v * c) / 111.32 / Math.cos(lat * RAD)];
   });
 }
 
-export function addReceiverToMiniMap(entry, slot) {
-  if (!entry._mapInited || !slot.gps) return;
-  addRxRing(entry, slot.hostKey, slot.gps, `${slot.bandLabel} · ${slot.label}`);
-  if (entry._vesselMarker) drawReceiverLines(entry);
-  fitMiniMap(entry);
-}
+export function drawMap(e, ais) {
+  const el = e.row.querySelector(".mini-map");
+  if (!L || !e.row.classList.contains("open")) return;
+  if (!e.map) {
+    e.map = L.map(el, {
+      zoomControl: false, scrollWheelZoom: false, preferCanvas: true,
+    }).setView([0, 0], 1);
+    L.tileLayer(TILES, { maxZoom: 9, attribution: ATTR })
+      .addTo(e.map);
+    e.layer = L.layerGroup().addTo(e.map);
+  }
+  e.map.invalidateSize();
+  const g = e.layer.clearLayers(), t = e.tdoa, p = t?.position;
+  const line = { color: "#fff", weight: 1, interactive: false };
+  const dot = (ll, style, tip) => L.circleMarker(ll, { ...line, ...style })
+    .bindTooltip(tip, { direction: "top" }).addTo(g);
 
-export function setVesselOnMiniMap(entry, info) {
-  if (!entry._mapInited || !info || !info.lastPos) return;
-  const L = window.L;
-  const { lat, lon } = info.lastPos;
-
-  const container = entry.row.querySelector(".mini-map");
-  if (container) container.classList.remove("no-track");
-
-  if (info.trail && info.trail.length > 1) {
-    if (entry._trail) entry._map.removeLayer(entry._trail);
-    entry._trail = L.polyline(info.trail.map(([x, y]) => [y, x]), {
-      color: "#fff", weight: 1, opacity: 0.35, lineCap: "round",
-    }).addTo(entry._map);
+  // receivers: solid = decoded, hollow = detected only, faded by weight
+  const rx = (t?.receivers || [...e.rx.values()].map((s) => ({ ...s, dec: 1 })))
+    .filter((r) => r.gps);
+  for (const r of rx) {
+    const o = 0.2 + 0.8 * (r.w ?? 1);
+    dot(r.gps, { radius: 3, opacity: o, fillColor: "#fff",
+                 fillOpacity: r.dec ? o : 0, interactive: true },
+        text(r.label, num(r.snrDb, "dB"), num(r.resUs, "µs")));
   }
 
-  if (entry._vesselMarker) {
-    entry._vesselMarker.setLatLng([lat, lon]);
-  } else {
-    entry._vesselMarker = L.circleMarker([lat, lon], {
-      radius: 5, color: "#fff", weight: 1.5, fillColor: "#fff", fillOpacity: 0.85,
-    }).bindTooltip(info.name || `MMSI ${entry.call.caller}`, {
-      direction: "top", offset: [0, -5],
-    });
-    entry._vesselMarker.addTo(entry._map);
+  const focus = [];
+  if (p) {
+    const ring = ellipse(p), at = [p.lat, p.lon];
+    L.polygon(ring, { ...line, color: ACCENT, fillOpacity: 0.12 }).addTo(g);
+    if (ais) L.polyline([at, [ais.lat, ais.lon]],
+      { ...line, opacity: 0.6, dashArray: "2 4" }).addTo(g);
+    L.marker(at, { icon: L.divIcon({ className: "est", iconSize: [10, 10] }) })
+      .bindTooltip(text("estimate", "± " + num(p.semiMajorKm, "km")),
+                   { direction: "top" }).addTo(g);
+    focus.push(...ring);
   }
-
-  drawReceiverLines(entry);
-  fitMiniMap(entry);
-}
-
-function drawReceiverLines(entry) {
-  const L = window.L;
-  for (const l of entry._rxLines || []) entry._map.removeLayer(l);
-  entry._rxLines = [];
-  if (!entry._vesselMarker) return;
-  const vll = entry._vesselMarker.getLatLng();
-  for (const slot of entry.receiverSlots) {
-    if (!slot.gps) continue;
-    const line = L.polyline([slot.gps, [vll.lat, vll.lng]], {
-      color: "#fff", weight: 1, opacity: 0.3, dashArray: "2 3",
-    }).addTo(entry._map);
-    entry._rxLines.push(line);
+  if (ais) {
+    const at = [ais.lat, ais.lon];
+    dot(at, { radius: 5, fillColor: "#fff", fillOpacity: 1, interactive: true },
+        text("AIS", ais.name, num(ais.speed, "kn", 1)));
+    focus.push(at);
   }
-}
+  if (!p) focus.push(...rx.map((r) => r.gps));
 
-// TDOA fix: hollow diamond at the solved position with a translucent
-// dashed circle sized by the solver's residual. Also adds receiver
-// rings for any cohort members this browser isn't directly attached
-// to — the TDOA quorum is authoritative about who heard the packet,
-// the local WS feed may have missed some.
-export function setTdoaOnMiniMap(entry, tdoa) {
-  if (!entry._mapInited || !entry._map || !tdoa || !tdoa.position) return;
-  const L = window.L;
-  const { lat, lon, residualKm } = tdoa.position;
-
-  for (const r of tdoa.receivers || []) {
-    if (!r || !Array.isArray(r.gps) || typeof r.slot !== "string") continue;
-    const hostKey = r.slot.split("|")[0];
-    addRxRing(entry, hostKey, r.gps, r.slot.replace("|", " · "));
-  }
-
-  drawHyperbolas(entry, tdoa);
-
-  if (entry._tdoaCircle) entry._map.removeLayer(entry._tdoaCircle);
-  entry._tdoaCircle = L.circle([lat, lon], {
-    radius: Math.max(500, (residualKm || 0) * 1000),
-    color: "#fff", weight: 1, opacity: 0.5, dashArray: "2 3",
-    fillColor: "#fff", fillOpacity: 0.08,
-    interactive: false,
-  }).addTo(entry._map);
-
-  if (entry._tdoaMarker) {
-    entry._tdoaMarker.setLatLng([lat, lon]);
-  } else {
-    entry._tdoaMarker = L.marker([lat, lon], {
-      icon: L.divIcon({
-        className: "tdoa-marker",
-        html: '<div class="tdoa-diamond"></div>',
-        iconSize: [14, 14], iconAnchor: [7, 7],
-      }),
-    }).bindTooltip(
-      `TDOA fix · ±${(residualKm || 0).toFixed(1)} km · q=${tdoa.quorum}${tdoa.regime ? ` · ${tdoa.regime}` : ""}`,
-      { direction: "top", offset: [0, -6] },
-    );
-    entry._tdoaMarker.addTo(entry._map);
-  }
-  fitMiniMap(entry);
-}
-
-// One hyperbola per non-reference receiver: the locus of points where
-// the timing offset would match the measured one assuming geodesic
-// propagation. The reference (which the broadcast lists first, with
-// dtSec = 0) is the cohort's cleanest decode — so its position+timing
-// is the trusted anchor against which every other curve is drawn.
-function drawHyperbolas(entry, tdoa) {
-  const L = window.L;
-  if (entry._hyperbolas) {
-    entry._map.removeLayer(entry._hyperbolas);
-    entry._hyperbolas = null;
-  }
-  const rx = tdoa.receivers;
-  if (!rx || rx.length < 2) return;
-  const ref = rx[0];
-  if (!ref || !Array.isArray(ref.gps)) return;
-
-  const all = [];
-  for (let i = 1; i < rx.length; i++) {
-    const o = rx[i];
-    if (!o || !Array.isArray(o.gps) || !Number.isFinite(o.dtSec)) continue;
-    for (const seg of hyperbolaSegments(ref.gps, o.gps, o.dtSec)) all.push(seg);
-  }
-  if (!all.length) return;
-  entry._hyperbolas = L.polyline(all, {
-    color: "#fff", weight: 1, opacity: 0.18,
-    interactive: false, smoothFactor: 2,
-  }).addTo(entry._map);
-}
-
-function fitMiniMap(entry) {
-  // Use every placed receiver marker, local or TDOA-contributed —
-  // that gives the map a bounds encompassing the full cohort, not
-  // just the subset this browser is attached to.
-  const pts = [];
-  for (const m of entry._rxMarkers.values()) {
-    const ll = m.getLatLng();
-    pts.push([ll.lat, ll.lng]);
-  }
-  if (entry._vesselMarker) {
-    const v = entry._vesselMarker.getLatLng();
-    pts.push([v.lat, v.lng]);
-  }
-  if (entry._tdoaMarker) {
-    const t = entry._tdoaMarker.getLatLng();
-    pts.push([t.lat, t.lng]);
-  }
-  if (!pts.length) { entry._map.setView([0, 0], 2); return; }
-  if (pts.length === 1) { entry._map.setView(pts[0], 5); return; }
-  entry._map.fitBounds(pts, { padding: [22, 22], maxZoom: 6 });
+  // refit only when the framed points change, so a redraw keeps the
+  // reader's pan and zoom
+  const key = focus.join();
+  if (key === e.fit || !focus.length) return;
+  e.fit = key;
+  e.map.fitBounds(focus, { padding: [24, 24], maxZoom: 7 });
 }

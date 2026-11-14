@@ -1,35 +1,18 @@
-// Skywave v2 client — a pure viewer. All decoding and the KiwiSDR
-// handshake live in Cloudflare Durable Objects (one per channel); this
-// module subscribes to a rack of them and renders whatever they tell it.
-//
-//   1. Boot: GET /v2/rack?region=<id> → { slots: [{host, port, band,
-//      bandKHz, label, gps, wsUrl}, ...] }.
-//   2. For each slot, open its WebSocket. Each slot announces decoded
-//      calls, activity-burst status flips, and — only during bursts,
-//      only to clients that asked — base-64 PCM for playback.
-//   3. Audio picker: follow whichever live slot has the loudest burst;
-//      un-follow the others so the server doesn't waste bandwidth
-//      streaming PCM we'd never play.
+// skywave client: a pure viewer. the server tunes the receivers, decodes
+// DSC and locates ships; this module reads one server-sent-events
+// stream per page (`/v2/events?region=`) and prints what it says:
+// the rack, per-slot status, decoded calls, position estimates, and
+// audio for the one slot it follows (the loudest live burst, chosen
+// here and told to the server with POST `/v2/follow`).
 
-import { Vessels } from "./vessels.js?v=35";
-import { initMiniMap, addReceiverToMiniMap, setVesselOnMiniMap, setTdoaOnMiniMap } from "./map.js?v=35";
-import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso } from "./regions.js?v=35";
+import { Vessels, GATEWAY } from "./vessels.js?v=39";
+import { drawMap } from "./map.js?v=39";
+import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso }
+  from "./regions.js?v=39";
 
 const DEBUG = /(\?|&)debug=1\b/.test(location.search);
 const AUDIO_LEAD_SEC = 0.25;
 const AUDIO_HOLD_MS  = 6000;
-const RACK_REFRESH_MS = 60_000;
-
-const GATEWAY = (() => {
-  const meta = document.querySelector('meta[name="skywave-gateway"]');
-  const url = meta && meta.content.trim();
-  if (!url) return null;
-  return url.replace(/\/+$/, "");
-})();
-
-// -------------------------------------------------------------------
-// DOM
-// -------------------------------------------------------------------
 
 const $ = (id) => document.getElementById(id);
 const rxCountEl = $("rxcount"), playingEl = $("playing"),
@@ -41,256 +24,109 @@ const rxCountEl = $("rxcount"), playingEl = $("playing"),
 // State
 // -------------------------------------------------------------------
 
-/** @type {Map<string, SlotConn>} slotKey ("host:port:bandKHz") → SlotConn */
+/** "host:port|band" → { slot, band, label, gps, state, rssi, lastBurstAt } */
 const slots = new Map();
-/** Cross-slot dedupe: sig → { firstSeen, receivers, row, ... } */
+/** Cross-slot dedupe: sig → { firstSeen, call, rx, row } */
 const callIndex = new Map();
-/** MMSI → latest TDOA fix from the coordinator DO. Kept for the whole
- *  session so a call decoded long after its TDOA still picks up the
- *  position when the card is opened. */
+/** MMSI → latest position estimate */
 const tdoaByMmsi = new Map();
-let tdoaWs = null;
-let tdoaRetry = 2000;
+const key = (s) => `${s.slot}|${s.band}`;
+let es = null;
+let clientId = null;
 let audioCtx = null;
 let destinationGain = null;
 let audioEl = null;
 let nextStart = 0;
 let audioFollowKey = null;
 let audioUnlocked = false;
-let rackTimer = null;
 
 // -------------------------------------------------------------------
-// SlotConn — one WebSocket to a ReceiverDO
+// Event stream. EventSource reconnects by itself; every (re)connect
+// starts with `hello` (a fresh client id) and `rack`.
 // -------------------------------------------------------------------
 
-class SlotConn {
-  constructor(meta) {
-    this.host = meta.host;
-    this.port = meta.port;
-    this.bandKHz = meta.bandKHz;
-    this.bandLabel = meta.band;
-    this.label = meta.label;
-    this.gps = meta.gps;
-    this.wsUrl = meta.wsUrl;
-    this.key = `${meta.host}:${meta.port}:${meta.bandKHz}`;
-    this.hostKey = `${meta.host}:${meta.port}`;   // compat with map.js markers
-    this.ws = null;
-    this.state = "idle";
-    this.rssi = -127;
-    this.lastBurstAt = 0;
-    this.audioFollow = false;
-    this.closed = false;
-    this.retryDelay = 2000;
-    // Set when the slot enters "dead" via a status frame (DO is up,
-    // upstream Kiwi failed). The dead-slot watchdog uses this to
-    // force-close and reconnect a slot that's been dark too long.
-    this.deadSince = 0;
-  }
-
-  connect() {
-    if (this.closed) return;
-    this.state = "connecting";
+const handlers = {
+  hello(m) {
+    clientId = m.id;
+    audioFollowKey = null;              // the server forgot our follow
+  },
+  rack(m) {
+    const old = new Map(slots);
+    slots.clear();
+    for (const s of m.slots) slots.set(key(s), old.get(key(s))
+      || { ...s, state: "idle", rssi: -127, lastBurstAt: 0 });
+    reconsiderAudio();
     updateRxCount();
-    try { this.ws = new WebSocket(this.wsUrl); }
-    catch (e) { this._retry(`ws ctor: ${e.message}`); return; }
-    this.ws.onopen = () => { this.retryDelay = 2000; };
-    this.ws.onmessage = (ev) => this._onMessage(ev);
-    this.ws.onerror = () => {};
-    this.ws.onclose = () => {
-      this.ws = null;
-      this.state = "dead";
-      if (this.audioFollow) stopFollowing(this);
-      updateRxCount();
-      this._retry("ws close");
-    };
-  }
-
-  close() {
-    this.closed = true;
-    if (this.ws) { try { this.ws.close(); } catch (_) {} this.ws = null; }
-  }
-
-  setAudioFollow(on) {
-    if (this.audioFollow === !!on) return;
-    this.audioFollow = !!on;
-    this._send({ t: "audio-follow", on: !!on });
-  }
-
-  _send(msg) {
-    if (this.ws && this.ws.readyState === 1) {
-      try { this.ws.send(JSON.stringify(msg)); } catch (_) {}
-    }
-  }
-
-  _retry(reason) {
-    if (this.closed) return;
-    if (DEBUG) console.log(`[skywave] ${this.key} drop: ${reason}`);
-    setTimeout(() => this.connect(), this.retryDelay);
-    this.retryDelay = Math.min(this.retryDelay * 2, 30_000);
-  }
-
-  _onMessage(ev) {
-    let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
-    if (!msg || typeof msg !== "object") return;
-    switch (msg.t) {
-      case "hello":
-        this.state = "live";
-        this.deadSince = 0;
-        updateRxCount();
-        return;
-      case "status":
-        if (typeof msg.rssi === "number") this.rssi = msg.rssi;
-        if (msg.state === "burst") {
-          this.lastBurstAt = performance.now();
-          reconsiderAudio();
-        } else if (msg.state === "live") {
-          this.state = "live";
-          this.deadSince = 0;
-          reconsiderAudio();
-        } else if (msg.state === "down" || msg.state === "err") {
-          this.state = "dead";
-          if (!this.deadSince) this.deadSince = performance.now();
-          reconsiderAudio();
-        }
-        updateRxCount();
-        return;
-      case "call":
-        if (msg.call) dispatchCall(msg.call, this);
-        return;
-      case "audio":
-        if (this.audioFollow && audioFollowKey === this.key) playAudio(msg);
-        return;
-    }
-  }
-}
-
-// -------------------------------------------------------------------
-// Rack load + reconcile
-// -------------------------------------------------------------------
-
-async function fetchRack(regionId) {
-  if (!GATEWAY) throw new Error("no gateway configured");
-  const resp = await fetch(`${GATEWAY}/v2/rack?region=${encodeURIComponent(regionId)}`);
-  if (!resp.ok) throw new Error(`rack ${resp.status}`);
-  return resp.json();
-}
-
-function applyRack(rack) {
-  const keep = new Set();
-  for (const s of rack.slots) {
-    const key = `${s.host}:${s.port}:${s.bandKHz}`;
-    keep.add(key);
-    if (slots.has(key)) continue;
-    const conn = new SlotConn(s);
-    slots.set(key, conn);
-    conn.connect();
-  }
-  for (const [key, conn] of slots) {
-    if (!keep.has(key)) {
-      conn.close();
-      slots.delete(key);
-    }
-  }
-  updateRxCount();
-}
-
-async function refreshRack() {
-  try {
-    const rack = await fetchRack(currentRegion().id);
-    applyRack(rack);
-  } catch (e) {
-    if (DEBUG) console.log("[skywave] rack refresh failed:", e);
-  }
-}
+    if (!slots.size) rxCountEl.textContent = "no receivers in this region";
+  },
+  status(m) {
+    const s = slots.get(key(m));
+    if (!s) return;
+    if (typeof m.rssi === "number") s.rssi = m.rssi;
+    if (m.state === "burst") s.lastBurstAt = performance.now();
+    s.state = m.state === "burst" ? "live" : m.state;
+    reconsiderAudio();
+    updateRxCount();
+  },
+  call(m) { if (m.call) dispatchCall(m); },
+  tdoa(m) {
+    if (!m.mmsi || !m.position) return;
+    tdoaByMmsi.set(m.mmsi, m);
+    renderMmsi(m.mmsi);
+  },
+  audio(m) { if (key(m) === audioFollowKey) playAudio(m); },
+};
 
 function stop() {
-  for (const c of slots.values()) c.close();
+  es?.close();
+  es = clientId = audioFollowKey = null;
   slots.clear();
-  if (rackTimer) { clearInterval(rackTimer); rackTimer = null; }
-  audioFollowKey = null;
-  playingEl.textContent = "";
-  playingEl.classList.remove("on");
+  updatePlayingLabel();
 }
 
-async function start() {
-  rxCountEl.textContent = "loading…";
-  try {
-    const rack = await fetchRack(currentRegion().id);
-    if (!rack.slots || !rack.slots.length) {
-      rxCountEl.textContent = "no receivers in this region";
-      return;
-    }
-    callIndex.clear();
-    callsEl.innerHTML = "";
-    emptyEl.style.display = "";
-    applyRack(rack);
-    rackTimer = setInterval(refreshRack, RACK_REFRESH_MS);
-    startDeadSlotWatchdog();
-    connectTdoaFeed();
-  } catch (e) {
-    rxCountEl.textContent = "no rack";
-    if (DEBUG) console.log("[skywave] start failed:", e);
-  }
-}
-
-function restart() { stop(); start(); }
-
-// Dead-slot watchdog: a slot can report state=err/down while the
-// client-DO WebSocket stays open (the DO is up, only its Kiwi upstream
-// failed). The SlotConn retry path is wired to ws.onclose, so without a
-// kick the slot sits dead indefinitely. Every DEAD_WATCH_MS we close
-// any WS whose slot has been dead for longer than DEAD_GRACE_MS; the
-// reconnect triggers a fresh _ensureUpstream inside the DO.
-
-const DEAD_GRACE_MS = 60_000;
-const DEAD_WATCH_MS = 15_000;
-let deadWatchTimer = null;
-
-function startDeadSlotWatchdog() {
-  if (deadWatchTimer) return;
-  deadWatchTimer = setInterval(() => {
-    const now = performance.now();
-    for (const s of slots.values()) {
-      if (!s.ws || s.ws.readyState !== 1) continue;
-      if (s.state !== "dead" || !s.deadSince) continue;
-      if (now - s.deadSince < DEAD_GRACE_MS) continue;
-      if (DEBUG) console.log(`[skywave] watchdog bouncing ${s.key}`);
-      try { s.ws.close(); } catch (_) {}
-      s.deadSince = 0;  // don't re-bounce before onclose fires
-    }
-  }, DEAD_WATCH_MS);
+function start() {
+  stop();
+  callIndex.clear();
+  callsEl.innerHTML = "";
+  emptyEl.hidden = false;
+  if (!GATEWAY) return void (rxCountEl.textContent = "no gateway");
+  rxCountEl.textContent = "connecting…";
+  es = new EventSource(
+    `${GATEWAY}/v2/events?region=${encodeURIComponent(currentRegion().id)}`);
+  es.onerror = () => { rxCountEl.textContent = "reconnecting…"; };
+  for (const [name, fn] of Object.entries(handlers))
+    es.addEventListener(name, (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+      if (DEBUG && name !== "audio" && name !== "status") console.log(name, m);
+      fn(m);
+    });
 }
 
 // -------------------------------------------------------------------
-// Audio picker — follow the loudest live burst, drop the rest
+// Audio picker: follow the loudest live burst
 // -------------------------------------------------------------------
+
+function follow(s) {
+  audioFollowKey = s ? key(s) : null;
+  if (!clientId) return;
+  const q = s ? `${encodeURIComponent(s.slot)}&band=${s.band}` : "none";
+  fetch(`${GATEWAY}/v2/follow?id=${clientId}&slot=${q}`, { method: "POST" })
+    .catch(() => {});
+}
 
 function reconsiderAudio() {
   const now = performance.now();
   let best = null, bestScore = -Infinity;
-  for (const c of slots.values()) {
-    if (c.state !== "live") continue;
-    const freshness = now - c.lastBurstAt;
-    if (freshness > AUDIO_HOLD_MS) continue;
-    const rssiW = Math.min(1, Math.max(0, (c.rssi + 110) / 80));
-    const score = rssiW - freshness / 1e6;
-    if (score > bestScore) { best = c; bestScore = score; }
+  for (const s of slots.values()) {
+    const fresh = now - s.lastBurstAt;
+    if (s.state !== "live" || fresh > AUDIO_HOLD_MS) continue;
+    const score = Math.min(1, Math.max(0, (s.rssi + 110) / 80)) - fresh / 1e6;
+    if (score > bestScore) { best = s; bestScore = score; }
   }
-  if (best && audioFollowKey !== best.key) {
-    for (const c of slots.values()) if (c !== best && c.audioFollow) c.setAudioFollow(false);
-    best.setAudioFollow(true);
-    audioFollowKey = best.key;
-    if (audioCtx) nextStart = audioCtx.currentTime + AUDIO_LEAD_SEC;
-  } else if (!best && audioFollowKey) {
-    for (const c of slots.values()) if (c.audioFollow) c.setAudioFollow(false);
-    audioFollowKey = null;
+  if ((best ? key(best) : null) !== audioFollowKey) {
+    follow(best);
+    if (best && audioCtx) nextStart = audioCtx.currentTime + AUDIO_LEAD_SEC;
   }
-  updatePlayingLabel();
-}
-
-function stopFollowing(conn) {
-  conn.audioFollow = false;
-  if (audioFollowKey === conn.key) audioFollowKey = null;
   updatePlayingLabel();
 }
 
@@ -308,14 +144,15 @@ function updatePlayingLabel() {
     playingEl.classList.remove("on");
     return;
   }
-  const label = `${conn.bandLabel} · ${conn.label}`;
+  const label = `${conn.band} · ${conn.label}`;
   const ctxReady = audioCtx && audioCtx.state === "running" && audioUnlocked;
   const elReady  = !audioEl || !audioEl.paused;
   if (ctxReady && elReady) {
     playingEl.textContent = label;
     playingEl.classList.add("on");
   } else {
-    playingEl.textContent = NEEDS_TAP_HINT ? `tap to enable audio · ${label}` : label;
+    playingEl.textContent = NEEDS_TAP_HINT
+      ? `tap to enable audio · ${label}` : label;
     playingEl.classList.remove("on");
   }
 }
@@ -345,7 +182,8 @@ function playAudio(msg) {
   const start = Math.max(nextStart, audioCtx.currentTime + 0.02);
   src.start(start);
   nextStart = start + samples.length / sr;
-  if (nextStart < audioCtx.currentTime - 0.5) nextStart = audioCtx.currentTime + AUDIO_LEAD_SEC;
+  if (nextStart < audioCtx.currentTime - 0.5)
+    nextStart = audioCtx.currentTime + AUDIO_LEAD_SEC;
 }
 
 function ensureAudio() {
@@ -404,289 +242,159 @@ function unlockAudio() {
 }
 
 // -------------------------------------------------------------------
-// Call dedupe + rendering (unchanged from v1)
+// -------------------------------------------------------------------
+// Call dedupe + rendering
 // -------------------------------------------------------------------
 
-const callSig = (c) =>
-  [c.formatCode, c.destination, c.caller, c.tc1Code, c.tc2Code, c.eos].join("|");
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt()};`);
+const hms = (ms) => new Date(ms).toISOString().slice(11, 19) + "Z";
+const km = (x) => x.toFixed(x < 10 ? 1 : 0);
+const coord = (p) => `${p.lat.toFixed(3)}°, ${p.lon.toFixed(3)}°`;
+const age = (min) => min < 90 ? `${Math.round(min)} min`
+  : min < 2880 ? `${Math.round(min / 60)} h` : `${Math.round(min / 1440)} d`;
+const distKm = (a, b) => {
+  const r = Math.PI / 180, h = (x) => Math.sin(x * r / 2) ** 2;
+  return 12742 * Math.asin(Math.sqrt(h(b.lat - a.lat)
+    + Math.cos(a.lat * r) * Math.cos(b.lat * r) * h(b.lon - a.lon)));
+};
+const callSig = (c) => [c.formatCode, c.destination, c.caller,
+  c.tc1Code, c.tc2Code, c.eos].join("|");
+const dest = (c) => c.destination || (c.formatCode === 112 ? "all ships" : "");
+const heardBy = (e) => [...e.rx.values()].map((r) => [r.label, r.band]);
+// the one AIS position we hold for a ship: the estimate's own, else
+// the lazy lookup made when the card opens
+const aisOf = (e) => e.tdoa?.ais || Vessels.ais(e.call.caller);
+const NIGHT = `<span class="tag" title="night: skywave paths, `
+  + `coarser estimate">night</span>`;
 
-function dispatchCall(call, slot) {
-  const sig = callSig(call);
-  const now = Date.now();
-  const existing = callIndex.get(sig);
-  if (existing && now - existing.firstSeen < 120000) {
-    existing.receivers.set(slot.label, slot.bandLabel);
-    if (!existing.receiverSlots.includes(slot)) existing.receiverSlots.push(slot);
-    updateHeard(existing);
-    addReceiverToMiniMap(existing, slot);
-    return;
+function dispatchCall(m) {
+  const { call } = m, sig = callSig(call), now = Date.now();
+  let e = callIndex.get(sig);
+  if (e && now - e.firstSeen < 120_000) {
+    e.rx.set(key(m), m);
+    return render(e);
   }
-  const entry = {
-    firstSeen: now,
-    receivers: new Map([[slot.label, slot.bandLabel]]),
-    receiverSlots: [slot],
-    primaryBand: slot.bandLabel,
-    call,
-    row: null,
-    _mapInited: false, _map: null, _rxMarkers: new Map(),
-  };
-  callIndex.set(sig, entry);
-  entry.row = addCallRow(call, entry);
-  if (/^\d{9}$/.test(call.caller || "")) Vessels.lookup(call.caller);
-  // TDOA may have arrived before this call's card was rendered (coord
-  // DO broadcasts on quorum, which can beat a decoder re-run elsewhere).
-  const tdoa = tdoaByMmsi.get(call.caller);
-  if (tdoa) renderTdoaInCard(entry, tdoa);
-  for (const [k, v] of callIndex) if (now - v.firstSeen > 600000) callIndex.delete(k);
+  e = { firstSeen: now, call, rx: new Map([[key(m), m]]) };
+  callIndex.set(sig, e);
+  addCallRow(e);
+  Vessels.lookup(call.caller);
+  for (const [k, v] of callIndex)
+    if (now - v.firstSeen > 600_000) callIndex.delete(k);
 }
 
-// TDOA feed — one WebSocket to the coordinator DO. Keeps a MMSI→fix
-// map so a late call decode for a previously-solved ship still picks up
-// its position when the card is rendered. Auto-reconnects on close.
+const renderMmsi = (mmsi) => {
+  for (const e of callIndex.values()) if (e.call.caller === mmsi) render(e);
+};
+Vessels.onUpdate(renderMmsi);
 
-function connectTdoaFeed() {
-  if (!GATEWAY) return;
-  if (tdoaWs) { try { tdoaWs.close(); } catch (_) {} }
-  tdoaWs = new WebSocket(GATEWAY.replace(/^http/, "ws") + "/v2/tdoa/subscribe");
-  tdoaWs.onopen = () => { tdoaRetry = 2000; };
-  tdoaWs.onerror = () => {};
-  tdoaWs.onmessage = (ev) => {
-    let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
-    if (!msg || msg.t !== "tdoa" || !msg.mmsi || !msg.position) return;
-    tdoaByMmsi.set(msg.mmsi, msg);
-    // Kick off a fresh-AIS lookup. LSEG returns minute-fresh positions,
-    // letting the UI render Δkm vs ground truth alongside the fix.
-    Vessels.liveAis(msg.mmsi);
-    for (const entry of callIndex.values()) {
-      if (entry.call.caller === msg.mmsi) renderTdoaInCard(entry, msg);
-    }
-  };
-  tdoaWs.onclose = () => {
-    tdoaWs = null;
-    setTimeout(connectTdoaFeed, tdoaRetry);
-    tdoaRetry = Math.min(tdoaRetry * 2, 30_000);
-  };
-}
+// everything on a card that can change after it is first printed
+function render(e) {
+  const { row, call: { caller } } = e, q = (s) => row.querySelector(s);
+  const t = e.tdoa = tdoaByMmsi.get(caller), p = t?.position;
+  const dots = (a) => a.filter(Boolean).join(" · ");
+  const v = Vessels.get(caller) || {}, a = aisOf(e);
+  const bands = [...new Set(heardBy(e).map(([, b]) => b))].join("/");
 
-function renderTdoaInCard(entry, tdoa) {
-  // Server has already gated on residual + bearing-gap + ellipse +
-  // single-band-bucket + q≥4. Trust it: render whatever it sends.
-  entry.tdoa = tdoa;
-  // Merge the coordinator's authoritative receiver list into
-  // entry.receivers. MMSIs decoded under noise vary between receivers,
-  // so the client's exact-match dedupe can't see the full cohort that
-  // the server's fuzzy-match bucket does — without this merge the
-  // heard-by list stays stuck at 1-2 even when the summary says 7 RX.
-  if (Array.isArray(tdoa.receivers)) {
-    for (const r of tdoa.receivers) {
-      if (r && r.label && r.band) entry.receivers.set(r.label, r.band);
-    }
+  row.classList.toggle("has-tdoa", !!p);
+  q(".name").textContent = v.name || a?.name || `MMSI ${caller || "—"}`;
+  q(".name").title = v.type || "";
+  q(".c-heard").textContent =
+    `${t?.quality?.receivers ?? t?.quorum ?? e.rx.size} rx · ${bands}`;
+
+  q(".vessel").innerHTML = [
+    v.flag || midIso(caller), v.type, v.callsign, v.imo && `IMO ${v.imo}`,
+  ].filter(Boolean).map((s) => `<span>${esc(s)}</span>`).join("");
+
+  const rows = [];
+  if (p) {
+    const { receivers = t.quorum, decoders, night } = t.quality || {};
+    const c = t.convergence;
+    rows.push(["estimate", coord(p), dots([
+      `± ${km(p.semiMajorKm)} km`,
+      receivers + " rx" + (decoders == null ? "" : `, ${decoders} decoded`),
+      hms(t.broadcastMs),
+      c?.fixCount > 1 && `${c.agreeCount}/${c.fixCount} converging`,
+      night && NIGHT,
+    ])]);
   }
-  if (!entry.row) return;
-  entry.row.classList.add("has-tdoa");
-
-  updateHeard(entry);
-  const summary = entry.row.querySelector(".c-heard");
-  if (summary) summary.classList.add("has-tdoa");
-
-  const detail = entry.row.querySelector(".detail-text");
-  if (detail) {
-    let tdoaEl = detail.querySelector(".tdoa-fix");
-    if (!tdoaEl) {
-      tdoaEl = document.createElement("div");
-      tdoaEl.className = "tdoa-fix";
-      // Sit just under the GFW vessel chips, above the format/kv block.
-      const anchor = detail.querySelector(".vessel");
-      if (anchor && anchor.nextSibling) detail.insertBefore(tdoaEl, anchor.nextSibling);
-      else detail.prepend(tdoaEl);
-    }
-    const { lat, lon, residualKm } = tdoa.position;
-    const when = new Date(tdoa.broadcastMs).toISOString().slice(11, 19) + "Z";
-    const regimeTxt = tdoa.regime ? ` · ${tdoa.regime}` : "";
-    // Multi-burst convergence — present if this MMSI has been fixed
-    // before in the last 30 min. Reads as "agree/total within 200 km".
-    const c = tdoa.convergence;
-    const convTxt = (c && c.fixCount > 1)
-      ? ` · ${c.agreeCount}/${c.fixCount} converging`
-      : "";
-    const qualityMeta = `±${residualKm.toFixed(1)} km${regimeTxt}${convTxt}`;
-    // Pull fresh AIS (LSEG) for ground-truth comparison if available.
-    const info = Vessels.get(entry.call.caller);
-    let aisLine = "";
-    if (info && info.aisLive) {
-      const a = info.aisLive;
-      const dKm = haversineKm(lat, lon, a.lat, a.lon);
-      const dt = a.ts ? (Date.now() - a.ts) / 60000 : null;
-      const dtTxt = dt == null ? "" : dt < 60 ? `${dt.toFixed(0)}m ago`
-                  : dt < 1440 ? `${(dt / 60).toFixed(1)}h ago` : `${(dt / 1440).toFixed(1)}d ago`;
-      aisLine = `<span class="tdoa-ais">vs AIS Δ ${dKm.toFixed(0)} km${dtTxt ? ` · ${dtTxt}` : ""}</span>`;
-    }
-    tdoaEl.innerHTML =
-      `<span class="tdoa-label">TDOA fix</span>` +
-      `<span class="tdoa-coord">${lat.toFixed(3)}°, ${lon.toFixed(3)}°</span>` +
-      `<span class="tdoa-meta">${qualityMeta} · q=${tdoa.quorum} · ${when}</span>` +
-      aisLine;
+  if (a) {
+    const min = a.ageMin ?? (a.ts ? (Date.now() - a.ts) / 60_000 : null);
+    rows.push(["AIS", coord(a), dots([
+      p && `Δ ${km(a.km ?? distKm(p, a))} km`,
+      min != null && `${age(min)} old`,
+      Number.isFinite(a.speed) && `${a.speed.toFixed(1)} kn`,
+    ])]);
   }
-  if (entry._mapInited) setTdoaOnMiniMap(entry, tdoa);
+  q(".pos").innerHTML = rows.map(([k, at, meta]) =>
+    `<span>${k}</span><span><b class="${k}">${at}</b> ${meta}</span>`)
+    .join("");
+
+  q(".heard-list").innerHTML = "heard by: " + heardBy(e).map(([rx, band]) =>
+    `<span>${esc(rx)}</span> ${band}`).join(", ");
+  drawMap(e, a);
 }
 
-function haversineKm(la1, lo1, la2, lo2) {
-  const R = 6371, p1 = la1 * Math.PI / 180, p2 = la2 * Math.PI / 180;
-  const dp = (la2 - la1) * Math.PI / 180, dl = (lo2 - lo1) * Math.PI / 180;
-  const h = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
-  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
-}
+function addCallRow(e) {
+  const c = e.call, row = e.row = document.createElement("div");
+  const cat = { 112: "distress", 110: "urgency", 108: "safety" }[
+    c.categoryCode];
+  const tc1 = c.tc1 && c.tc1 !== "?" ? c.tc1 : null;
+  const tc2 = c.tc2 && c.tc2 !== "?" && c.tc2 !== c.tc1 ? c.tc2 : null;
+  const kv = [
+    ["MMSI", c.caller || "—"],
+    ["format", `${c.format} (${c.formatCode})`],
+    ["category", c.category || "?"],
+    ["telecommand 1", tc1],
+    ["telecommand 2", tc2],
+    ["EOS", c.eos],
+    ["ECC", c.ecc_valid ? "ok" : "—"],
+    ["mark / space",
+      `${(+c.markHz || 0).toFixed(0)} / ${(+c.spaceHz || 0).toFixed(0)} Hz`],
+    ["phasing score", c.phasingScore],
+  ].filter(([, v]) => v != null)
+    .map(([k, v]) => `<span>${k}</span><span>${esc(v)}</span>`).join("");
 
-function updateHeard(entry) {
-  const bands = new Set(entry.receivers.values());
-  const heardEl = entry.row.querySelector(".c-heard");
-  if (heardEl) {
-    // A TDOA broadcast takes precedence — it counts network-wide
-    // receivers, not just the ones this client is attached to.
-    const n = entry.tdoa ? entry.tdoa.quorum : entry.receivers.size;
-    heardEl.textContent = `${n} RX · ${Array.from(bands).join("/")}`;
-  }
-  const list = entry.row.querySelector(".heard-list");
-  if (list) list.innerHTML = "heard by: " + Array.from(entry.receivers).map(
-    ([rx, band]) => `<span>${escapeHtml(rx)}</span> <em>${band}</em>`
-  ).join(", ");
-}
-
-function addCallRow(call, entry) {
-  emptyEl.style.display = "none";
-  const row = document.createElement("div");
-  row.className = "call";
-  if (call.categoryCode === 112) row.classList.add("distress");
-  else if (call.categoryCode === 110) row.classList.add("urgency");
-  else if (call.categoryCode === 108) row.classList.add("safety");
-
-  const t = new Date();
-  const hh = String(t.getUTCHours()).padStart(2, "0");
-  const mm = String(t.getUTCMinutes()).padStart(2, "0");
-  const ss = String(t.getUTCSeconds()).padStart(2, "0");
-  const callerMmsi = call.caller || "—";
-  const destMmsi = call.destination || (call.formatCode === 112 ? "all ships" : "—");
-
-  const tc1 = call.tc1 && call.tc1 !== "?" ? call.tc1 : null;
-  const tc2 = call.tc2 && call.tc2 !== "?" && call.tc2 !== call.tc1 ? call.tc2 : null;
-  const kvRows = [
-    ["MMSI", escapeHtml(callerMmsi)],
-    ["format", `${escapeHtml(call.format)} (${call.formatCode})`],
-    ["category", escapeHtml(call.category || "?")],
-    ...(tc1 ? [["telecommand 1", escapeHtml(tc1)]] : []),
-    ...(tc2 ? [["telecommand 2", escapeHtml(tc2)]] : []),
-    ["EOS", escapeHtml(call.eos)],
-    ["ECC", call.ecc_valid ? "ok" : "—"],
-    ["mark / space", `${(+call.markHz || 0).toFixed(0)} / ${(+call.spaceHz || 0).toFixed(0)} Hz`],
-    ["phasing score", String(call.phasingScore)],
-  ];
-  const kvHtml = kvRows.map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join("");
-  const paySummary = [
-    call.category || "?",
-    tc1,
-    tc2,
-    call.eos,
-  ].filter(Boolean).map(escapeHtml).join(" · ");
-
+  row.className = "call" + (cat ? " " + cat : "");
   row.innerHTML = `
-    <span class="c-t">${hh}:${mm}:${ss}Z</span>
-    <span class="c-who">
-      <span class="name" data-mmsi="${callerMmsi}">MMSI ${callerMmsi}</span><span class="flag">${midIso(callerMmsi)}</span>
-    </span>
-    <span class="c-flow">→ ${escapeHtml(destMmsi)}</span>
-    <span class="c-pay">${paySummary}</span>
-    <span class="c-heard">${entry.receivers.size} RX · ${entry.primaryBand}</span>
+    <span class="c-t">${hms(e.firstSeen)}</span>
+    <span class="c-who"><span class="name"></span><span
+      class="flag">${midIso(c.caller)}</span></span>
+    <span class="c-flow">→ ${esc(dest(c) || "—")}</span>
+    <span class="c-pay">${[c.category || "?", tc1, tc2, c.eos]
+      .filter(Boolean).map(esc).join(" · ")}</span>
+    <span class="c-heard"></span>
     <div class="call-detail">
       <div class="detail-text">
-        <div class="vessel" data-mmsi="${callerMmsi}"></div>
-        <div class="kv">${kvHtml}</div>
-        <div class="heard-list">heard by: ${Array.from(entry.receivers).map(([rx, band]) => `<span>${escapeHtml(rx)}</span> <em>${band}</em>`).join(", ")}</div>
-        <code>${(call.symbols || []).map((s) => s < 0 ? "?" : s).join(" ")}</code>
+        <div class="vessel"></div>
+        <div class="kv"><div class="pos"></div>${kv}</div>
+        <div class="heard-list"></div>
+        <code>${(c.symbols || []).map((s) => s < 0 ? "?" : s).join(" ")}</code>
       </div>
       <div class="mini-map"></div>
-    </div>
-  `;
-  row.addEventListener("click", (e) => {
-    if (e.target.closest(".mini-map, a")) return;
-    row.classList.toggle("open");
-    // initMiniMap itself picks up entry.tdoa inside its RAF, so we
-    // don't re-invoke setTdoaOnMiniMap here — the map object doesn't
-    // exist yet at this synchronous moment.
-    if (row.classList.contains("open")) initMiniMap(entry);
+    </div>`;
+  row.addEventListener("click", (ev) => {
+    if (ev.target.closest(".mini-map, a")) return;
+    if (!row.classList.toggle("open")) return;
+    if (!e.tdoa?.ais) Vessels.fetchAis(c.caller);
+    render(e);
   });
+  emptyEl.hidden = true;
   callsEl.prepend(row);
   while (callsEl.children.length > 200) callsEl.lastChild.remove();
-
-  applyVesselIfCached(callerMmsi);
-  return row;
+  render(e);
 }
-
-// -------------------------------------------------------------------
-// GFW vessel rendering
-// -------------------------------------------------------------------
-
-function applyVesselIfCached(mmsi) {
-  const info = Vessels.get(mmsi);
-  if (info) renderVessel(mmsi, info);
-}
-
-function renderVessel(mmsi, info) {
-  if (!info) return;
-  for (const nameEl of document.querySelectorAll(`.name[data-mmsi="${mmsi}"]`)) {
-    nameEl.textContent = info.name || `MMSI ${mmsi}`;
-    if (info.type) nameEl.title = info.type;
-  }
-  for (const v of document.querySelectorAll(`.vessel[data-mmsi="${mmsi}"]`)) {
-    const flag = info.flag || midIso(mmsi);
-    const bits = [];
-    if (flag) bits.push(`<span class="vchip">${escapeHtml(flag)}</span>`);
-    if (info.type) bits.push(`<span class="vchip">${escapeHtml(info.type)}</span>`);
-    if (info.callsign) bits.push(`<span class="vchip">${escapeHtml(info.callsign)}</span>`);
-    if (info.imo) bits.push(`<span class="vchip">IMO ${escapeHtml(info.imo)}</span>`);
-    v.innerHTML = bits.join(" ");
-  }
-}
-
-Vessels.onUpdate((mmsi, info) => {
-  renderVessel(mmsi, info);
-  if (!info) return;
-  for (const entry of callIndex.values()) {
-    if (entry.call.caller !== mmsi) continue;
-    if (entry._mapInited) {
-      if (info.lastPos) {
-        setVesselOnMiniMap(entry, info);
-      } else if (info.vesselId) {
-        const c = entry.row.querySelector(".mini-map");
-        if (c) c.classList.add("no-track");
-      }
-    }
-    // If a TDOA fix already landed and now LSEG fresh AIS arrived, re-
-    // render the TDOA block so the Δ-vs-AIS line appears.
-    if (info.aisLive && entry.tdoa) renderTdoaInCard(entry, entry.tdoa);
-  }
-});
 
 // -------------------------------------------------------------------
 // Header counter
 // -------------------------------------------------------------------
 
 function updateRxCount() {
-  const live = Array.from(slots.values()).filter((s) => s.state === "live").length;
-  const total = slots.size;
-  const region = currentRegion();
-  const rx = !total
-    ? "connecting…"
-    : live === 0
-      ? `0 / ${total} stations`
-      : `${live} station${live === 1 ? "" : "s"}`;
-  const regionPart = region.id === "global" ? "" : ` · ${region.name}`;
-  rxCountEl.textContent = rx + regionPart;
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => (
-    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
-  ));
+  const live = [...slots.values()].filter((s) => s.state === "live").length;
+  const total = slots.size, region = currentRegion();
+  rxCountEl.textContent = (!total ? "connecting…"
+    : live ? `${live} station${live === 1 ? "" : "s"}`
+    : `0 / ${total} stations`)
+    + (region.id === "global" ? "" : ` · ${region.name}`);
 }
 
 // -------------------------------------------------------------------
@@ -699,71 +407,45 @@ function downloadCsv() {
     "dest_mmsi", "format", "category", "tc1", "tc2", "eos",
     "mark_hz", "space_hz", "phasing_score",
     "receivers_count", "primary_band", "heard_by",
+    "est_lat", "est_lon", "est_semi_major_km",
   ];
-  const esc = (v) => {
-    if (v == null) return "";
-    const s = String(v);
-    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  const rows = Array.from(callIndex.values()).sort((a, b) => a.firstSeen - b.firstSeen);
-  const lines = [cols.join(",")];
-  for (const e of rows) {
-    const c = e.call;
-    const v = Vessels.get(c.caller) || {};
-    const heardBy = Array.from(e.receivers).map(([rx, band]) => `${rx} (${band})`).join("; ");
-    lines.push([
-      new Date(e.firstSeen).toISOString(),
-      c.caller || "",
-      v.name || "",
-      v.flag || midIso(c.caller),
-      v.type || "",
-      c.destination || (c.formatCode === 112 ? "all ships" : ""),
-      c.format || "",
-      c.category || "",
-      c.tc1 || "",
-      c.tc2 || "",
-      c.eos || "",
-      c.markHz != null ? c.markHz.toFixed(0) : "",
-      c.spaceHz != null ? c.spaceHz.toFixed(0) : "",
-      c.phasingScore != null ? c.phasingScore : "",
-      e.receivers.size,
-      e.primaryBand || "",
-      heardBy,
-    ].map(esc).join(","));
-  }
-  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
+  const cell = (v) => /[",\n\r]/.test(v = String(v ?? ""))
+    ? `"${v.replace(/"/g, '""')}"` : v;
+  const rows = [...callIndex.values()]
+    .sort((a, b) => a.firstSeen - b.firstSeen).map((e) => {
+      const c = e.call, v = Vessels.get(c.caller) || {}, p = e.tdoa?.position;
+      return [
+        new Date(e.firstSeen).toISOString(), c.caller, v.name,
+        v.flag || midIso(c.caller), v.type, dest(c), c.format, c.category,
+        c.tc1, c.tc2, c.eos, c.markHz?.toFixed(0), c.spaceHz?.toFixed(0),
+        c.phasingScore, e.rx.size, heardBy(e)[0][1],
+        heardBy(e).map(([rx, band]) => `${rx} (${band})`).join("; "),
+        p?.lat, p?.lon, p?.semiMajorKm,
+      ].map(cell).join(",");
+    });
   const a = document.createElement("a");
-  a.href = url;
-  a.download = `skywave-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.csv`;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  a.href = URL.createObjectURL(
+    new Blob([[cols, ...rows].join("\n")], { type: "text/csv;charset=utf-8" }));
+  a.download = `skywave-${new Date().toISOString().slice(0, 19)
+    .replace(/:/g, "-")}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
 // -------------------------------------------------------------------
 // Bootstrap
 // -------------------------------------------------------------------
 
-if (csvBtn) csvBtn.addEventListener("click", downloadCsv);
+csvBtn.addEventListener("click", downloadCsv);
+tdoaOnlyEl.addEventListener("change", () =>
+  document.body.classList.toggle("tdoa-only", tdoaOnlyEl.checked));
 
-if (tdoaOnlyEl) {
-  tdoaOnlyEl.addEventListener("change", () => {
-    document.body.classList.toggle("tdoa-only", tdoaOnlyEl.checked);
-  });
-}
-
-if (regionEl) {
-  for (const r of REGIONS) {
-    const opt = document.createElement("option");
-    opt.value = r.id; opt.textContent = r.name;
-    regionEl.appendChild(opt);
-  }
-  regionEl.value = currentRegion().id;
-  regionEl.addEventListener("change", () => {
-    localStorage.setItem(REGION_STORAGE_KEY, regionEl.value);
-    restart();
-  });
-}
+for (const r of REGIONS) regionEl.add(new Option(r.name, r.id));
+regionEl.value = currentRegion().id;
+regionEl.addEventListener("change", () => {
+  localStorage.setItem(REGION_STORAGE_KEY, regionEl.value);
+  start();
+});
 
 // Stay attached for the life of the page: iOS aggressively re-suspends
 // the AudioContext on tab backgrounding and after long silence, and the
@@ -776,4 +458,4 @@ if (regionEl) {
 
 start();
 
-if (DEBUG) window.skywave = { slots, callIndex, Vessels };
+if (DEBUG) window.skywave = { slots, callIndex, tdoaByMmsi, Vessels, handlers };

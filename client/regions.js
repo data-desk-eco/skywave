@@ -1,55 +1,33 @@
-// Client-side static data: the region dropdown, MMSI-to-ISO-country
-// lookup (for the little flag chip on each call), and a GPS-string
-// parser used by the per-card mini-map.
-//
-// Band-coverage, coastal scoring, and rack selection moved server-side
-// in v2 — see `worker/src/regions.js`.
+// static client data: the region dropdown and the MMSI → ISO country
+// lookup behind each call's flag chip. rack selection is server-side.
 
 export const REGION_STORAGE_KEY = "skywave.region";
 
-// The dropdown is deliberately short: "ALL" scans the bbox picker's
-// global rack, while the target-focused regions (currently just Black
-// Sea / Russian ports) each pin a hand-tuned cohort of receivers
-// positioned for solid TDOA geometry around a specific patch of sea.
-// Add future presets here as they prove out.
+// "ALL" is the global bbox rack; the rest pin a cohort of receivers
+// around one patch of sea.
 export const REGIONS = [
-  { id: "global",             name: "ALL",   bbox: null                   },
-  // Tier-1 ground-wave MF TDOA targets — sub-100 km fix accuracy
-  // achievable, validated against AIS.
-  { id: "english-channel",    name: "ENGCH", bbox: [46, -8,  54,   8]    },
-  // Tier-2 ground-wave MF targets — surround geometry not as tight as
-  // English Channel but each has 15+ distinct receivers within 400 km
-  // for a viable cohort.
-  { id: "ny-harbour",         name: "NY",    bbox: [38, -76,  43, -71]   },
-  { id: "kattegat",           name: "KAT",   bbox: [54,  10,  58,  14]   },
-  { id: "chesapeake",         name: "CHES",  bbox: [35, -78,  39, -74]   },
-  { id: "ligurian",           name: "LIG",   bbox: [42,   6,  46,  11]   },
-  { id: "western-approaches", name: "WAPP",  bbox: [48,  -8,  52,  -3]   },
-  // Long-baseline (HF skywave) target cohorts. TDOA fixes from these
-  // are not as reliable but the rack is still useful for watching DSC
-  // traffic in the area.
-  { id: "sea-pac",            name: "SEAP",  bbox: [-35, 95,  35, 155]   },
-  { id: "black-sea",          name: "BSK",   bbox: [40,  25,  48,  42]   },
-  { id: "n-atlantic",         name: "NAT",   bbox: [28, -65,  60,   2]   },
-  { id: "persian-gulf",       name: "PG",    bbox: [20,  48,  32,  62]   },
+  { id: "global",             name: "ALL"   },
+  // ground-wave MF targets
+  { id: "english-channel",    name: "ENGCH" },
+  { id: "ny-harbour",         name: "NY"    },
+  { id: "kattegat",           name: "KAT"   },
+  { id: "chesapeake",         name: "CHES"  },
+  { id: "ligurian",           name: "LIG"   },
+  { id: "western-approaches", name: "WAPP"  },
+  // long-baseline HF targets: coarser estimates
+  { id: "sea-pac",            name: "SEAP"  },
+  { id: "black-sea",          name: "BSK"   },
+  { id: "n-atlantic",         name: "NAT"   },
+  { id: "persian-gulf",       name: "PG"    },
 ];
 
+// ?region=… in the URL wins and is remembered, so shared links work
 export function currentRegion() {
-  // ?region=... in the URL takes precedence and pins localStorage, so
-  // sharing a link like /skywave/?region=nw-europe just works.
-  const urlRegion = new URLSearchParams(location.search).get("region");
-  if (urlRegion && REGIONS.some((r) => r.id === urlRegion)) {
-    localStorage.setItem(REGION_STORAGE_KEY, urlRegion);
-    return REGIONS.find((r) => r.id === urlRegion);
-  }
+  const id = new URLSearchParams(location.search).get("region");
+  if (REGIONS.some((r) => r.id === id))
+    localStorage.setItem(REGION_STORAGE_KEY, id);
   const saved = localStorage.getItem(REGION_STORAGE_KEY);
   return REGIONS.find((r) => r.id === saved) || REGIONS[0];
-}
-
-export function parseGps(s) {
-  if (!s) return null;
-  const m = String(s).match(/\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)/);
-  return m ? [parseFloat(m[1]), parseFloat(m[2])] : null;
 }
 
 // Maritime Identification Digit → ISO 3166-1 alpha-2 country (ITU-R

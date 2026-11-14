@@ -6,7 +6,8 @@
 
 const L = window.L;
 const GW = document.querySelector('meta[name="skywave-gateway"]').content;
-const TILE = "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png";
+const TILE = "https://server.arcgisonline.com/ArcGIS/rest/services/"
+  + "Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}";
 
 // One muted hue per gate — the ghosts are the visual mass, kept secondary
 // to the amber fixes. Ordered by how many the campaign produced.
@@ -29,7 +30,7 @@ const ACCENT = "#ffb000";
 const map = L.map("map", { zoomControl: true, preferCanvas: true, worldCopyJump: true })
   .setView([50.5, 0], 6);
 L.control.scale({ imperial: false }).addTo(map);
-L.tileLayer(TILE, { subdomains: "abcd", maxZoom: 12, attribution: '&copy; <a href="https://carto.com/">carto</a> · OSM · Skywave' })
+L.tileLayer(TILE, { maxZoom: 12, attribution: "Esri, HERE, Garmin, &copy; OpenStreetMap · Skywave" })
   .addTo(map);
 
 const cohortLayer = L.layerGroup().addTo(map); // receiver lines for the selected marker
