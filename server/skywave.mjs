@@ -186,26 +186,34 @@ class Rx {
     let call;
     try { call = decode(view, this.sr, {}); } catch { return; }
     if (!call?.caller) return;
-    // one row per call: a decode that ran before the end-of-sequence
-    // symbol arrived (eos "—") waits for the next pass to complete it
-    const sig = [call.formatCode, call.destination, call.caller, call.tc1Code, call.tc2Code].join("|"), now = Date.now();
-    for (const [k, t] of this.sigs) if (now - Math.abs(t) > 120000) this.sigs.delete(k);
-    const seen = this.sigs.get(sig);
-    if (seen > 0) return;
-    this.sigs.set(sig, call.eos === "—" && !seen ? -now : now);
+    // a burst is one call: every receiver reports the cleanest decode
+    // of it so far, once, so noisy copies do not become rows of their
+    // own. a decode that ran before the end-of-sequence symbol arrived
+    // (eos "—") waits for the next pass to complete it
+    const now = Date.now(), clk = this.clock(), quality = call.badSymbols * 10 + call.phasingScore;
+    const T = clk?.tAt(this.total - this.used + off + (call.startSample | 0));
     delete call.symbols;
-    if (this.sigs.get(sig) > 0) all("call", { ...this.info(), call });
-    const clk = this.clock();
-    if (!clk) return;
-    const T = clk.tAt(this.total - this.used + off + (call.startSample | 0));
-    let b = bursts.find((b) => b.band === this.s.band && Math.abs(b.T - T) < 2 && compat(b.caller, call.caller));
-    if (!b) {
-      bursts.push(b = { T, band: this.s.band, caller: call.caller, call, q: new Map(), wallMs: now });
+    let b = bursts.find((b) => b.band === this.s.band && compat(b.caller, call.caller)
+      && (T != null ? Math.abs(b.T - T) < 2 : now - b.wallMs < 15000));
+    if (!b && T != null) {
+      bursts.push(b = { T, band: this.s.band, caller: call.caller, call, best: Infinity, q: new Map(), said: new Map(), wallMs: now });
       if (bursts.length > 50) bursts.shift();
       setTimeout(() => solve(b).catch((e) => log(`solve failed ${e.message}`)), 7500);
     }
-    if (!call.caller.includes("?")) { b.caller = call.caller; b.call = call; }
-    b.q.set(this.s.slot, Math.min(b.q.get(this.s.slot) ?? 999, call.badSymbols * 10 + call.phasingScore));
+    if (!b) {
+      const sig = [call.formatCode, call.destination, call.caller, call.tc1Code, call.tc2Code].join("|");
+      if (now - (this.sigs.get(sig) || 0) < 60000) return;
+      this.sigs.set(sig, now);
+      for (const [k, t] of this.sigs) if (now - t > 120000) this.sigs.delete(k);
+      return all("call", { ...this.info(), call });
+    }
+    if (quality < b.best || (b.call.eos === "—" && call.eos !== "—" && quality <= b.best)) Object.assign(b, { best: quality, call, caller: call.caller });
+    if (T != null) b.q.set(this.s.slot, Math.min(b.q.get(this.s.slot) ?? 999, quality));
+    const st = b.said.get(this.key);
+    if (st === 1) return;
+    const done = b.call.eos !== "—" || st === -1;
+    b.said.set(this.key, done ? 1 : -1);
+    if (done) all("call", { ...this.info(), call: b.call });
   }
   // ±300 Hz baseband of the burst window, or "wait" while frames lag
   cut(b) {
