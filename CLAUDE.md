@@ -44,7 +44,8 @@ last 100 estimates and `GET /status` the client and receiver counts. No vessel t
 stored or served: one position per ship only.
 
 The Cloudflare worker this replaced (durable objects, pairwise
-correlation, a stack of geometric gates) is in the git history before
+correlation, a stack of geometric gates) was deleted from Cloudflare on
+2026-11-14 with its R2 bucket; its code is in the git history before
 commit `3f2663d`, with its documentation in the same commits'
 `CLAUDE.md`.
 
@@ -132,7 +133,11 @@ the vessels and fixes scored on the other half unless stated.
 - `toa_modes.mjs`, `toa_excess.mjs` — night diagnostics: excess delay
   at truth by range, effective-height fit.
 
-`captures/` is not committed.
+`captures/` is not committed. Everything captured up to 2026-11-14
+(the July campaign, the November night, ring and US captures, their AIS
+polls, and what the retired worker held on Cloudflare) is in the private
+bucket at `s3://data-desk-raw/skywave/captures-2026-11-14/`, one
+zstd-compressed object per file (`data-desk env aws s3 cp …`).
 
 ## Client (`client/`, static, no build step)
 
