@@ -28,7 +28,10 @@ browser ─ EventSource ─► skywave (node) ─ ws ─► KiwiSDR × N
   bits; `server/locate.js` solves; `server/lseg.js` fetches one AIS
   position; the result is broadcast as a `tdoa` event.
 - A receiver that no browser's rack names for 5 minutes is closed, so
-  a quiet page stops holding KiwiSDR slots. No state is kept.
+  a quiet page stops holding KiwiSDR slots.
+- Every timed burst is appended to `/var/lib/skywave/toa-<date>.jsonl`
+  (arrival times per receiver, the estimate, the AIS position), in the
+  row format `scripts/toa_fix.mjs` reads. Raw audio is not kept.
 
 Events: `hello {id}`, `rack {region, regionName, slots}`,
 `status {slot, band, state, rssi}`, `call {slot, …, call}`,

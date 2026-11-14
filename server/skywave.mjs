@@ -12,10 +12,13 @@
 //
 //   PORT=8083 node server/skywave.mjs
 // env: LSEG_PROXY_URL, LSEG_PROXY_API_KEY, LSEG_APP_KEY; SKYWAVE_BIAS
-// (json file of {"host:port": offsetUs}, see scripts/toa_bias.mjs)
+// (json file of {"host:port": offsetUs}, see scripts/toa_bias.mjs);
+// SKYWAVE_DATA (directory): every timed burst is appended to
+// toa-<date>.jsonl there, in burst_toa.mjs's row format plus the
+// estimate and the ais position, for scoring later (scripts/toa_fix.mjs)
 
 import { createServer } from "node:http";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, appendFile } from "node:fs";
 import { decode } from "./dsc.js";
 import { baseband } from "./replica.js";
 import { arrivals, sunElevation } from "./burst.js";
@@ -252,7 +255,14 @@ async function solve(b) {
     todo = again;
   }
   const rows = arrivals(iq, (h) => b.q.get(h) ?? 999)?.filter((r) => r.pr > 6);
-  if (!rows || rows.length < 4 || b.caller.includes("?")) return;
+  if (!rows || rows.length < 2) return;
+  const keep = (extra) => {
+    if (!process.env.SKYWAVE_DATA) return;
+    const t0 = Math.min(...rows.map((r) => r.t)), day = new Date(b.wallMs).toISOString().slice(0, 10);
+    appendFile(`${process.env.SKYWAVE_DATA}/toa-${day}.jsonl`, JSON.stringify({ mmsi: b.caller, dest: b.call.destination, fmt: b.call.formatCode,
+      eos: b.call.eos, band: b.band, wallMs: b.wallMs, gpsT: t0, rows: rows.map((r) => ({ ...r, paths: undefined, t: +(r.t - t0).toFixed(7) })), ...extra }) + "\n", () => {});
+  };
+  if (rows.length < 4 || b.caller.includes("?")) return keep();
   // timing floor by daylight at the cohort's centre; 20.25 kHz-mode
   // kiwis stamp ~463 us early unless individually calibrated.
   const mid = [0, 1].map((k) => rows.reduce((s, r) => s + r.gps[k], 0) / rows.length);
@@ -281,6 +291,7 @@ async function solve(b) {
     broadcastMs: Date.now(),
   };
   all("tdoa", msg);
+  keep({ position: msg.position, night, ais });
   recent.push(msg) > 100 && recent.shift();
   log(`fix ${b.caller} ${msg.position.lat},${msg.position.lon} ±${msg.position.semiMajorKm} km q=${rows.length}${night ? " night" : ""}${ais ? ` ais Δ${ais.km} km` : ""}`);
 }
