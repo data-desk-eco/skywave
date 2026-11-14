@@ -230,9 +230,10 @@ async function solve(b) {
   const rows = arrivals(iq, (h) => b.q.get(h) ?? 999)?.filter((r) => r.pr > 6);
   if (!rows || rows.length < 4 || b.caller.includes("?")) return;
   // timing floor by daylight at the cohort's centre; 20.25 kHz-mode
-  // kiwis stamp ~463 us early unless individually calibrated
+  // kiwis stamp ~463 us early unless individually calibrated.
   const mid = [0, 1].map((k) => rows.reduce((s, r) => s + r.gps[k], 0) / rows.length);
-  const night = sunElevation(mid, b.wallMs) < 10, floor = night ? 150e-6 : 20e-6;
+  // night floor: measured error ran ~2x the ellipse at 150 us
+  const night = sunElevation(mid, b.wallMs) < 10, floor = night ? 300e-6 : 20e-6;
   const obs = rows.map((r) => ({ gps: r.gps, t: r.t - (bias[r.host] ?? (r.sr > 20000 ? -463 : 0)) * 1e-6, sigma: Math.hypot(r.sigUs * 1e-6, floor) }));
   await tick();
   const f = locate(obs);
