@@ -6,9 +6,8 @@
 //   node scripts/toa_score.mjs captures/day1_toa.jsonl captures/day1_ais.jsonl [hKm] > captures/day1_res.jsonl
 
 import { readFileSync } from "node:fs";
-import { geodist } from "../worker/src/tdoa.js";
-import { reduce } from "../worker/src/locate.js";
-import { COAST_REGISTRY } from "../worker/src/coast-registry.js";
+import { geodist, reduce } from "../server/locate.js";
+import { COAST_REGISTRY } from "../server/coast-registry.js";
 
 const [toaFile, aisFile, h = 0] = process.argv.slice(2);   // h: E-layer height for the two-mode model (0 = ground wave only)
 const rd = (f) => readFileSync(f, "utf8").trim().split("\n").map((l) => JSON.parse(l));

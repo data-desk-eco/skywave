@@ -2,7 +2,7 @@
 // next to what 1-hop E / F reflections would add at that range.
 //   node scripts/toa_modes.mjs captures/nov1_toa.jsonl captures/nov1_ais.jsonl
 import { readFileSync } from "node:fs";
-import { geodist, C } from "../worker/src/tdoa.js";
+import { geodist, C } from "../server/locate.js";
 const rd = (f) => readFileSync(f, "utf8").trim().split("\n").map((l) => JSON.parse(l));
 const R = 6371;
 const hop = (dKm, h, n = 1) => n * 2 * Math.sqrt(R * R + (R + h) ** 2 - 2 * R * (R + h) * Math.cos(dKm / n / 2 / R));

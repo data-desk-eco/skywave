@@ -4,7 +4,7 @@
 // scatter after removing each burst's median.
 //   node scripts/toa_excess.mjs toa.jsonl ais.jsonl [main|first|blend]
 import { readFileSync } from "node:fs";
-import { geodist, C } from "../worker/src/tdoa.js";
+import { geodist, C } from "../server/locate.js";
 const rd = (f) => readFileSync(f, "utf8").trim().split("\n").map((l) => JSON.parse(l));
 const R = 6371, which = process.argv[4] ?? "blend";
 const hop = (d, h) => (h ? 2 * Math.sqrt(R * R + (R + h) ** 2 - 2 * R * (R + h) * Math.cos(d / 2 / R)) : d);

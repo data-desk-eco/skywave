@@ -7,7 +7,7 @@
 
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
-import { baseband, softBits, bitClock, replica, toa } from "../worker/src/replica.js";
+import { baseband, softBits, bitClock, replica, toa } from "../server/replica.js";
 
 const TB = 0.01;
 const f32 = (b64) => new Float32Array(Buffer.from(b64, "base64").buffer.slice(0));

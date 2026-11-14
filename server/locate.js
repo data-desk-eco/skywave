@@ -4,7 +4,13 @@
 // it. several bursts from one slow or stationary transmitter can be
 // solved together (obs[i].k = burst index): one position, many t0s.
 
-import { geodist, C } from "./tdoa.js";
+export const C = 299792458;   // m/s
+// great-circle distance (m) between two [lat, lon] points in degrees
+export function geodist(a, b) {
+  const r = Math.PI / 180, h = Math.sin((b[0] - a[0]) * r / 2) ** 2
+    + Math.cos(a[0] * r) * Math.cos(b[0] * r) * Math.sin((b[1] - a[1]) * r / 2) ** 2;
+  return 2 * 6371000 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
 
 // two error models:
 //  day   — symmetric cauchy; one bad arrival cannot drag the rest.

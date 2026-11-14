@@ -3,9 +3,8 @@
 //
 //   node scripts/toa_fix.mjs captures/day1_toa.jsonl --ais captures/day1_ais.jsonl --bias captures/bias.json [--minq 4] [--floor 15]
 import { readFileSync } from "node:fs";
-import { locate } from "../worker/src/locate.js";
-import { geodist } from "../worker/src/tdoa.js";
-import { COAST_REGISTRY } from "../worker/src/coast-registry.js";
+import { locate, geodist } from "../server/locate.js";
+import { COAST_REGISTRY } from "../server/coast-registry.js";
 const args = process.argv.slice(2), opt = (k, d) => { const i = args.indexOf(k); return i < 0 ? d : args[i + 1]; };
 const rd = (f) => readFileSync(f, "utf8").trim().split("\n").map((l) => JSON.parse(l));
 const bias = opt("--bias") ? JSON.parse(readFileSync(opt("--bias"), "utf8")) : {};

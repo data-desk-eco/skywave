@@ -11,8 +11,8 @@
 //
 //   node scripts/capture_burst.mjs [lat] [lon] [radiusKm] [maxRx] [hours] [minKm] > captures/x.jsonl 2> captures/x.log
 
-import { decode as dscDecode } from "../worker/src/dsc.js";
-import { baseband } from "../worker/src/replica.js";
+import { decode as dscDecode } from "../server/dsc.js";
+import { baseband } from "../server/replica.js";
 import { openSync, readSync, fstatSync } from "node:fs";
 
 const [lat = 51, lon = 1.5, radiusKm = 600, maxRx = 60, hours = 4, minKm = 0] = process.argv.slice(2);
