@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 
 const [capFile, outFile, durationSec = 21600] = process.argv.slice(2);
-const LSEG = `${homedir()}/Research/.github/.claude/skills/lseg/lseg`;
+const LSEG = process.env.LSEG ?? `${homedir()}/Tools/data-desk/skills/lseg/lseg`;
 const GW = "https://skywave-gateway.louis-6bf.workers.dev";
 const ricCache = new Map();   // mmsi → ric | null
 const t0 = Date.now();
@@ -75,6 +75,6 @@ while (Date.now() - t0 < durationSec * 1000) {
       log(`polled ${rows.length} vessels`);
     } catch (e) { log(`poll failed: ${e.message}`); }
   }
-  await new Promise((r) => setTimeout(r, 900000));
+  await new Promise((r) => setTimeout(r, 600000));
 }
 log("ais watch done");

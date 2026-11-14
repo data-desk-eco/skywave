@@ -468,6 +468,98 @@ well far from the fix where the diagnostic value lives. See
 - All picks pass the same hard health filters: active, GPS-fixing,
   considerate (≥2 free user slots), recent.
 
+### Re-measurement — 2026-11-14 (supersedes parts of the July findings)
+
+The July captures were re-measured with a data-aided estimator and
+scored per receiver against LSEG AIS truth. The July conclusion on
+summer daytime propagation was wrong, and the pipeline below (offline, `scripts/`) replaces the
+pairwise-correlation + gate stack as the reference method. It is not
+yet ported to the Worker.
+
+**Estimator (`worker/src/replica.js`).** Once one receiver decodes a
+burst the bit sequence is known. Every receiver is then correlated
+against a noise-free CPFSK replica of those bits (bits voted across
+the decoding receivers), searched over delay and frequency offset.
+This gives a per-receiver arrival time, SNR and sigma (no
+noise × noise term, no reference receiver), and it detects the burst
+about 20 dB below the decode threshold: with `capture_burst.mjs`
+(every receiver's IQ ring is cut when any receiver decodes), bursts
+decoded by 1–14 receivers are detected by 16–26. `paths()` peels
+multiple arrivals off the delay–doppler surface (subtract and
+re-search) for multipath diagnosis.
+
+**Receiver clock offsets.** July day set, vessels with bracketing AIS:
+after removing one constant per receiver, the timing residual against
+geodesic truth is 17 µs median (p90 106 µs), with no trend in range
+out to 500+ km. The constants are near zero for 12 kHz Kiwis and
+−463 µs for the one 20.25 kHz-mode Kiwi (Alderney, the busiest
+decoder in that capture; 463 µs ≈ 140 km). Fitted on two disjoint
+halves of the vessels the Alderney constant is −462 and −458 µs and
+the others agree within ~20 µs. The July statement that summer
+daytime MF carries 100–300 µs sporadic-E contamination was this
+offset. `toa_bias.mjs` fits the constants from AIS-scored residuals;
+uncalibrated 20.25 kHz receivers default to −463 µs.
+
+**Solver (`worker/src/locate.js`).** Unknowns are position and one
+emission time per burst; each arrival is weighted by its own sigma;
+Cauchy loss. Several bursts from one transmitter can be solved as one
+position (`k` index). The 1σ ellipse comes from the weighted Fisher
+matrix. July day set, offsets fitted on half the vessels and fixes
+scored on the other half (72 fixes): error / ellipse ≈ 0.7–0.8 for
+ellipses under 60 km; median error 11 km where the ellipse is under
+15 km (3 fixes), 17 km for 15–30 km (22), 34 km for 30–60 km (24),
+46 km overall. The limit there is geometry: cohorts were mostly four
+near-collinear decoders, which is what the whole-rack capture fixes.
+
+**Propagation, day.** July (high sun): ground wave only, to 500+ km.
+November US east coast, early afternoon: arrivals are single-path
+and agree to tens of µs, but receivers beyond ~400–700 km look like
+one E-layer hop (`2·√(R² + (R+h)² − 2R(R+h)·cos(d/2R))`, h ≈ 110 km)
+rather than the geodesic. `locate` has a two-mode option (`h`, or
+`hs` to fit it): each arrival is ground wave or one hop, chosen by
+range and then by fit. Evidence is thin and mixed — receivers
+uncalibrated, almost all truth ships 600–1400 km outside a
+north–south receiver line where range trades against h: GENCO HORNET
+216 → 32 km, NACC PROVIDENCE (inside the cohort; chi² picks h = 110)
+106 → 33 km, CRESTY 444 → 135 km, but EREIKOUSA 113 → 348 km. Not
+established. The clean test is a winter-day capture with the source
+inside the cohort (Channel, `captures/nov2`, queued for 2026-11-15).
+
+**Propagation, night.** Channel rack, 2026-11-14 evening, 20–29
+receivers per burst within 600 km: receivers within ~400 km of the
+ship see several ionospheric hops spread over 1–4 ms (IQR of excess
+delay 800–1700 µs) and arrive 400–1400 µs late relative to mid-range
+ones; receivers beyond ~500 km mostly agree to ±100–200 µs. Fix
+error with the near rack alone: 70–145 km median (9 truth bursts).
+Adding a ring of receivers 600–1700 km out (a `FOLLOW` slave capture;
+40–64 receivers detect each burst) and solving on all of them with a
+150 µs floor: GAS EXELERO (mid-Channel) 35 km, BREYDEL (Denmark)
+62 km, and ships well outside the old rack — SUPERFAST III (Greece)
+38 km, KING ARTHUR 55 km, HOEGH TRACER (Gibraltar) 60 km, CSPC
+SKYLINE 65 km; three of 17 truth bursts were gross misses (250 km+).
+Small sample; the ellipse under-reports at night (error ≈ 2× ellipse).
+Tried and rejected on tonight's data: a ground/1E/1F/2F hop model
+with free layer heights (scores no better at truth than 40–120 km
+away), a one-sided "arrivals can only be late" loss (`late` option;
+occasional catastrophic far solutions), dropping receivers within
+500–700 km of the first fix (`--far`; no clear gain yet), a single
+effective reflection height (removes the near-late trend in the
+residuals but not the fix error).
+
+**Method for a new capture.** `capture_burst.mjs` + `ais_watch.mjs`
+(LSEG positions; GFW only for MMSI → IMO), then
+`scripts/scorecard.sh captures/<name>`: arrival times, residuals at
+truth, offsets fitted on half the vessels, fixes scored on the other
+half. `SLAVES="captures/x.jsonl"` adds `FOLLOW` captures; extra
+arguments go to `toa_fix.mjs` (night: `--floor 150`).
+
+**Next.** (1) Score the queued winter-day Channel capture — the
+first large-cohort, in-cohort daytime test. (2) Port to the Worker:
+ReceiverDO cuts its ring on a coordinator request, TDOADO runs
+`replica.js` + `locate.js` with a per-host offset table kept current
+from AIS-verified fixes. (3) Night: more truth with the ring before
+tuning anything.
+
 ### Validation — 2026-07-02/03 ground-truth campaign
 
 The question "can this really produce decent, consistent fixes?" got
@@ -653,6 +745,14 @@ Radio-ham tinker spirit served with Data Desk restraint.
   (mixed-cohort rescue subset) + legacy `xcorr` (kept as the
   comparison baseline in tests). Exercised offline by the scripts
   under `scripts/`.
+- `replica.js` — data-aided arrival times: `baseband`, bit voting
+  helpers, `toa` (matched filter against the decoded bit sequence,
+  detection statistic `pr`), `paths` (multipath decomposition). The
+  reference estimator since 2026-11-14; not yet used by the DOs.
+- `locate.js` — weighted robust solver on per-receiver arrival times
+  with per-burst emission times, multi-burst fusion, two-mode
+  ground / E-hop propagation and a Fisher ellipse. Reference solver
+  since 2026-11-14; not yet used by the DOs.
 - `toa.js` — arrival-time estimation. `estimateDt` (complex-envelope
   cross-correlation with CFO grid search, sub-sample peak, peakRatio
   confidence) + `hilbert` (analytic reconstruction of real snippets)
@@ -683,6 +783,25 @@ Radio-ham tinker spirit served with Data Desk restraint.
 - `location-hint.js` — GPS → CF region string.
 
 ### `scripts/` — offline validation + live testing
+
+- `capture_burst.mjs` — whole-rack capture: receivers picked straight
+  from the public list around a centre; when any receiver decodes,
+  every receiver's ring is cut around that GPS time and written as
+  ±300 Hz baseband. Retries cuts when the host is busy. `FOLLOW=<file>`
+  runs a second receiver set on another capture's bursts.
+- `burst_toa.mjs` — capture_burst output → replica arrival time,
+  detection statistic and resolved paths for every receiver, one row
+  per burst (incremental). `toa_extract.mjs` does the same for the
+  July decode-only captures.
+- `toa_score.mjs` / `toa_bias.mjs` — residuals at AIS / registry
+  truth; per-receiver clock offsets from them (`--half a|b` fits on
+  alternate vessels for hold-out).
+- `toa_fix.mjs` — solves bursts with `locate.js` and scores them
+  (`--bias`, `--h N|fit`, `--fuse MIN`, `--late`, `--far KM`, `--half`).
+- `scorecard.sh` — the chain above in one command.
+- `toa_modes.mjs`, `toa_hops.mjs`, `toa_excess.mjs` — night
+  diagnostics: excess delay at truth by range, the rejected
+  multi-layer hop test, effective-height fit.
 
 - `capture_iq.mjs` — ground-truth capture harness. Connects directly
   to the Kiwis of a region's rack (any band set), decodes DSC
