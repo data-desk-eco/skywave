@@ -262,7 +262,9 @@ async function solve(b) {
     appendFile(`${process.env.SKYWAVE_DATA}/toa-${day}.jsonl`, JSON.stringify({ mmsi: b.caller, dest: b.call.destination, fmt: b.call.formatCode,
       eos: b.call.eos, band: b.band, wallMs: b.wallMs, gpsT: t0, rows: rows.map((r) => ({ ...r, paths: undefined, t: +(r.t - t0).toFixed(7) })), ...extra }) + "\n", () => {});
   };
-  if (rows.length < 4 || b.caller.includes("?")) return keep();
+  // 00MIDxxxx is a coast station: fixed and known, so keep its
+  // arrivals for calibration but do not solve for it
+  if (rows.length < 4 || /\?|^00/.test(b.caller)) return keep();
   // timing floor by daylight at the cohort's centre; 20.25 kHz-mode
   // kiwis stamp ~463 us early unless individually calibrated.
   const mid = [0, 1].map((k) => rows.reduce((s, r) => s + r.gps[k], 0) / rows.length);

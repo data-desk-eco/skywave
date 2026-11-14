@@ -190,6 +190,8 @@ Plain ES modules; Leaflet from CDN is the only runtime dependency.
   500 ms later; keep the first search inside ±9 Hz and ±8 ms.
 - **MMSIs decoded under noise differ between receivers** (`5632??300`).
   Bursts are grouped with `?` as a wildcard, same band, within 2 s.
+- **Coast stations (`00MIDxxxx`) are not solved.** Their arrivals are
+  still kept in the TOA log; the station's position is known.
 - **A burst on two bands is two transmissions.** Never mix bands in
   one solve.
 - **`*.proxy.kiwisdr.com` redirects the websocket handshake.** The
