@@ -80,6 +80,7 @@ function cost(obs, groups, p, o) {
 // opts.late     — night loss (see above)
 // opts.h        — E-layer virtual height (km) for the two-mode model, or
 //                 opts.hs = [..] to fit it; omitted = ground wave only
+// opts.reachKm  — how far from the receivers a fix may lie (default 4000)
 // opts.padDeg   — search margin around the receivers (default 6°)
 // returns { lat, lon, t0[], res[] (s), w[], chi2, nEff,
 //           semiMajorKm, semiMinorKm, orientDeg }
@@ -91,6 +92,10 @@ export function locate(obs, opts = {}) {
   const la = obs.map((x) => x.gps[0]), lo = obs.map((x) => x.gps[1]), pad = opts.padDeg ?? 6;
   const box = [Math.max(-85, Math.min(...la) - pad), Math.min(85, Math.max(...la) + pad),
     Math.min(...lo) - pad * 1.5, Math.max(...lo) + pad * 1.5];
+  // a far source looks like a plane wave, and the search would follow
+  // it round the earth: it stays within opts.reachKm of the receivers
+  const mid = [la.reduce((s, x) => s + x, 0) / la.length, lo.reduce((s, x) => s + x, 0) / lo.length];
+  const reach = (opts.reachKm ?? 4000) * 1000;
   // coarse sweep, then pattern-search down from the best few cells
   const N = 60, dLa = (box[1] - box[0]) / N, dLo = (box[3] - box[2]) / N, cands = [];
   for (let i = 0; i <= N; i++) for (let j = 0; j <= N; j++) {
@@ -104,7 +109,9 @@ export function locate(obs, opts = {}) {
     while (hLa > 1e-4) {
       let moved = false;
       for (const [a, b] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
-        const q = [p[0] + a * hLa, p[1] + b * hLo], cq = cost(obs, groups, q, opts).c;
+        const q = [p[0] + a * hLa, p[1] + b * hLo];
+        if (geodist(q, mid) > reach) continue;
+        const cq = cost(obs, groups, q, opts).c;
         if (cq < c - 1e-12) { p = q; c = cq; moved = true; }
       }
       if (!moved) { hLa /= 2; hLo /= 2; }

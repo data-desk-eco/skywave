@@ -271,8 +271,10 @@ async function solve(b) {
   const obs = rows.map((r) => ({ gps: r.gps, t: r.t - (bias[r.host] ?? (r.sr > 20000 ? -463 : 0)) * 1e-6, sigma: Math.hypot(r.sigUs * 1e-6, floor) }));
   await tick();
   const f = locate(obs);
-  if (!f || !Number.isFinite(f.semiMajorKm)) return;
+  if (!f || !Number.isFinite(f.semiMajorKm)) return keep();
   const pos = [f.lat, f.lon], km = (p) => geodist(pos, p) / 1000;
+  // at the edge of the search the source is beyond what the cohort can range
+  if (Math.min(...rows.map((r) => km(r.gps))) > 3000) return keep();
   const a = await lsegLookupMmsi(process.env, b.caller).catch(() => null);
   const ais = a?.lat != null ? { name: a.name, lat: a.lat, lon: a.lon, ts: a.ts, speed: a.speed,
     km: +km([a.lat, a.lon]).toFixed(1), ageMin: a.ts ? Math.round((Date.now() - a.ts) / 60e3) : null } : null;
