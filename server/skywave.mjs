@@ -186,12 +186,15 @@ class Rx {
     let call;
     try { call = decode(view, this.sr, {}); } catch { return; }
     if (!call?.caller) return;
-    const sig = [call.formatCode, call.destination, call.caller, call.tc1Code, call.tc2Code, call.eos].join("|"), now = Date.now();
-    if (now - (this.sigs.get(sig) || 0) < 60000) return;
-    this.sigs.set(sig, now);
-    for (const [k, t] of this.sigs) if (now - t > 120000) this.sigs.delete(k);
+    // one row per call: a decode that ran before the end-of-sequence
+    // symbol arrived (eos "—") waits for the next pass to complete it
+    const sig = [call.formatCode, call.destination, call.caller, call.tc1Code, call.tc2Code].join("|"), now = Date.now();
+    for (const [k, t] of this.sigs) if (now - Math.abs(t) > 120000) this.sigs.delete(k);
+    const seen = this.sigs.get(sig);
+    if (seen > 0) return;
+    this.sigs.set(sig, call.eos === "—" && !seen ? -now : now);
     delete call.symbols;
-    all("call", { ...this.info(), call });
+    if (this.sigs.get(sig) > 0) all("call", { ...this.info(), call });
     const clk = this.clock();
     if (!clk) return;
     const T = clk.tAt(this.total - this.used + off + (call.startSample | 0));
