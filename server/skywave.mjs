@@ -30,6 +30,12 @@ const compat = (a, b) => a.length === b.length && [...a].every((c, i) => c === "
 const clients = new Map(), rxs = new Map(), bursts = [], fixes = new Map();
 let nextClient = 1, list = null, listAt = 0;
 
+// node's fetch reuses kept-alive sockets the far end has already closed
+// and fails on the first write: one retry, for every caller (lseg.js too)
+const fetch0 = globalThis.fetch;
+globalThis.fetch = (...a) => fetch0(...a).catch(() => fetch0(...a));
+const idents = new Map();   // mmsi → identity search body, kept a day
+
 const send = (c, ev, data) => c.res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`);
 const all = (ev, data, keep = () => true) => { for (const c of clients.values()) if (keep(c)) send(c, ev, data); };
 
@@ -310,11 +316,17 @@ createServer(async (req, res) => {
     if (url.pathname === "/lseg/track" && /^\d{9}$/.test(q.get("mmsi") || ""))
       return json(res, await lsegLookupMmsi(process.env, q.get("mmsi")));
     if (url.pathname === "/gfw" && /^\d{9}$/.test(q.get("query") || "")) {
-      const r = await fetch("https://gateway.api.globalfishingwatch.org/v3/vessels/search?includes%5B0%5D=MATCH_CRITERIA&includes%5B1%5D=OWNERSHIP"
-        + `&datasets%5B0%5D=public-global-vessel-identity%3Av4.0&query=${q.get("query")}`, { headers: { accept: "*/*", authorization: "Bearer",
-        origin: "https://globalfishingwatch.org", referer: "https://globalfishingwatch.org/map/fishing-activity/default-public/vessel-search" } });
-      res.writeHead(r.status, { ...CORS, "content-type": "application/json", "cache-control": "public, max-age=86400" });
-      return res.end(await r.text());
+      let hit = idents.get(q.get("query"));
+      if (!hit || Date.now() - hit.t > 864e5) {
+        const r = await fetch("https://gateway.api.globalfishingwatch.org/v3/vessels/search?includes%5B0%5D=MATCH_CRITERIA&includes%5B1%5D=OWNERSHIP"
+          + `&datasets%5B0%5D=public-global-vessel-identity%3Av4.0&query=${q.get("query")}`, { headers: { accept: "*/*", authorization: "Bearer",
+          origin: "https://globalfishingwatch.org", referer: "https://globalfishingwatch.org/map/fishing-activity/default-public/vessel-search" } });
+        hit = { t: Date.now(), status: r.status, body: await r.text() };
+        if (r.ok) idents.set(q.get("query"), hit);
+        if (idents.size > 5000) idents.clear();
+      }
+      res.writeHead(hit.status, { ...CORS, "content-type": "application/json", "cache-control": "public, max-age=86400" });
+      return res.end(hit.body);
     }
     if (url.pathname === "/status") return json(res, { clients: clients.size, receivers: rxs.size, live: [...rxs.values()].filter((r) => r.live).length });
     json(res, { error: "not found" }, 404);
