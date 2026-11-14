@@ -108,6 +108,14 @@ the vessels and fixes scored on the other half unless stated.
   Rejected on this data: a ground/1E/1F/2F hop model with free layer
   heights, the one-sided loss, range-dependent sigma, a single
   effective reflection height.
+- **First-path timing at night (in progress, 2026-11-14).**
+  `toa_fix.mjs --first F` times on the earliest path at least F x the
+  strongest. A first sweep on `nov1b` (359 bursts) was void: only 135
+  bursts carried `paths`. Next: finish `PATHS=1 node
+  scripts/burst_toa.mjs captures/nov1b.jsonl captures/nov1w.jsonl
+  captures/nov1p_toa.jsonl >> captures/nov1p_toa.jsonl` (127 of 359
+  done; it resumes), then score F = 0, .25, .5, 1 against the blend at floors
+  150 and 300, paired per burst, Channel/North Sea apart.
 - **Not yet measured.** A daytime capture with a large cohort around
   the ship (Channel, `captures/nov2`, 2026-11-15). The July error
   model predicts single-digit km there; the US result says winter
@@ -127,7 +135,7 @@ the vessels and fixes scored on the other half unless stated.
 - `toa_score.mjs`, `toa_bias.mjs` — residuals at truth; offsets
   (`--half a|b` fits on alternate vessels).
 - `toa_fix.mjs` — solve and score (`--bias`, `--floor`, `--fuse MIN`,
-  `--h N|fit`, `--late`, `--far KM`, `--half`).
+  `--h N|fit`, `--first F`, `--late`, `--far KM`, `--half`).
 - `scorecard.sh captures/<name> [toa_fix flags]` — the whole chain;
   `SLAVES=` names `FOLLOW` captures.
 - `toa_modes.mjs`, `toa_excess.mjs` — night diagnostics: excess delay

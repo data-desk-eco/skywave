@@ -31,9 +31,15 @@ const truthAt = (mmsi, t) => {
 // --h N: two-mode model at fixed E height; --h fit: height fitted per solve
 const hOpt = opt("--h"), prop = hOpt === "fit" ? { hs: [0, 90, 100, 110, 120, 130, 140] } : hOpt ? { h: +hOpt } : {};
 const far = +opt("--far", 0), half = opt("--half"), fuseMin = +opt("--fuse", 0);
+// --first F: time on the earliest path at least F x the strongest's
+// amplitude (0: earliest of all, 1: strongest) instead of the blend
+const first = opt("--first"), lead = (ps) => {
+  const m = Math.max(...ps.map((p) => p[2]));
+  return ps.find((p) => p[2] >= first * m)[0];
+};
 const mk = (b, k) => b.rows.filter((r) => (r.pr ? r.pr > minPr : r.rho > 0.3) && (!opt("--known") || r.host in bias)).map((r) => ({
   // 20.25 kHz-mode kiwis stamp ~463 us early unless individually calibrated
-  gps: r.gps, host: r.host, k, t: (opt("--first") && r.paths?.length ? r.paths[0][0] : r.t) - (bias[r.host] ?? (r.sr > 20000 ? -463 : 0)) * 1e-6,
+  gps: r.gps, host: r.host, k, t: (first != null && r.paths?.length ? lead(r.paths) : r.t) - (bias[r.host] ?? (r.sr > 20000 ? -463 : 0)) * 1e-6,
   sigma: Math.hypot(r.sigUs * 1e-6, floor),
 }));
 const all = rd(args[0]).filter((b) => /^\d{9}$/.test(b.mmsi) && (!half || (+b.mmsi % 2 === 0) === (half === "a")));
