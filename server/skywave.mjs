@@ -192,7 +192,7 @@ class Rx {
     if (Math.sqrt(g * 64 / view.length) < 0.005) return;
     let call;
     try { call = decode(view, this.sr, {}); } catch { return; }
-    if (!call?.caller) return;
+    if (!call?.caller || (call.caller.match(/\?/g) || []).length > 1) return;   // a noise lock, not a call
     // a burst is one call: every receiver reports the cleanest decode
     // of it so far, once, so noisy copies do not become rows of their
     // own. a decode that ran before the end-of-sequence symbol arrived
