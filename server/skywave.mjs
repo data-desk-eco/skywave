@@ -8,6 +8,7 @@
 //   POST /v2/follow?id=&slot=&band=   which slot's audio a client hears
 //   GET  /lseg/track?mmsi=        single latest AIS position (LSEG)
 //   GET  /gfw?query=<mmsi>        vessel identity search (no positions)
+//   GET  /v2/recent, /status      last 100 estimates; client and receiver counts
 //
 //   PORT=8083 node server/skywave.mjs
 // env: LSEG_PROXY_URL, LSEG_PROXY_API_KEY, LSEG_APP_KEY; SKYWAVE_BIAS
@@ -27,7 +28,7 @@ const RING_KM = [600, 1700], RING_N = 30;   // night helpers around a target
 const bias = existsSync(process.env.SKYWAVE_BIAS ?? "") ? JSON.parse(readFileSync(process.env.SKYWAVE_BIAS, "utf8")) : {};
 const log = (s) => console.log(`${new Date().toISOString()} ${s}`);
 const compat = (a, b) => a.length === b.length && [...a].every((c, i) => c === "?" || b[i] === "?" || c === b[i]);
-const clients = new Map(), rxs = new Map(), bursts = [], fixes = new Map();
+const clients = new Map(), rxs = new Map(), bursts = [], fixes = new Map(), recent = [];
 let nextClient = 1, list = null, listAt = 0;
 
 // node's fetch reuses kept-alive sockets the far end has already closed
@@ -280,6 +281,7 @@ async function solve(b) {
     broadcastMs: Date.now(),
   };
   all("tdoa", msg);
+  recent.push(msg) > 100 && recent.shift();
   log(`fix ${b.caller} ${msg.position.lat},${msg.position.lon} ±${msg.position.semiMajorKm} km q=${rows.length}${night ? " night" : ""}${ais ? ` ais Δ${ais.km} km` : ""}`);
 }
 
@@ -328,6 +330,7 @@ createServer(async (req, res) => {
       res.writeHead(hit.status, { ...CORS, "content-type": "application/json", "cache-control": "public, max-age=86400" });
       return res.end(hit.body);
     }
+    if (url.pathname === "/v2/recent") return json(res, recent);
     if (url.pathname === "/status") return json(res, { clients: clients.size, receivers: rxs.size, live: [...rxs.values()].filter((r) => r.live).length });
     json(res, { error: "not found" }, 404);
   } catch (e) { log(`${url.pathname} failed ${e.message}`); if (!res.headersSent) json(res, { error: "failed" }, 502); }

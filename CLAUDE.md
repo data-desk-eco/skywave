@@ -36,7 +36,8 @@ Events: `hello {id}`, `rack {region, regionName, slots}`,
 `audio {slot, band, sr, rssi, pcm}` (base64 int16 BE, only for the
 slot a client follows via `POST /v2/follow?id=&slot=&band=`).
 `GET /lseg/track?mmsi=` and `GET /gfw?query=` serve the latest AIS
-position and the vessel identity search. No vessel track is fetched,
+position and the vessel identity search; `GET /v2/recent` returns the
+last 100 estimates and `GET /status` the client and receiver counts. No vessel track is fetched,
 stored or served: one position per ship only.
 
 The Cloudflare worker this replaced (durable objects, pairwise
@@ -135,8 +136,7 @@ the vessels and fixes scored on the other half unless stated.
 `app.js` (event stream, call log, audio picker, CSV export),
 `vessels.js` (identity + single AIS position, cached), `regions.js`,
 `map.js` (Leaflet mini-map: estimate, 1σ ellipse, AIS point,
-receivers), `index.html`, `styles.css`. `map.html` +
-`detections-map.js` are a static map of the July campaign.
+receivers), `index.html`, `styles.css`.
 
 Design: radio-ham spirit with Data Desk restraint. Monospace
 (JetBrains Mono), monochrome with one accent, no clutter. Mobile
