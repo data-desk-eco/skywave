@@ -38,7 +38,10 @@ const all = (ev, data, keep = () => true) => { for (const c of clients.values())
 async function directory() {
   if (list && Date.now() - listAt < 600e3) return list;
   const js = await (await fetch("http://rx.linkfanel.net/kiwisdr_com.js")).text();
-  list = JSON.parse(js.slice(js.indexOf("["), js.lastIndexOf("]") + 1).replace(/,(\s*[\]}])/g, "$1"));
+  // *.proxy.kiwisdr.com has refused every connection since 2026-11-14:
+  // those receivers stay out of the racks unless PROXY=1
+  list = JSON.parse(js.slice(js.indexOf("["), js.lastIndexOf("]") + 1).replace(/,(\s*[\]}])/g, "$1"))
+    .filter((x) => process.env.PROXY || !/proxy\.kiwisdr\.com/.test(x.url || ""));
   listAt = Date.now();
   return list;
 }
