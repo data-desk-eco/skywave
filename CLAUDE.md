@@ -27,8 +27,11 @@ browser ─ EventSource ─► skywave (node) ─ ws ─► KiwiSDR × N
 - `server/burst.js` times each cut against a replica of the decoded
   bits; `server/locate.js` solves; `server/lseg.js` fetches one AIS
   position; the result is broadcast as a `tdoa` event.
-- A receiver that no browser's rack names for 5 minutes is closed, so
-  a quiet page stops holding KiwiSDR slots.
+- A receiver that no rack names for 5 minutes is closed, so a quiet
+  page stops holding KiwiSDR slots.
+- `SKYWAVE_KEEP` (region ids, set in the unit) names racks the server
+  holds with nobody watching, re-picked every 6 h, so the TOA log
+  covers every hour of the day for long-term scoring.
 - Every timed burst is appended to `/var/lib/skywave/toa-<date>.jsonl`
   (arrival times per receiver, the estimate, the AIS position), in the
   row format `scripts/toa_fix.mjs` reads. Raw audio is not kept.
@@ -40,7 +43,8 @@ Events: `hello {id}`, `rack {region, regionName, slots}`,
 slot a client follows via `POST /v2/follow?id=&slot=&band=`).
 `GET /lseg/track?mmsi=` and `GET /gfw?query=` serve the latest AIS
 position and the vessel identity search; `GET /v2/recent` returns the
-last 100 estimates and `GET /status` the client and receiver counts. No vessel track is fetched,
+last 100 estimates and `GET /status` the client, receiver and held
+counts. No vessel track is fetched,
 stored or served: one position per ship only.
 
 The Cloudflare worker this replaced (durable objects, pairwise
@@ -175,8 +179,9 @@ Plain ES modules; Leaflet from CDN is the only runtime dependency.
 
 - Add a framework, bundler or npm dependency. `package.json` exists
   only to mark `.js` as ES modules.
-- Hold receivers with nobody watching. The 5-minute idle close and the
-  ≥ 2 free slots rule in the pickers are the etiquette.
+- Hold receivers with nobody watching beyond the `SKYWAVE_KEEP` racks.
+  The 5-minute idle close and the ≥ 2 free slots rule in the pickers
+  are the etiquette.
 - Fetch, store or publish a vessel track. One AIS position per ship.
 - Put a secret in the repository. LSEG keys reach the server through
   its credential store.

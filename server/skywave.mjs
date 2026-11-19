@@ -15,7 +15,9 @@
 // (json file of {"host:port": offsetUs}, see scripts/toa_bias.mjs);
 // SKYWAVE_DATA (directory): every timed burst is appended to
 // toa-<date>.jsonl there, in burst_toa.mjs's row format plus the
-// estimate and the ais position, for scoring later (scripts/toa_fix.mjs)
+// estimate and the ais position, for scoring later (scripts/toa_fix.mjs);
+// SKYWAVE_KEEP (region ids, comma-separated): racks held with nobody
+// watching, re-picked every 6 h, so that log runs day and night
 
 import { createServer } from "node:http";
 import { readFileSync, existsSync, appendFile } from "node:fs";
@@ -238,6 +240,20 @@ class Rx {
   }
 }
 
+const open = (s) => { const k = `${s.slot}|${s.band}`; rxs.has(k) || rxs.set(k, new Rx(s)); return k; };
+let held = new Set();
+async function hold() {
+  try {
+    const ks = new Set();
+    for (const id of (process.env.SKYWAVE_KEEP ?? "").split(",").filter(Boolean))
+      for (const s of await rackFor(regionById(id))) ks.add(open(s));
+    held = ks;
+    if (ks.size) log(`holding ${ks.size} receivers for ${process.env.SKYWAVE_KEEP}`);
+    setTimeout(hold, 6 * 3600e3);
+  } catch (e) { log(`hold failed ${e.message}`); setTimeout(hold, 600e3); }
+}
+hold();
+
 // ---- solve -----------------------------------------------------------
 
 const tick = () => new Promise((r) => setImmediate(r));
@@ -316,11 +332,7 @@ createServer(async (req, res) => {
       req.on("close", () => clients.delete(c.id));
       send(c, "hello", { id: c.id });
       const slots = await rackFor(region);
-      for (const s of slots) {
-        const key = `${s.slot}|${s.band}`;
-        c.keys.add(key);
-        if (!rxs.has(key)) rxs.set(key, new Rx(s));
-      }
+      for (const s of slots) c.keys.add(open(s));
       send(c, "rack", { region: region.id, regionName: region.name, slots });
       for (const k of c.keys) if (rxs.get(k).live) send(c, "status", { ...rxs.get(k).info(), state: "live" });
       return;
@@ -346,15 +358,17 @@ createServer(async (req, res) => {
       return res.end(hit.body);
     }
     if (url.pathname === "/v2/recent") return json(res, recent);
-    if (url.pathname === "/status") return json(res, { clients: clients.size, receivers: rxs.size, live: [...rxs.values()].filter((r) => r.live).length });
+    if (url.pathname === "/status") return json(res, { clients: clients.size, receivers: rxs.size, held: held.size, live: [...rxs.values()].filter((r) => r.live).length });
     json(res, { error: "not found" }, 404);
   } catch (e) { log(`${url.pathname} failed ${e.message}`); if (!res.headersSent) json(res, { error: "failed" }, 502); }
 }).listen(+(process.env.PORT ?? 8083), "127.0.0.1", () => log("skywave listening"));
 
-// a receiver nobody's rack names for 5 minutes gives its kiwi slot back;
+// a receiver no rack names (a browser's or a held one) for 5 minutes
+// gives its kiwi slot back;
 // a comment line every 20 s keeps idle streams open through proxies
 setInterval(() => {
   const now = Date.now();
   for (const c of clients.values()) { c.res.write(": ka\n\n"); for (const k of c.keys) if (rxs.has(k)) rxs.get(k).seen = now; }
+  for (const k of held) if (rxs.has(k)) rxs.get(k).seen = now;
   for (const [k, r] of rxs) if (now - r.seen > IDLE_MS) { r.close(); rxs.delete(k); }
 }, 20000);
