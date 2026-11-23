@@ -30,7 +30,7 @@ const truthAt = (mmsi, t) => {
 };
 // --h N: two-mode model at fixed E height; --h fit: height fitted per solve
 const hOpt = opt("--h"), prop = hOpt === "fit" ? { hs: [0, 90, 100, 110, 120, 130, 140] } : hOpt ? { h: +hOpt } : {};
-const far = +opt("--far", 0), half = opt("--half"), fuseMin = +opt("--fuse", 0);
+const far = +opt("--far", 0), near = +opt("--near", Infinity), half = opt("--half"), fuseMin = +opt("--fuse", 0);
 // --first F: time on the earliest path at least F x the strongest's
 // amplitude (0: earliest of all, 1: strongest) instead of the blend
 const first = opt("--first"), lead = (ps) => {
@@ -54,9 +54,10 @@ for (const s of sets) {
   if (!obs.length) continue;
   let f = locate(obs, { ...prop, late: !!opt("--late") });
   // --far KM (night): re-solve on receivers at least KM from the first fix,
-  // where one hop dominates and delays are far more consistent
-  if (f && far) {
-    const o2 = obs.filter((o) => geodist([f.lat, f.lon], o.gps) / 1000 >= far);
+  // where one hop dominates and delays are far more consistent; --near KM:
+  // and at most KM from it (a transatlantic arrival is not the same path)
+  if (f && (far || near < Infinity)) {
+    const o2 = obs.filter((o) => { const d = geodist([f.lat, f.lon], o.gps) / 1000; return d >= far && d <= near; });
     const ok = new Set(o2.map((o) => o.k)).size === new Set(obs.map((o) => o.k)).size && o2.length >= minq;
     if (!ok) continue;
     obs.length = 0; obs.push(...o2);

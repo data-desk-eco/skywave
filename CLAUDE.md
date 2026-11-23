@@ -120,6 +120,22 @@ the vessels and fixes scored on the other half unless stated.
   captures/nov1p_toa.jsonl >> captures/nov1p_toa.jsonl` (127 of 359
   done; it resumes), then score F = 0, .25, .5, 1 against the blend at floors
   150 and 300, paired per burst, Channel/North Sea apart.
+- **Keep log, 19–23 Nov (english-channel + ny-harbour, 17 411 bursts,
+  2 759 vessel fixes with AIS).** Live estimates: 73 km median by day
+  (7 receivers), 196 km at night in Europe, 609 km at night in the US.
+  Night timing spread is 250–300 µs at every SNR (propagation-limited);
+  by day it follows SNR. At night US receivers decode European calls
+  and time them 5–20 ms off (and vice versa); re-solving without
+  arrivals over 4000 km from the first fix (`--near 4000`, now in the
+  server) cut night p75 626 → 538 km, paired. Rejected on this data: a
+  per-receiver offset table fitted on half the vessels plus coast
+  stations (day 72 → 124 km median, even after the gate), and `--far
+  500` at night (205 → 283 km). A few receivers have stable gross
+  offsets (178.115.248.93 ≈ −9 ms, 178.164.107.18 ≈ +1 ms,
+  sm1.thulesius.se ≈ −450 µs) that a hand-picked table could fix.
+  Ellipses under 500 km under-report error 1.3–2x; long ellipses
+  (ship outside the cohort) over-report it, but their median error is
+  still 630–750 km.
 - **Not yet measured.** A daytime capture with a large cohort around
   the ship (Channel, `captures/nov2`, 2026-11-15). The July error
   model predicts single-digit km there; the US result says winter
@@ -139,7 +155,8 @@ the vessels and fixes scored on the other half unless stated.
 - `toa_score.mjs`, `toa_bias.mjs` — residuals at truth; offsets
   (`--half a|b` fits on alternate vessels).
 - `toa_fix.mjs` — solve and score (`--bias`, `--floor`, `--fuse MIN`,
-  `--h N|fit`, `--first F`, `--late`, `--far KM`, `--half`).
+  `--h N|fit`, `--first F`, `--late`, `--far KM`, `--near KM`,
+  `--half`).
 - `scorecard.sh captures/<name> [toa_fix flags]` — the whole chain;
   `SLAVES=` names `FOLLOW` captures.
 - `toa_modes.mjs`, `toa_excess.mjs` — night diagnostics: excess delay

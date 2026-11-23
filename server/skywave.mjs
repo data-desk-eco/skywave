@@ -288,7 +288,11 @@ async function solve(b) {
   const night = sunElevation(mid, b.wallMs) < 10, floor = night ? 300e-6 : 20e-6;
   const obs = rows.map((r) => ({ gps: r.gps, t: r.t - (bias[r.host] ?? (r.sr > 20000 ? -463 : 0)) * 1e-6, sigma: Math.hypot(r.sigUs * 1e-6, floor) }));
   await tick();
-  const f = locate(obs);
+  // re-solve without arrivals over 4000 km from the first fix: at night
+  // a transatlantic receiver can decode the call but times it 5-20 ms off
+  let f = locate(obs);
+  const near = f && obs.filter((o) => geodist([f.lat, f.lon], o.gps) < 4e6);
+  if (near?.length >= 4 && near.length < obs.length) f = locate(near);
   if (!f || !Number.isFinite(f.semiMajorKm)) return keep();
   const pos = [f.lat, f.lon], km = (p) => geodist(pos, p) / 1000;
   // at the edge of the search the source is beyond what the cohort can range
