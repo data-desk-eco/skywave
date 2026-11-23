@@ -147,6 +147,10 @@ the vessels and fixes scored on the other half unless stated.
   fixes 70 km median, top tenth 48 km. A coast-station addressee puts
   the ship 194 km (day) / 256 km (night) median from it: a prior, not a
   fix. `--fuse 20` night median 188 → 154 km (unpaired).
+  Repeat-confirmed sightings (live log: a ship's fixes in one session,
+  gaps < 30 min, kept if another lands within 50 km, merged at the
+  median): 356 of 6338 sessions; 34 km median by day (p90 156), 78 km
+  at night (p90 338); 42 km with 3+ fixes.
 - **Not yet measured.** A daytime capture with a large cohort around
   the ship (Channel, `captures/nov2`, 2026-11-15). The July error
   model predicts single-digit km there; the US result says winter
