@@ -263,6 +263,12 @@ hold();
 
 const tick = () => new Promise((r) => setImmediate(r));
 
+// 68% of misses fall inside this radius (keep log, Europe, by ellipse
+// size); the fisher ellipse alone under-reports small and over-reports
+// large errors
+const err68 = (a, night) => [[50, 74, 139], [150, 159, 201], [500, 299, 530], [Infinity, 847, 1197]]
+  .find((x) => a < x[0])[night ? 2 : 1];
+
 async function solve(b) {
   // same band, and near enough to the decoders that the burst could
   // fall inside the ±8 ms search: another region's rack stays out
@@ -306,13 +312,22 @@ async function solve(b) {
   const ais = a?.lat != null ? { name: a.name, lat: a.lat, lon: a.lon, ts: a.ts, speed: a.speed,
     km: +km([a.lat, a.lon]).toFixed(1), ageMin: a.ts ? Math.round((Date.now() - a.ts) / 60e3) : null } : null;
   const prev = (fixes.get(b.caller) ?? []).filter((x) => Date.now() - x.t < 30 * 60e3).slice(-9);
-  const dist = prev.map((x) => km(x.pos));
-  fixes.set(b.caller, [...prev, { t: Date.now(), pos }]);
+  const dist = prev.map((x) => km(x.pos)), used = near?.length >= 4 ? near : obs;
+  fixes.set(b.caller, [...prev, { t: Date.now(), pos, band: b.band, night, obs: used }]);
+  // the ship's bursts in this session (same band, gaps < 30 min) solved
+  // as one position with one emission time each: night errors are
+  // independent between bursts, so this halves the miss (keep log)
+  const ses = [...prev.filter((x) => x.band === b.band), { obs: used, night }];
+  const j = ses.length > 1 ? locate(ses.flatMap((x, k) => x.obs.map((o) => ({ ...o, k })))) : null;
   const { caller, destination, formatCode, categoryCode, eos } = b.call;
   const msg = {
     mmsi: b.caller, call: { caller, destination, formatCode, categoryCode, eos },
     position: { lat: +f.lat.toFixed(4), lon: +f.lon.toFixed(4), semiMajorKm: +f.semiMajorKm.toFixed(1),
-      semiMinorKm: +f.semiMinorKm.toFixed(1), bearingDeg: Math.round(((90 - f.orientDeg) % 180 + 180) % 180) },
+      semiMinorKm: +f.semiMinorKm.toFixed(1), bearingDeg: Math.round(((90 - f.orientDeg) % 180 + 180) % 180),
+      err68Km: err68(f.semiMajorKm, night) },
+    session: j && Number.isFinite(j.semiMajorKm) ? { lat: +j.lat.toFixed(4), lon: +j.lon.toFixed(4), bursts: ses.length,
+      semiMajorKm: +j.semiMajorKm.toFixed(1), semiMinorKm: +j.semiMinorKm.toFixed(1),
+      bearingDeg: Math.round(((90 - j.orientDeg) % 180 + 180) % 180), err68Km: ses.some((x) => x.night) ? 230 : 75 } : null,
     quality: { receivers: rows.length, decoders: rows.filter((r) => r.dec).length, night }, quorum: rows.length,
     receivers: rows.map((r, i) => ({ slot: r.host, label: iq.find((c) => c.host === r.host).label, gps: r.gps, dec: !!r.dec,
       snrDb: r.snrDb, resUs: Math.round(f.res[i] * 1e6), w: +f.w[i].toFixed(2) })),
@@ -320,7 +335,7 @@ async function solve(b) {
     broadcastMs: Date.now(),
   };
   all("tdoa", msg);
-  keep({ position: msg.position, night, ais });
+  keep({ position: msg.position, session: msg.session, night, ais });
   recent.push(msg) > 100 && recent.shift();
   log(`fix ${b.caller} ${msg.position.lat},${msg.position.lon} ±${msg.position.semiMajorKm} km q=${rows.length}${night ? " night" : ""}${ais ? ` ais Δ${ais.km} km` : ""}`);
 }

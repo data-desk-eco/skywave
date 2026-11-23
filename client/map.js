@@ -38,7 +38,7 @@ export function drawMap(e, ais) {
     e.layer = L.layerGroup().addTo(e.map);
   }
   e.map.invalidateSize();
-  const g = e.layer.clearLayers(), t = e.tdoa, p = t?.position;
+  const g = e.layer.clearLayers(), t = e.tdoa, p = t?.session ?? t?.position;
   const line = { color: "#fff", weight: 1, interactive: false };
   const dot = (ll, style, tip) => L.circleMarker(ll, { ...line, ...style })
     .bindTooltip(tip, { direction: "top" }).addTo(g);

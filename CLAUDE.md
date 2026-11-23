@@ -78,7 +78,11 @@ emission time per burst. Each arrival is weighted by its sigma
 (Cramér–Rao from its SNR, plus a floor: 20 µs by day, 300 µs when the
 sun is under 10° at the cohort's centre). Cauchy loss, coarse grid
 then pattern search. The server re-solves without arrivals over
-4000 km from the first fix (transatlantic decodes, 5–20 ms off). The 1σ ellipse is the weighted Fisher matrix.
+4000 km from the first fix (transatlantic decodes, 5–20 ms off).
+Each fix also carries `session`: the ship's same-band bursts of the
+last 30 min solved as one position with one t0 per burst, which the
+client shows in preference. Both carry `err68Km`, the radius holding
+68% of measured misses for that ellipse size, day or night. The 1σ ellipse is the weighted Fisher matrix.
 Several bursts can share one position (`k`). Options kept for
 experiments: `h` / `hs` (ground wave or one E-layer hop per arrival),
 `late` (one-sided night loss).
@@ -151,6 +155,19 @@ the vessels and fixes scored on the other half unless stated.
   gaps < 30 min, kept if another lands within 50 km, merged at the
   median): 356 of 6338 sessions; 34 km median by day (p90 156), 78 km
   at night (p90 338); 42 km with 3+ fixes.
+- **Session joint solve (keep log, Europe, offline).** On the 446
+  sessions with 2+ bursts it beats the median single fix in 86–94% of
+  sessions: night 343 → 171 km median where the fixes disagree, 91 →
+  64 km where they agree; day 158 → 69 and 50 → 30 km. Picking
+  agreeing bursts first does not help; the Cauchy loss already
+  rejects them. 68% radius: 75 km day, 230 km night.
+- **Rejected, keep log.** Coast-station differential correction
+  (rolling per-receiver residual, 15–120 min, any station radius, and
+  the REQ/ACK pair): worse in every variant, because a receiver's
+  night residual barely repeats between bursts (r = 0.34 under 2 min,
+  0.22 under 30 min; day 0.72 / 0.58). Weighting receivers by their
+  historical spread: day floor 0.5 x spread gives 68 → 62 km, paired
+  (49% better, 35% worse); night neutral or worse; not adopted.
 - **Not yet measured.** A daytime capture with a large cohort around
   the ship (Channel, `captures/nov2`, 2026-11-15). The July error
   model predicts single-digit km there; the US result says winter

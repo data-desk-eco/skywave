@@ -5,10 +5,10 @@
 // audio for the one slot it follows (the loudest live burst, chosen
 // here and told to the server with POST `/v2/follow`).
 
-import { Vessels, GATEWAY } from "./vessels.js?v=39";
-import { drawMap } from "./map.js?v=39";
+import { Vessels, GATEWAY } from "./vessels.js?v=40";
+import { drawMap } from "./map.js?v=40";
 import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso }
-  from "./regions.js?v=39";
+  from "./regions.js?v=40";
 
 const DEBUG = /(\?|&)debug=1\b/.test(location.search);
 const AUDIO_LEAD_SEC = 0.25;
@@ -290,7 +290,7 @@ Vessels.onUpdate(renderMmsi);
 // everything on a card that can change after it is first printed
 function render(e) {
   const { row, call: { caller } } = e, q = (s) => row.querySelector(s);
-  const t = e.tdoa = tdoaByMmsi.get(caller), p = t?.position;
+  const t = e.tdoa = tdoaByMmsi.get(caller), p = t?.session ?? t?.position;
   const dots = (a) => a.filter(Boolean).join(" · ");
   const v = Vessels.get(caller) || {}, a = aisOf(e);
   const bands = [...new Set(heardBy(e).map(([, b]) => b))].join("/");
@@ -310,7 +310,8 @@ function render(e) {
     const { receivers = t.quorum, decoders, night } = t.quality || {};
     const c = t.convergence;
     rows.push(["estimate", coord(p), dots([
-      `± ${km(p.semiMajorKm)} km`,
+      `± ${km(p.err68Km ?? p.semiMajorKm)} km`,
+      p.bursts && `${p.bursts} bursts`,
       receivers + " rx" + (decoders == null ? "" : `, ${decoders} decoded`),
       hms(t.broadcastMs),
       c?.fixCount > 1 && `${c.agreeCount}/${c.fixCount} converging`,
@@ -320,7 +321,7 @@ function render(e) {
   if (a) {
     const min = a.ageMin ?? (a.ts ? (Date.now() - a.ts) / 60_000 : null);
     rows.push(["AIS", coord(a), dots([
-      p && `Δ ${km(a.km ?? distKm(p, a))} km`,
+      p && `Δ ${km(t.session ? distKm(p, a) : a.km ?? distKm(p, a))} km`,
       min != null && `${age(min)} old`,
       Number.isFinite(a.speed) && `${a.speed.toFixed(1)} kn`,
     ])]);
