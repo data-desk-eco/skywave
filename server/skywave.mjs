@@ -110,7 +110,12 @@ class Rx {
     const tx = (m) => { try { ws.send(m); } catch {} };
     ws.onopen = () => { tx("SET auth t=kiwi p="); tx("SET ident_user=skywave"); this.ka = setInterval(() => tx("SET keepalive"), 5000); };
     ws.onmessage = (ev) => this.msg(ev.data, tx);
-    ws.onclose = ws.onerror = () => { clearInterval(this.ka); try { ws.close(); } catch {} this.retry(); };
+    // detach first: close() on a failing socket re-fires these, recursively
+    ws.onclose = ws.onerror = () => {
+      ws.onclose = ws.onerror = null; clearInterval(this.ka);
+      try { ws.close(); } catch {}
+      this.retry();
+    };
   }
   retry() {
     if (this.closed || this.retrying) return;

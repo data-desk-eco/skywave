@@ -69,20 +69,24 @@ it is a diagnostic (`PATHS=1` in `burst_toa.mjs`), not used in fixes.
 It is near zero for 12 kHz receivers and about −463 µs (140 km) for
 20.25 kHz-mode receivers. `scripts/toa_bias.mjs` fits the constants
 from residuals at AIS truth; the server takes a table from
-`SKYWAVE_BIAS` and defaults 20.25 kHz receivers to −463 µs.
+`SKYWAVE_BIAS` (unset in production) and defaults 20.25 kHz receivers
+to −463 µs. A full fitted table hurt on the keep log; only a few
+receivers have stable gross offsets (see below).
 
 **Solver (`server/locate.js`).** Unknowns are position and one
 emission time per burst. Each arrival is weighted by its sigma
 (Cramér–Rao from its SNR, plus a floor: 20 µs by day, 300 µs when the
 sun is under 10° at the cohort's centre). Cauchy loss, coarse grid
-then pattern search. The 1σ ellipse is the weighted Fisher matrix.
+then pattern search. The server re-solves without arrivals over
+4000 km from the first fix (transatlantic decodes, 5–20 ms off). The 1σ ellipse is the weighted Fisher matrix.
 Several bursts can share one position (`k`). Options kept for
 experiments: `h` / `hs` (ground wave or one E-layer hop per arrival),
 `late` (one-sided night loss).
 
 **Racks.** `regions.js` picks as before. For a single-band target
 region the server adds up to 30 receivers 600–1700 km from the target
-on that band: at night only distant receivers time consistently.
+on that band. Distant receivers help at night, but dropping the near
+ones (`--far 500`) hurt on the keep log.
 
 ## What has been measured
 
@@ -121,21 +125,17 @@ the vessels and fixes scored on the other half unless stated.
   done; it resumes), then score F = 0, .25, .5, 1 against the blend at floors
   150 and 300, paired per burst, Channel/North Sea apart.
 - **Keep log, 19–23 Nov (english-channel + ny-harbour, 17 411 bursts,
-  2 759 vessel fixes with AIS).** Live estimates: 73 km median by day
-  (7 receivers), 196 km at night in Europe, 609 km at night in the US.
-  Night timing spread is 250–300 µs at every SNR (propagation-limited);
-  by day it follows SNR. At night US receivers decode European calls
-  and time them 5–20 ms off (and vice versa); re-solving without
-  arrivals over 4000 km from the first fix (`--near 4000`, now in the
-  server) cut night p75 626 → 538 km, paired. Rejected on this data: a
-  per-receiver offset table fitted on half the vessels plus coast
-  stations (day 72 → 124 km median, even after the gate), and `--far
-  500` at night (205 → 283 km). A few receivers have stable gross
+  2 759 vessel fixes; truth is the LSEG position logged with each
+  fix).** Live: 73 km median by day (7 receivers), 196 km at night in
+  Europe, 609 km at night in the US. Night residuals are 250–300 µs at
+  every SNR (propagation-limited); by day they follow SNR. The 4000 km
+  re-solve cut night p75 626 → 538 km, paired. Rejected: a fitted
+  per-receiver offset table (day 72 → 124 km) and `--far 500` at night
+  (205 → 283 km). Untested: a hand-picked table for the stable gross
   offsets (178.115.248.93 ≈ −9 ms, 178.164.107.18 ≈ +1 ms,
-  sm1.thulesius.se ≈ −450 µs) that a hand-picked table could fix.
-  Ellipses under 500 km under-report error 1.3–2x; long ellipses
-  (ship outside the cohort) over-report it, but their median error is
-  still 630–750 km.
+  sm1.thulesius.se ≈ −450 µs). Ellipses under 500 km under-report
+  error 1.3–2x; longer ones (ship outside the cohort) over-report it,
+  but still miss by 630–750 km median.
 - **Not yet measured.** A daytime capture with a large cohort around
   the ship (Channel, `captures/nov2`, 2026-11-15). The July error
   model predicts single-digit km there; the US result says winter
