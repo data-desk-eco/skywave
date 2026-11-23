@@ -136,6 +136,17 @@ the vessels and fixes scored on the other half unless stated.
   sm1.thulesius.se ≈ −450 µs). Ellipses under 500 km under-report
   error 1.3–2x; longer ones (ship outside the cohort) over-report it,
   but still miss by 630–750 km median.
+- **Fix quality (keep log, Europe, after the gate).** Rank correlation
+  with error, night: agreement with the same ship's other fixes within
+  30 min 0.69, semi-major 0.56, ellipse elongation −0.52, largest
+  azimuth gap of the receivers seen from the fix 0.47; residuals,
+  chi², SNR ≤ 0.31. Filters: sibling within 50 km + semi-major
+  < 100 km keeps 4% of night fixes at 40 km median (p90 78), 18% of day
+  fixes at 35 km. A gradient-boosted classifier (CV by vessel, target
+  < 100 km, AUC 0.86 vs 0.77 for semi-major alone): top quarter of night
+  fixes 70 km median, top tenth 48 km. A coast-station addressee puts
+  the ship 194 km (day) / 256 km (night) median from it: a prior, not a
+  fix. `--fuse 20` night median 188 → 154 km (unpaired).
 - **Not yet measured.** A daytime capture with a large cohort around
   the ship (Channel, `captures/nov2`, 2026-11-15). The July error
   model predicts single-digit km there; the US result says winter
