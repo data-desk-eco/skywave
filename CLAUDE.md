@@ -172,6 +172,12 @@ the vessels and fixes scored on the other half unless stated.
   the ship (Channel, `captures/nov2`, 2026-11-15). The July error
   model predicts single-digit km there; the US result says winter
   daytime may fall short of that.
+- **Korea rack (held from 2026-11-24).** The first one-sided target:
+  no public MF receivers in China, Russia or North Korea, and the Korean
+  ones are usually full, so the rack is about 7 receivers in Japan and
+  Taiwan, 600–1500 km out, largest bearing gap ~220°. The keep log puts
+  Europe fixes at that gap at ~65 km by day and ~190 km at night; score
+  it on the AIS-visible traffic before trusting a fix on a dark ship.
 
 ## Scripts
 

@@ -10,6 +10,7 @@ export const REGIONS = [
   // ground-wave MF targets
   { id: "english-channel",    name: "ENGCH" },
   { id: "ny-harbour",         name: "NY"    },
+  { id: "korea",              name: "KOR"   },
   { id: "kattegat",           name: "KAT"   },
   { id: "chesapeake",         name: "CHES"  },
   { id: "ligurian",           name: "LIG"   },

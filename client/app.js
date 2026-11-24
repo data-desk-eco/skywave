@@ -8,7 +8,7 @@
 import { Vessels, GATEWAY } from "./vessels.js?v=40";
 import { drawMap } from "./map.js?v=40";
 import { REGIONS, REGION_STORAGE_KEY, currentRegion, midIso }
-  from "./regions.js?v=40";
+  from "./regions.js?v=41";
 
 const DEBUG = /(\?|&)debug=1\b/.test(location.search);
 const AUDIO_LEAD_SEC = 0.25;

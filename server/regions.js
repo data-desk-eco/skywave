@@ -103,6 +103,14 @@ export const REGIONS = [
   // Harbour out to 400 km; bearing gap 130° is wider than English
   // Channel but still surround geometry. Channel approaches into
   // Newark/JFK area are some of the world's busiest shipping lanes.
+  // Korea — one-sided: no public MF receivers in China, Russia or the
+  // north, so the cohort is South Korea plus Japan out to 1700 km
+  // (largest bearing gap ~220°). For attribution of DSC calls from
+  // ships around the peninsula, scored against the AIS-visible traffic.
+  { id: "korea", name: "Korea", bbox: null,
+    target: {
+      gps: [37.5, 126.5], radiusKm: 1700, cohortSize: 40, bands: [2187.5],
+    } },
   { id: "ny-harbour", name: "NY Harbour", bbox: null,
     target: {
       gps: [40.5, -74.0], radiusKm: 400, cohortSize: 40, bands: [2187.5],
